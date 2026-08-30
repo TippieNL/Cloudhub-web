@@ -666,6 +666,53 @@ if ($path === '/api/storage/usage' && $method === 'GET') api_try(function()use($
         'byUser' => $byUser,
     ];
 });
+/**
+* What *this* account is using, readable by anyone signed in.
+*
+* /api/storage/usage is admin-only, which left an account with a quota no way
+* to see how much of it it had used -- it found out when an upload came back
+* 507 after the fact.
+*
+* Deliberately never forces a measurement. Walking the whole store is
+* expensive, and a route every account can call must not be a way to make the
+* server do that on demand; ?refresh stays admin-only on the route above.
+*
+* The response shape is shared with the Android build (TippieNL/Cloudhub-2),
+* so field names and types here are a contract -- `versions` is reported as
+* zeroes rather than omitted because this build has no file-versioning
+* feature and a client reading the field should not have to special-case it.
+*/
+if ($path === '/api/storage/me' && $method === 'GET') api_try(function()use($fs, $config) {
+    release_session_lock();
+    $user = Auth::user();
+
+    // Swept exactly as assert_upload_fits() does, so the figure shown here is
+    // the figure that will refuse an upload. A number that disagrees with the
+    // error you eventually get is worse than no number.
+    ledger()->sweep($fs);
+
+    $report = storage_report($fs, $config);
+    $used = $user === null?0:ledger()->usage((int)$user['id']);
+
+    return [
+        'usedBytes' => $used,
+        'quotaBytes' => (int)round((float)$config['user_quota_gb'] * 1073741824),
+        'storeUsedBytes' => (int)($report['bytes'] ?? 0),
+        'storageLimitBytes' => (int)round((float)$config['storage_limit_gb'] * 1073741824),
+        'diskFreeBytes' => (int)($report['diskFree'] ?? 0),
+        'diskTotalBytes' => (int)($report['diskTotal'] ?? 0),
+        'files' => (int)($report['files'] ?? 0),
+        // storageReport() returns `folders` as a list of per-folder rows, so
+        // this is count(), not a cast: (int) on a non-empty array is 1, which
+        // would report "1 folder" for every store that has any at all.
+        'folders' => count($report['folders'] ?? []),
+        'trash' => $report['trash'] ?? ['bytes' => 0, 'files' => 0, 'entries' => 0],
+        'versions' => $report['versions'] ?? ['bytes' => 0, 'files' => 0],
+        'cached' => (bool)($report['cached'] ?? false),
+        'measuredAt' => $report['measuredAt'] ?? null,
+        'isAdmin' => $user !== null && ($user['role'] ?? '') === 'admin',
+    ];
+});
 if ($path === '/api/trash' && $method === 'GET') api_try(function()use($fs, $config) {
     release_session_lock();
     return ['enabled' => (bool)$config['trash_enabled'], 'retentionDays' => (int)$config['trash_retention_days'],
