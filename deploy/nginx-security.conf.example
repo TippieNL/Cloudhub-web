@@ -1,0 +1,45 @@
+# CloudHub — nginx server block.
+#
+# Point the document root at public/. Everything sensitive — .env, config/,
+# src/, database/, tools/, tests/, logs/ and the storage tree — then sits
+# *outside* the document root and nginx cannot serve it at all, which is a
+# stronger guarantee than any deny rule.
+#
+# nginx does not read .htaccess, so the project's Apache rules do not apply
+# here. The deny rules below only matter if you cannot point the root at
+# public/ and must serve the project directory itself.
+
+server {
+    listen 80;
+    server_name cloudhub.example.com;
+
+    root /path/to/Cloud-File-Hub-PHP/public;
+    index index.php;
+    client_max_body_size 32M;          # only needs to exceed UPLOAD_CHUNK_MB
+
+    # Front controller: unknown paths (including /share/<token>) go to PHP.
+    location / {
+        try_files $uri $uri/ /index.php$is_args$args;
+    }
+
+    location ~ \.php$ {
+        include fastcgi_params;
+        fastcgi_pass unix:/run/php/php8.2-fpm.sock;
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        fastcgi_read_timeout 300;      # long enough for large range reads
+    }
+
+    # Never serve dotfiles (.env, .git, editor droppings).
+    location ~ /\. { deny all; return 404; }
+}
+
+# ---------------------------------------------------------------------------
+# Fallback ONLY if the document root must be the project directory rather than
+# public/. In that layout the application's own files are inside the web root,
+# so they have to be denied explicitly. Put these BEFORE the generic
+# location / block.
+# ---------------------------------------------------------------------------
+# location ~ ^/(?:config|src|views|database|deploy|tests|tools|logs|storage)(?:/|$) { deny all; return 404; }
+# location ~ ^/\.env                                                               { deny all; return 404; }
+# location ~* \.(?:env|ini|log|sql|sqlite|bak|old|orig|save|dist|md)$              { deny all; return 404; }
+# location ~ ^/(?:index|router)\.php$ { }   # the two entry points stay reachable

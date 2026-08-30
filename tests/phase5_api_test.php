@@ -1,0 +1,3 @@
+<?php
+$r=dirname(__DIR__);$h=file_get_contents($r.'/src/Helpers/Http.php');$i=file_get_contents($r.'/public/index.php');
+$c=['body cap'=>str_contains($h,'REQUEST_TOO_LARGE'),'media type'=>str_contains($h,'UNSUPPORTED_MEDIA_TYPE'),'invalid JSON'=>str_contains($h,'JSON_THROW_ON_ERROR'),'validation'=>str_contains($h,'VALIDATION_FAILED'),'request IDs'=>str_contains($h,'X-Request-ID'),'no-store'=>str_contains($h,'Cache-Control: no-store'),'safe 5xx'=>str_contains($i,'An internal server error occurred'),'request correlation'=>str_contains($i,'Http::requestId()'),'API 404'=>str_contains($i,'API endpoint not found'),'ZIP cap'=>str_contains($i,'maximum of 500 files')];$bad=false;foreach($c as $n=>$ok){echo($ok?'[PASS] ':'[FAIL] ').$n.PHP_EOL;$bad|=!$ok;}exit($bad?1:0);

@@ -1,0 +1,27 @@
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Runtime / generated data
+/storage/files/*
+!/storage/files/.gitkeep
+/storage/.thumbnails/
+/logs/*
+!/logs/.gitkeep
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Dependencies and vendored binaries
+/node_modules/
+/bin/
+
+# Replit tooling caches
+/.config/
+
+# Thumbnail and usage caches (regenerated on demand)
+/storage/.cache/

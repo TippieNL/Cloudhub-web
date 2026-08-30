@@ -1,0 +1,110 @@
+Upgrade my existing Node.js (Express) HTTP + WebDAV file server (running on Replit) to support image thumbnails in the web UI and secure shareable URLs for any file.
+
+The project must remain compatible with Replit:
+- Use process.env.PORT
+- Listen on 0.0.0.0
+- Keep modular structure
+- Do not use heavy or unnecessary dependencies
+
+========================
+FEATURE 1: IMAGE THUMBNAILS
+========================
+
+Goal:
+Display thumbnail previews for image files instead of generic file icons.
+
+Requirements:
+- Supported image types: .jpg, .jpeg, .png, .webp, .gif
+- Thumbnails must maintain aspect ratio
+- Max size: 300x300
+- Use a lightweight image library (e.g., sharp)
+- Generate thumbnails dynamically
+- Cache thumbnails in:
+  /storage/.thumbnails/
+- Naming format:
+  originalFileName_hash_thumb.webp
+- Thumbnail should only generate once unless file changes
+- Prevent path traversal attacks
+- Restrict to ROOT_DIR only
+
+Create route:
+GET /thumbnail?path=/example/image.jpg
+
+This route must:
+- Validate and sanitize path
+- Confirm file exists inside ROOT_DIR
+- Only allow image types
+- Generate thumbnail if not cached
+- Stream thumbnail safely
+- Never expose absolute paths
+
+Frontend:
+- Replace image icon with thumbnail preview
+- Grid layout with image preview + filename
+- Lazy-load thumbnails
+- Show loading placeholder
+- Keep responsive layout
+
+Non-image files must continue using existing icon system.
+
+========================
+FEATURE 2: SECURE SHAREABLE URLs
+========================
+
+Goal:
+Allow any file to be shared via a secure public link without requiring login.
+
+Functional Requirements:
+- Add “Share” button next to each file
+- Generate secure random token (minimum 32 bytes entropy)
+- Map token to file path
+- Optional expiration support (configurable)
+- Share link format:
+  https://your-repl.replit.app/share/<secureToken>
+
+Create route:
+GET /share/:token
+
+This route must:
+- Validate token
+- Confirm file exists
+- Stream file securely
+- Prevent directory access
+- Prevent traversal attacks
+- Not expose directory structure
+- Respect delete/overwrite restrictions
+
+Security:
+- Tokens must be unguessable
+- Use crypto.randomBytes
+- Do not expose root path
+- Prevent brute force risks
+- Ensure share route cannot access arbitrary files
+
+========================
+PERFORMANCE REQUIREMENTS
+========================
+
+- Use streaming for file responses
+- Do not buffer entire files into memory
+- Limit thumbnail generation concurrency
+- Prevent blocking main thread
+- Avoid redundant thumbnail regeneration
+
+========================
+OUTPUT REQUIREMENTS
+========================
+
+Provide:
+- Full updated project structure
+- Complete source code (no pseudocode)
+- New routes
+- Thumbnail caching logic
+- Share token system
+- Updated frontend HTML, CSS, JS
+- Clear inline comments explaining security decisions
+- Instructions to test on Replit
+
+Do not provide partial code.
+Do not skip validation or error handling.
+Deliver production-quality implementation suitable for secure deployment after authentication hardening.

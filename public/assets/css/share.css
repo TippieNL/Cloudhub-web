@@ -1,0 +1,144 @@
+/*
+ * Public share viewer.
+ *
+ * Standalone by design: a logged-out visitor should never pull in the whole
+ * application stylesheet, so this file carries its own tokens and follows the
+ * visitor's colour scheme rather than the app's stored theme.
+ */
+:root {
+    --share-bg: #f4f5f7;
+    --share-surface: #ffffff;
+    --share-stage: #101114;
+    --share-text: #16181d;
+    --share-muted: #626878;
+    --share-border: #dfe2e8;
+    --share-primary: #2f6fed;
+    --share-primary-text: #ffffff;
+}
+
+@media (prefers-color-scheme: dark) {
+    :root {
+        --share-bg: #0d0e11;
+        --share-surface: #16181d;
+        --share-stage: #000000;
+        --share-text: #eceef2;
+        --share-muted: #9aa1b1;
+        --share-border: #272b33;
+        --share-primary: #4b86f5;
+    }
+}
+
+* { box-sizing: border-box; }
+
+body.share-page {
+    margin: 0;
+    min-height: 100dvh;
+    display: flex;
+    background: var(--share-bg);
+    color: var(--share-text);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+}
+
+.share-shell {
+    margin: auto;
+    width: min(1100px, 100%);
+    min-height: 100dvh;
+    display: flex;
+    flex-direction: column;
+}
+
+.share-stage {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 16px;
+    background: var(--share-stage);
+}
+
+.share-media {
+    max-width: 100%;
+    max-height: calc(100dvh - 150px);
+    display: block;
+}
+
+.share-stage-image .share-media {
+    object-fit: contain;
+    /* Checkerboard so transparent PNGs and GIFs stay readable. */
+    background-image:
+        linear-gradient(45deg, #2a2c31 25%, transparent 25%, transparent 75%, #2a2c31 75%),
+        linear-gradient(45deg, #2a2c31 25%, transparent 25%, transparent 75%, #2a2c31 75%);
+    background-size: 22px 22px;
+    background-position: 0 0, 11px 11px;
+}
+
+.share-stage-video .share-media { width: 100%; }
+
+.share-audio {
+    width: min(560px, 100%);
+    text-align: center;
+    color: #f2f3f6;
+}
+
+.share-audio-icon { font-size: 64px; line-height: 1; margin-bottom: 18px; opacity: .75; }
+.share-audio .share-media { width: 100%; }
+
+.share-bar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 14px;
+    padding: 14px 18px;
+    background: var(--share-surface);
+    border-top: 1px solid var(--share-border);
+}
+
+.share-meta { min-width: 0; }
+
+.share-name {
+    margin: 0;
+    font-size: 16px;
+    font-weight: 650;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.share-sub { margin: 2px 0 0; color: var(--share-muted); font-size: 13px; }
+.share-dot { margin: 0 6px; }
+
+.share-actions { display: flex; gap: 8px; flex-shrink: 0; }
+
+.share-btn {
+    appearance: none;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 38px;
+    padding: 0 16px;
+    border: 1px solid var(--share-border);
+    border-radius: 8px;
+    background: var(--share-surface);
+    color: inherit;
+    font: inherit;
+    font-weight: 550;
+    text-decoration: none;
+    cursor: pointer;
+}
+
+.share-btn:hover { border-color: var(--share-primary); }
+.share-btn:focus-visible { outline: 2px solid var(--share-primary); outline-offset: 2px; }
+
+.share-btn-primary {
+    background: var(--share-primary);
+    border-color: var(--share-primary);
+    color: var(--share-primary-text);
+}
+
+@media (max-width: 620px) {
+    .share-bar { flex-direction: column; align-items: stretch; }
+    .share-actions > * { flex: 1; }
+    .share-media { max-height: calc(100dvh - 200px); }
+}

@@ -1,0 +1,22 @@
+DirectoryIndex index.php
+RewriteEngine On
+
+# Never expose application internals.
+RewriteRule ^(?:config|src|views|database|storage|logs|tests|tools|deploy)(?:/|$) - [F,L,NC]
+RewriteRule ^\.env(?:\..*)?$ - [F,L,NC]
+RewriteRule ^(?:composer\.(?:json|lock)|phpunit\.xml|README\.md|SECURITY\.md)$ - [F,L,NC]
+RewriteRule .*\.(?:bak|old|orig|save|sql|log|ini|dist)$ - [F,L,NC]
+
+# Public static files.
+RewriteRule ^favicon\.png$ public/favicon.png [L]
+RewriteRule ^assets/(.*)$ public/assets/$1 [L]
+
+# Existing public files may be requested through /public/ directly.
+RewriteCond %{REQUEST_FILENAME} -f [OR]
+RewriteCond %{REQUEST_FILENAME} -d
+RewriteRule ^public/ - [L]
+
+# Everything else goes through the root bootstrap. This intentionally also
+# handles the existing project directory itself when installed in a subfolder.
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteRule ^ index.php [QSA,L]

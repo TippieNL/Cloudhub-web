@@ -1,0 +1,172 @@
+Analyze the conversation and extract relevant context for future use. **Output the documentation in proper Markdown format**, ensuring the structure adheres to the specifications below. The output must **always include a version control table** at the end.
+    
+    ---
+    
+    ## Deep Focus State:
+    - **Establish primary intent**:
+      - **Purpose** (e.g., analysis, ideation, planning, execution).
+      - Extract:
+        - **Core subject** analyzed.
+        - **Goals/tasks** outlined.
+      - Categorize for broad follow-up tasks.
+    
+    - **Capture broader scope**:
+      - **Contextual Background**: Subject, objectives, and key points.
+      - **Insights**: Findings applicable to related tasks.
+      - **Guidance**: Steps, requirements, or decisions.
+    
+    - **Refine documentation** by detecting user responses:
+      - Verify assumptions are confirmed, not documented as facts.
+    
+    ### Response Detection:
+    - **Analyze user responses**:
+      - **Confirmations**: Mark validated info as accurate.
+      - **Denials**: Exclude and flag rejected info.
+      - **Corrections**: Replace outdated/incorrect details.
+      - **Expansions**: Add context/examples provided by the user.
+      - **Fine-Tuning**: Reflect nuanced adjustments.
+    
+    ### Prevent Assumptions:
+    - Document only confirmed, corrected, or expanded details.
+    - Flag ambiguities for review.
+    
+    ### Balance Ideas/Details:
+    - Capture:
+      - **High-level context**: Intent/purpose.
+      - **Details**: User-provided specifics.
+    
+    ---
+    
+    ## Documentation Action:
+    - **Create new document** if no existing match:
+      - Include metadata (date, purpose, tags).
+      - Add initial contextual details.
+    - **Update existing document**:
+      - Search for a match and compare new insights.
+      - Apply updates per **Updating Context Documentation**.
+    
+    ---
+    
+    ## Structuring Documentation:
+    
+    ### Metadata:
+    - Include:
+      - **Date**: Interaction timestamp.
+      - **Purpose**: Conversation goal.
+      - **Tags**: See **Searchability and Tagging System**.
+      - **Primary Intent**: Summarize in one sentence.
+    
+    ### Organization:
+    - Structure based on intent:
+      - **Themes**: Group by topics.
+      - **Steps**: Numbered sequences.
+    
+    ### Framework-Based Organization:
+    - Apply frameworks dynamically based on conversation type:
+      - **PARA:** Projects, Areas, Resources, Archives.
+      - **OKR:** Objectives, Key Results.
+      - **SMART:** Specific, Measurable, Achievable, Relevant, Time-bound.
+      - **GROW:** Goal, Reality, Options, Way Forward.
+      - **RACI:** Responsible, Accountable, Consulted, Informed.
+      - **SWOT:** Strengths, Weaknesses, Opportunities, Threats.
+      - **Pyramid:** Start with key idea, then supporting details.
+      - **Eisenhower:** Prioritize by urgency and importance.
+      - **5 Whys:** Use iterative questioning for root causes.
+    
+    ### Auto-Structure Selection:
+    - Select structure based on conversation type:
+      - **Creative:** Bullet points for ideas.
+      - **Strategic:** "Goals," "Actions," and "Recommendations."
+      - **Technical:** "Problem," "Solutions," "Next Steps."
+      - **Analysis:** SWOT categories (e.g., "Strengths," "Weaknesses").
+      - **Prioritization:** Eisenhower Matrix for tasks.
+      - **Root Cause:** 5 Whys for iterative problem-solving.
+    
+    ---
+    
+    ## Updating Documentation:
+    
+    ### Dynamic Updates:
+    - Compare new insights with existing content:
+      - Replace outdated info.
+      - Add new findings.
+      - Clarify incomplete sections.
+    
+    ### Version Management:
+    - Keep a changelog:
+      - **Date**: Modification timestamp.
+      - **Description**: Summary of changes.
+    
+    ### Historical References:
+    - Retain related discussions:
+      - Include metadata and key insights.
+      - Cross-link with related documents.
+    
+    ### Continuity:
+    - Integrate updates seamlessly:
+      - Maintain flow and readability.
+      - Avoid disrupting structure.
+    
+    ---
+    
+    ## Searchability and Tagging System:
+    *Internal use only. Exclude from generated documentation.*
+    
+    ### Tags:
+    - Use **3-5 descriptive tags** per document.
+    - Apply nested tags (e.g., "Content > Thought Leadership").
+    - Dynamically generate tags from content.
+    
+    ### Metadata Tags:
+    - Embed in metadata for retrieval.
+    - Link tags to connect related documents.
+    
+    ---
+    
+    ## Markdown Standards:
+    
+    ### Specifications:
+    
+    #### 1. Structure:
+    - Use:
+      - `#` for main titles.
+      - `##`, `###` for subsections.
+    
+    #### 2. Readability:
+    - Limit lines to 80-120 characters.
+    - Use blank lines for clarity.
+    - Avoid excessive formatting.
+    
+    #### 3. Lists/Tables:
+    - Use:
+      - Bullet points for lists.
+      - Numbered lists for steps.
+      - Tables for structured data.
+    
+    #### 4. Links/Code:
+    - Use meaningful links.
+    - Add alt text for images.
+    - Use backticks for code.
+    
+    #### 5. Features:
+    - Use blockquotes for notes.
+    - Add task lists for actions.
+    - Include metadata for scope tracking.
+    
+    #### 6. Consistency:
+    - Use semantic elements (e.g., headings, lists).
+    - Keep formatting consistent.
+    
+    #### 7. Version Control:
+    - **Always include a revision table**:
+      - **Version**: Number.
+      - **Date**: Revision date.
+      - **Description**: Summary of changes.
+    
+    ---
+    
+    ### Instructions for Output:
+    1. **Ensure Markdown format** for the entire output so it can be copied in one action.
+    2. **Include the Version Control Table** at the end of the documentation.
+    3. **Follow Markdown Standards** as specified in this prompt.
+    4. **Ensure clarity and logical structure** throughout the document.
