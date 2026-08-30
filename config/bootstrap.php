@@ -1,11 +1,33 @@
 <?php
 declare(strict_types=1);
 
+/**
+ * Map CloudHub\Foo\Bar to src/Foo/Bar.php.
+ *
+ * A missing file is reported here, naming the path that was tried, rather
+ * than being skipped so PHP can raise "Class not found" further down. Those
+ * two failures have the same cause and wildly different diagnostic value: on
+ * a deployment where src/ had not been copied across, the silent version cost
+ * an evening, because the message named a class that was never the problem
+ * and no path at all.
+ *
+ * Only classes under the CloudHub prefix are our business; anything else is
+ * left for the next registered autoloader, which is why class_exists() probes
+ * for optional third-party classes still work.
+ */
 spl_autoload_register(function(string $class): void {
     $prefix = 'CloudHub\\';
     if (!str_starts_with($class, $prefix)) return;
-    $file = dirname(__DIR__) . '/src/' . str_replace('\\', '/', substr($class, strlen($prefix))) . '.php';
-    if (is_file($file)) require $file;
+    $relative = str_replace('\\', '/', substr($class, strlen($prefix))) . '.php';
+    $file = dirname(__DIR__) . '/src/' . $relative;
+    if (!is_file($file)) {
+        throw new RuntimeException(
+            'Cannot load '.$class.': '.$file.' is missing or unreadable. '
+            .'The application directory looks incomplete -- check that src/ was '
+            .'deployed in full and that the web server user can read it.'
+        );
+    }
+    require $file;
 });
 
 function load_env(string $file): void {
