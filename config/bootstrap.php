@@ -51,6 +51,23 @@ $isDevelopment=$config['app_env']==='development';
 ini_set('display_errors',$isDevelopment?'1':'0');
 ini_set('display_startup_errors',$isDevelopment?'1':'0');
 ini_set('log_errors','1');
+/*
+ * Send the log somewhere findable.
+ *
+ * log_errors was on but no destination was ever set, so PHP fell back to the
+ * SAPI default -- under KSWEB that is Apache's own error log, somewhere off in
+ * the server install. Since api_try() deliberately hides 5xx detail from the
+ * client, that log is the only place the real message exists, and a 500 on a
+ * phone was effectively undiagnosable. logs/ already exists and .htaccess
+ * already denies it. An explicit error_log in php.ini or the environment still
+ * wins: this only fills in the default.
+ */
+if (trim((string)ini_get('error_log')) === '') {
+    $logDir = dirname(__DIR__).'/logs';
+    if (is_dir($logDir) || @mkdir($logDir, 0775, true) || is_dir($logDir)) {
+        ini_set('error_log', $logDir.'/php-error.log');
+    }
+}
 ini_set('expose_php','0');
 error_reporting(E_ALL);
 set_exception_handler(function(Throwable $e) use ($config): void {

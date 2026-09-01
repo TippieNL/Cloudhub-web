@@ -144,18 +144,15 @@ final class UploadService
         $chunkLimit = max(1, (int)$this->config['upload_chunk_mb']) * 1024 * 1024;
 
         $in = fopen($input, 'rb');
-        // 'c+b' rather than 'ab': the write has to land at a position this
-        // method chooses, not wherever the file currently ends.
-        $out = fopen($part, 'c+b');
+        $out = $this->openPartForWriting($part);
         if (!$in || !$out) {
             if ($in) fclose($in);
             if ($out) fclose($out);
-            throw new RuntimeException('Unable to open upload stream', 500);
+            throw new RuntimeException('Unable to open upload stream for '.$part, 500);
         }
 
         /*
-         * The offset is checked and the write positioned under one exclusive
-         * lock.
+         * The offset is checked and the write is positioned there.
          *
          * Previously the size was read, compared, and then appended with 'ab'
          * with nothing held in between. Because upload ids are deterministic
@@ -165,26 +162,26 @@ final class UploadService
          * twice the length. From then on complete() failed 409 "incomplete"
          * forever and append() failed 413, because $remaining went negative.
          * The session could not be recovered before the 24-hour sweep.
+         *
+         * Writing at a position this method chooses is what fixes that, not the
+         * lock below: two requests that compute the same offset now write the
+         * same region instead of each adding to the end, so the file keeps the
+         * right length and the right bytes either way. The lock only narrows
+         * the window between the check and the write.
          */
         $written = 0;
-        if (!flock($out, LOCK_EX)) {
-            fclose($in);
-            fclose($out);
-            throw new RuntimeException('Unable to lock the upload for writing', 500);
-        }
+        $locked = $this->lockForWriting($out, $part);
         clearstatcache(true, $part);
         $current = (int)(fstat($out)['size'] ?? 0);
         if ($offset !== $current) {
-            flock($out, LOCK_UN);
+            $this->releasePart($out, $locked);
             fclose($in);
-            fclose($out);
             throw new RuntimeException('Upload offset mismatch; expected '.$current, 409);
         }
         if (fseek($out, $current) !== 0) {
-            flock($out, LOCK_UN);
+            $this->releasePart($out, $locked);
             fclose($in);
-            fclose($out);
-            throw new RuntimeException('Unable to position the upload for writing', 500);
+            throw new RuntimeException('Unable to seek '.$part.' to offset '.$current, 500);
         }
 
         $remaining = (int)$meta['size'] - $current;
@@ -213,17 +210,77 @@ final class UploadService
             }
         } finally {
             // Flush before releasing: another waiter must observe this chunk's
-            // bytes in the size it reads under the lock, or it would compute
-            // the same offset again.
+            // bytes in the size it reads, or it would compute the same offset
+            // again.
             fflush($out);
-            flock($out, LOCK_UN);
+            $this->releasePart($out, $locked);
             fclose($in);
-            fclose($out);
         }
         clearstatcache(true, $part);
         $meta['updatedAt'] = time();
         $this->writeMeta($id, $meta);
         return $this->statusPayload($id, $meta);
+    }
+
+    /**
+     * Open the staging file for a positioned write.
+     *
+     * 'c+b' rather than 'ab' because the write has to land where append()
+     * decides, not wherever the file currently ends. It asks for more than
+     * 'ab' did -- create *and* read -- and this class already warns that
+     * Android emulated storage reports permissions unreliably, so a refusal
+     * falls back to creating the file and reopening it for update.
+     *
+     * @return resource|false
+     */
+    private function openPartForWriting(string $part)
+    {
+        $out = @fopen($part, 'c+b');
+        if ($out !== false) return $out;
+
+        if (!is_file($part)) @touch($part);
+        $out = @fopen($part, 'r+b');
+        if ($out !== false) {
+            error_log('[upload] '.$part.' refused c+b; reopened r+b');
+            return $out;
+        }
+        return false;
+    }
+
+    /**
+     * Take the advisory lock if this filesystem has one, without insisting.
+     *
+     * Locking here is an optimisation, not the correctness mechanism -- the
+     * positioned write in append() is -- so a filesystem without it must not
+     * fail the upload. ensureWritableDirectory()'s docblock records that
+     * Android shared storage supports ordinary I/O without reliable advisory
+     * flock() semantics, and requiring the lock made every chunk return 500 on
+     * exactly the platform this application is built for.
+     *
+     * Non-blocking with a short bounded wait, because the other failure mode is
+     * a flock() that never returns rather than one that returns false: a
+     * blocking call there would hold the request open until the browser gave
+     * up. Real contention is one other tab, which clears well inside this.
+     *
+     * @param resource $out
+     */
+    private function lockForWriting($out, string $part): bool
+    {
+        for ($attempt = 0; $attempt < 20; $attempt++) {
+            if (@flock($out, LOCK_EX | LOCK_NB)) return true;
+            usleep(50000);   // 20 x 50ms = 1s
+        }
+        error_log('[upload] no advisory lock available for '.$part.'; continuing with a positioned write');
+        return false;
+    }
+
+    /**
+     * @param resource $out
+     */
+    private function releasePart($out, bool $locked): void
+    {
+        if ($locked) @flock($out, LOCK_UN);
+        fclose($out);
     }
 
     /** Assemble/finalise the upload and apply the requested conflict policy. */
