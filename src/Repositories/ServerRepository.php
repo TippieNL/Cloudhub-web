@@ -3,7 +3,7 @@ namespace CloudHub\Repositories;
 use PDO;
 final class ServerRepository {
  private PDO $db;
- public function __construct(){ $c=require dirname(__DIR__,2).'/config/database.php'; $this->db=new PDO($c['dsn'],$c['user'],$c['pass'],[PDO::ATTR_ERRMODE=>PDO::ERRMODE_EXCEPTION,PDO::ATTR_DEFAULT_FETCH_MODE=>PDO::FETCH_ASSOC]); }
+ public function __construct(){ $this->db=\CloudHub\Helpers\Db::connection(); }
  public function all(bool $activeOnly=false): array { $sql='SELECT * FROM storage_servers'.($activeOnly?' WHERE is_active=1':'').' ORDER BY created_at'; $rows=$this->db->query($sql)->fetchAll(); return array_map([$this,'decode'],$rows); }
  public function get(int $id): ?array { $s=$this->db->prepare('SELECT * FROM storage_servers WHERE id=?');$s->execute([$id]);$r=$s->fetch();return $r?$this->decode($r):null; }
  public function create(array $d): array { $this->db->beginTransaction(); try { if(!empty($d['isDefault']))$this->db->exec('UPDATE storage_servers SET is_default=0'); $s=$this->db->prepare('INSERT INTO storage_servers(name,type,is_active,is_default,config) VALUES(?,?,?,?,?)');$s->execute([$d['name'],$d['type'],$d['isActive']?1:0,$d['isDefault']?1:0,json_encode($d['config'])]);$id=(int)$this->db->lastInsertId();$this->db->commit();return $this->get($id); } catch(\Throwable $e){$this->db->rollBack();throw $e;} }

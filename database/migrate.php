@@ -139,6 +139,10 @@ addColumn($pdo, 'share_links', 'expires_at', 'TIMESTAMP NULL DEFAULT NULL');
 if (!indexExists($pdo, 'storage_servers', 'idx_storage_active')) $pdo->exec('ALTER TABLE storage_servers ADD INDEX idx_storage_active (is_active)');
 if (!indexExists($pdo, 'storage_servers', 'idx_storage_default')) $pdo->exec('ALTER TABLE storage_servers ADD INDEX idx_storage_default (is_default)');
 if (!indexExists($pdo, 'share_links', 'idx_share_expires')) $pdo->exec('ALTER TABLE share_links ADD INDEX idx_share_expires (expires_at)');
+// Creating a share looks for an existing link by path before issuing a token,
+// so without this every Share click scanned the whole table. TEXT needs a
+// prefix length, matching the (190) file_metadata already uses.
+if (!indexExists($pdo, 'share_links', 'idx_share_path')) $pdo->exec('ALTER TABLE share_links ADD INDEX idx_share_path (file_path(190))');
 if (!indexExists($pdo, 'file_metadata', 'idx_file_server')) $pdo->exec('ALTER TABLE file_metadata ADD INDEX idx_file_server (server_id)');
 if (!indexExists($pdo, 'file_metadata', 'idx_file_server_path')) $pdo->exec('ALTER TABLE file_metadata ADD INDEX idx_file_server_path (server_id, file_path(190))');
 // Per-user usage is a SUM grouped by this column on every upload attempt.

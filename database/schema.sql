@@ -68,7 +68,7 @@ CREATE TABLE IF NOT EXISTS share_links (
  file_path TEXT NOT NULL,
  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
  expires_at TIMESTAMP NULL DEFAULT NULL,
- INDEX idx_share_expires(expires_at)
+ INDEX idx_share_expires(expires_at), INDEX idx_share_path(file_path(190))
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 INSERT INTO storage_servers (name,type,is_active,is_default,config)

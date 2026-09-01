@@ -49,6 +49,20 @@ $checks['L6 the diagnostic survives as a CLI tool'] = is_file($root.'/tools/stor
 $checks['L6 the CLI tool refuses web requests'] =
     str_contains((string)file_get_contents($root.'/tools/storage-check.php'), "PHP_SAPI !== 'cli'");
 
+// L11 -- the ffmpeg diagnostic described an architecture that no longer exists.
+// It read ffmpeg, ffprobe, projectBin and cacheDir from
+// VideoThumbnailService::diagnostics(), which returns none of them, so it
+// emitted warnings and reported nothing. Frames are extracted in the browser
+// now and the vendored bin/ went with the initial import.
+$checks['L11 the stale ffmpeg diagnostic is gone'] = !is_file($root.'/tools/ffmpeg-check.php');
+$checks['L11 the thumbnail service is still browser-based'] =
+    str_contains((string)file_get_contents($root.'/src/Services/VideoThumbnailService.php'), "'mode' => 'browser'");
+// Every remaining tool refuses to run as a web request.
+foreach (glob($root.'/tools/*.php') ?: [] as $tool) {
+    $checks['L11 '.basename($tool).' refuses web requests'] =
+        (bool)preg_match("/PHP_SAPI\s*!==\s*'cli'/", (string)file_get_contents($tool));
+}
+
 // L7 -- deny rules cover every application directory, on both server families.
 foreach (['config', 'src', 'views', 'database', 'storage', 'logs', 'tests', 'tools', 'deploy'] as $dir) {
     $checks["L7 .htaccess denies /$dir"] = (bool)preg_match('/RewriteRule \^\(\?:[^)]*\b'.$dir.'\b[^)]*\)/', $htaccess);

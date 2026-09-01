@@ -22,8 +22,29 @@ final class AuditLog {
    $safe=self::sanitize($context);
    $stmt=$pdo->prepare('INSERT INTO security_events(user_id,username,event_type,outcome,ip_address,user_agent,request_id,context_json,created_at) VALUES(?,?,?,?,?,?,?,?,UTC_TIMESTAMP())');
    $stmt->execute([$uid,$username,substr($event,0,80),substr($outcome,0,20),substr($ip,0,45),$ua,$requestId,$safe?json_encode($safe,JSON_UNESCAPED_SLASHES|JSON_UNESCAPED_UNICODE):null]);
+   self::pruneOccasionally($pdo);
   } catch (\Throwable $e) {
    error_log('[audit] '.$e->getMessage());
+  }
+ }
+
+ /**
+  * Drop events past the retention window, roughly once every hundred writes.
+  *
+  * tools/cleanup-security-events.php does exactly this and remains the way to
+  * force a full sweep -- but it needs cron, and the installations this runs on
+  * are phones. Sampled the same way LoginRateLimiter prunes login_attempts, so
+  * the table is bounded without a scheduled job. Its own try/catch: an audit
+  * trail that cannot tidy itself must still record the event.
+  */
+ private static function pruneOccasionally(PDO $pdo): void {
+  if(random_int(1,100)!==1)return;
+  try{
+   $days=max(1,(int)($GLOBALS['config']['security_event_retention_days']??90));
+   $stmt=$pdo->prepare('DELETE FROM security_events WHERE created_at < DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? DAY)');
+   $stmt->execute([$days]);
+  }catch(\Throwable $e){
+   error_log('[audit] retention prune skipped: '.$e->getMessage());
   }
  }
  private static function sanitize(array $context): array {

@@ -99,8 +99,7 @@ final class Auth {
         if($last!==0&&$now-$last<self::ACCOUNT_RECHECK_SECONDS)return;
 
         try{
-            $config=require dirname(__DIR__,2).'/config/database.php';
-            $pdo=new PDO($config['dsn'],$config['user'],$config['pass'],[PDO::ATTR_ERRMODE=>PDO::ERRMODE_EXCEPTION]);
+            $pdo=\CloudHub\Helpers\Db::connection();
             $status=(new \CloudHub\Repositories\UserRepository($pdo))->status((int)$_SESSION['user_id']);
         }catch(\Throwable $e){
             error_log('[auth] account revalidation skipped: '.$e->getMessage());

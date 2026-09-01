@@ -382,9 +382,7 @@ function assert_upload_fits(FileService $fs, array $config, int $size): void {
     }
 }
 function db(): PDO {
-    static $pdo; if (!$pdo) {
-        $c = require dirname(__DIR__).'/config/database.php'; $pdo = new PDO($c['dsn'], $c['user'], $c['pass'], [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
-    }return $pdo;
+    return \CloudHub\Helpers\Db::connection();
 }
 /**
  * Absolute origin (scheme://host) for links handed to other people.
