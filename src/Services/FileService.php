@@ -198,6 +198,10 @@ final class FileService {
   */
  public function copiedFiles(string $path): array {
   if(is_link($path))return [];
+  // A path that is not there produced [$path] and, once a partly-failed copy
+  // started asking what landed, would have attributed a row to a file that
+  // was never written.
+  if(!file_exists($path))return [];
   if(!is_dir($path))return [$path];
   $out=[];$stack=[$path];
   while($stack){

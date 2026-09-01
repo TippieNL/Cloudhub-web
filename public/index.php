@@ -331,7 +331,15 @@ function storage_report(FileService $fs, array $config, bool $force = false): ar
     $report = $fs->storageReport();
     $report['cached'] = false;
     if (!is_dir(dirname($cache)))@mkdir(dirname($cache), 0775, true);
-    @file_put_contents($cache, json_encode($report, JSON_UNESCAPED_SLASHES));
+    // Written through a temporary file, as the thumbnail cache already is: a
+    // reader hitting a half-written usage.json gets JSON it cannot decode.
+    $reportJson = json_encode($report, JSON_UNESCAPED_SLASHES);
+    if ($reportJson !== false) {
+        $cacheTmp = $cache.'.'.bin2hex(random_bytes(4)).'.tmp';
+        if (@file_put_contents($cacheTmp, $reportJson) !== strlen($reportJson) || !@rename($cacheTmp, $cache)) {
+            @unlink($cacheTmp);
+        }
+    }
     return $report;
 }
 /**
@@ -638,6 +646,17 @@ $relocate = function(callable $apply, string $verb)use($fs, $config): array {
             }
             $done++;
         }catch(RuntimeException $e) {
+            // A copy that threw partway still wrote files. Attribution ran
+            // only on success, so those bytes sat on disk with no ledger row
+            // and stopped counting against anyone's quota; repeated failures
+            // accumulated untracked storage. Charge whatever actually landed
+            // -- deleting it instead would destroy data on a partial failure.
+            if ($verb === 'copy' && isset($target)) {
+                foreach ($fs->copiedFiles($target) as $copied) {
+                    ledger()->record($fs->relative($copied), basename($copied),
+                        (int)(filesize($copied)?:0), null, Auth::user()['id'] ?? null);
+                }
+            }
             $failed[] = ['path' => $rel, 'message' => $e->getMessage()];
         }
     }

@@ -41,13 +41,42 @@ final class StorageLedger
         try {
             $server = $this->defaultServerId();
             if ($server === null) return;   // nothing to attach the row to
-            $this->forget($path);           // an overwrite replaces the old row
-            $stmt = $this->db->prepare(
-                'INSERT INTO file_metadata (server_id, file_path, original_name, size, mime_type, uploaded_by)
-                 VALUES (?, ?, ?, ?, ?, ?)');
-            $stmt->execute([$server, $path, $name, max(0, $size), $mime, $userId]);
+            // The delete and the insert are one unit: a failure between them
+            // left the old row gone and no new one written, so the bytes on
+            // disk stopped counting against anybody's quota.
+            $this->transactionally(function() use ($server, $path, $name, $size, $mime, $userId): void {
+                // deleteRows() rather than forget(): forget() swallows its own
+                // failures by design, which inside a transaction would let a
+                // failed delete commit alongside the insert and leave two rows
+                // for one path -- charging the quota twice.
+                $this->deleteRows($path);   // an overwrite replaces the old row
+                $stmt = $this->db->prepare(
+                    'INSERT INTO file_metadata (server_id, file_path, original_name, size, mime_type, uploaded_by)
+                     VALUES (?, ?, ?, ?, ?, ?)');
+                $stmt->execute([$server, $path, $name, max(0, $size), $mime, $userId]);
+            });
         } catch (Throwable $e) {
             error_log('[ledger] record failed: '.$e->getMessage());
+        }
+    }
+
+    /**
+     * Run $work inside a transaction, joining one that is already open.
+     *
+     * PDO does not nest transactions, so a caller already inside one is left
+     * to own the commit; this only begins, commits and rolls back the
+     * transaction it opened itself.
+     */
+    private function transactionally(callable $work): void
+    {
+        if ($this->db->inTransaction()) { $work(); return; }
+        $this->db->beginTransaction();
+        try {
+            $work();
+            $this->db->commit();
+        } catch (Throwable $e) {
+            if ($this->db->inTransaction()) $this->db->rollBack();
+            throw $e;
         }
     }
 
@@ -55,18 +84,24 @@ final class StorageLedger
     public function forget(string $path): void
     {
         try {
-            $prefix = rtrim($path, '/').'/';
-            // mb_strlen, not strlen: the column is utf8mb4 and MySQL's
-            // SUBSTR() counts characters, so a byte length overshoots for any
-            // non-ASCII name. "/Fotos N/" is 10 bytes but 9 characters, so the
-            // comparison took "/Fotos N/a" and matched nothing -- every row
-            // beneath an accented, CJK or emoji folder survived its deletion
-            // and kept counting against the owner's quota.
-            $stmt = $this->db->prepare('DELETE FROM file_metadata WHERE file_path = ? OR SUBSTR(file_path, 1, ?) = ?');
-            $stmt->execute([$path, mb_strlen($prefix), $prefix]);
+            $this->deleteRows($path);
         } catch (Throwable $e) {
             error_log('[ledger] forget failed: '.$e->getMessage());
         }
+    }
+
+    /** The delete itself, which reports failure so a caller in a transaction can abort. */
+    private function deleteRows(string $path): void
+    {
+        $prefix = rtrim($path, '/').'/';
+        // mb_strlen, not strlen: the column is utf8mb4 and MySQL's SUBSTR()
+        // counts characters, so a byte length overshoots for any non-ASCII
+        // name. "/Fotos N/" is 10 bytes but 9 characters, so the comparison
+        // took "/Fotos N/a" and matched nothing -- every row beneath an
+        // accented, CJK or emoji folder survived its deletion and kept
+        // counting against the owner's quota.
+        $stmt = $this->db->prepare('DELETE FROM file_metadata WHERE file_path = ? OR SUBSTR(file_path, 1, ?) = ?');
+        $stmt->execute([$path, mb_strlen($prefix), $prefix]);
     }
 
     /**
@@ -84,6 +119,10 @@ final class StorageLedger
     public function relocate(string $from, string $to): void
     {
         try {
+            // All of it or none of it: a failure partway used to leave some
+            // descendants renamed and the rest pointing at a folder that no
+            // longer exists.
+            $this->transactionally(function() use ($from, $to): void {
             $stmt = $this->db->prepare('UPDATE file_metadata SET file_path = ? WHERE file_path = ?');
             $stmt->execute([$to, $from]);
 
@@ -102,6 +141,7 @@ final class StorageLedger
             foreach ($rows as $row) {
                 $update->execute([rtrim($to, '/').'/'.substr((string)$row['file_path'], strlen($prefix)), (int)$row['id']]);
             }
+            });
         } catch (Throwable $e) {
             error_log('[ledger] relocate failed: '.$e->getMessage());
         }

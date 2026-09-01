@@ -50,8 +50,18 @@ final class UploadService
             if ($name === '.' || $name === '..') continue;
             $dir = $this->stagingRoot.'/'.$name;
             if (!is_dir($dir) || (filemtime($dir) ?: time()) >= $cutoff) continue;
-            $this->deleteStagingTree($dir);
-            $removed++;
+            // Per entry, because deleteStagingTree() throws on any failed
+            // rmdir or unlink and init() calls this before it does anything
+            // else -- so one directory PHP could not remove (left by another
+            // uid, or a FUSE quirk on Android) failed every user's every
+            // upload with a 500 until somebody deleted it by hand. Cleanup
+            // is opportunistic and must never block the actual work.
+            try {
+                $this->deleteStagingTree($dir);
+                $removed++;
+            } catch (\Throwable $e) {
+                error_log('[upload] could not clean abandoned session '.$dir.': '.$e->getMessage());
+            }
         }
         return $removed;
     }
@@ -63,7 +73,11 @@ final class UploadService
         $this->cleanupAbandoned();
 
         $max = max(1, (int)$this->config['max_upload_mb']) * 1024 * 1024;
-        if ($size < 0 || $size > $max) throw new RuntimeException('File exceeds the '.$this->config['max_upload_mb'].' MB limit', 413);
+        // Separated so the message names the actual fault. The route defaults
+        // a missing size to -1, which fell into the limit branch and answered
+        // "File exceeds the 2048 MB limit" for a field that was never sent.
+        if ($size < 0) throw new RuntimeException('A file size is required to start an upload', 400);
+        if ($size > $max) throw new RuntimeException('File exceeds the '.$this->config['max_upload_mb'].' MB limit', 413);
 
         $safeName = $this->files->safeName($name);
         $targetDir = $this->files->existing($targetPath);
@@ -269,14 +283,28 @@ final class UploadService
         }
         @unlink($dir.'/meta.json');
         @rmdir($dir);
-        return ['success'=>true,'name'=>basename($dest),'path'=>substr(str_replace('\\','/',$dest), strlen($this->config['root_dir']))];
+        // FileService::relative() rather than a substr() against the raw
+        // config value: $dest comes from existing(), which is a realpath,
+        // while config['root_dir'] is whatever was written in .env -- so a
+        // symlinked, trailing-slash or /./ ROOT_DIR cut the string at the
+        // wrong offset. relative() resolves the same root and asserts
+        // containment while it is there.
+        return ['success'=>true,'name'=>basename($dest),'path'=>$this->files->relative($dest)];
     }
 
     /** Explicitly cancel an upload and remove all staged bytes. */
     public function cancel(string $id): array
     {
         $dir = $this->sessionDir($id);
-        if(is_file($dir.'/meta.json')){$meta=$this->readMeta($id);$this->assertOwner($meta);}
+        // Upload ids are a deterministic hash of path|name|size|lastModified,
+        // so they are guessable -- and the ownership check used to sit inside
+        // this is_file() test while the delete below ran unconditionally.
+        // Anyone could therefore drop another account's staged bytes just by
+        // naming a session whose metadata was missing. Nothing to prove
+        // ownership against means nothing to cancel; genuinely orphaned
+        // directories are removed by the cleanupAbandoned() TTL.
+        if (!is_file($dir.'/meta.json')) throw new RuntimeException('Upload session not found or expired', 404);
+        $this->assertOwner($this->readMeta($id));
         if (is_dir($dir)) $this->deleteStagingTree($dir);
         return ['success'=>true];
     }
@@ -405,7 +433,7 @@ final class UploadService
         // Symlinks are unlinked, never followed, so a staged link cannot be
         // used to delete files elsewhere on the filesystem.
         if (is_link($normalised)) {
-            if (!unlink($normalised)) throw new RuntimeException('Unable to remove upload staging link', 500);
+            if (!@unlink($normalised)) throw new RuntimeException('Unable to remove upload staging link', 500);
             return;
         }
 
@@ -414,11 +442,14 @@ final class UploadService
                 if ($entry === '.' || $entry === '..') continue;
                 $this->deleteStagingTree($normalised.'/'.$entry);
             }
-            if (!rmdir($normalised)) throw new RuntimeException('Unable to remove upload staging directory', 500);
+            if (!@rmdir($normalised)) throw new RuntimeException('Unable to remove upload staging directory', 500);
             return;
         }
 
-        if (file_exists($normalised) && !unlink($normalised)) {
+        // Suppressed because each result is checked here and turned into an
+        // exception naming what could not be removed; the raw warning is the
+        // same fact with less context, and cleanupAbandoned() logs the throw.
+        if (file_exists($normalised) && !@unlink($normalised)) {
             throw new RuntimeException('Unable to remove upload staging file', 500);
         }
     }
