@@ -178,6 +178,25 @@ function release_session_lock(): void {
 }
 
 /**
+ * Expire old trash entries at most once a minute, rather than on every delete.
+ *
+ * trashPurgeExpired() reads one meta.json per trash entry, and the file
+ * manager deletes a selection one request at a time -- so deleting fifty
+ * files with two hundred entries in the trash was ten thousand file reads to
+ * answer a question whose answer changes once a day. The stamp file lives
+ * beside the usage cache, outside the storage root, so it is neither listed,
+ * searched, nor counted.
+ */
+function purge_expired_trash_occasionally(FileService $fs, int $retentionDays): void {
+    if ($retentionDays <= 0) return;
+    $stamp = dirname(__DIR__).'/storage/.cache/trash-purge';
+    if (is_file($stamp) && time()-(int)@filemtime($stamp) < 60) return;
+    if (!is_dir(dirname($stamp)) && !@mkdir(dirname($stamp), 0775, true) && !is_dir(dirname($stamp))) return;
+    @touch($stamp);
+    $fs->trashPurgeExpired($retentionDays);
+}
+
+/**
  * Where a file's cached thumbnail lives.
  *
  * Keyed by absolute path and modification time, so editing or replacing a
@@ -534,7 +553,7 @@ if ($path === '/api/files/delete' && $method === 'DELETE') api_try(function()use
     }
     $meta = $fs->trash($p, Auth::user()['username'] ?? null);
     ledger()->forget($meta['originalPath']);
-    $fs->trashPurgeExpired((int)$config['trash_retention_days']);
+    purge_expired_trash_occasionally($fs, (int)$config['trash_retention_days']);
     AuditLog::write(db(), 'file.trash', 'success', ['path' => $meta['originalPath'], 'id' => $meta['id']]);
     return ['success' => true, 'trashed' => true, 'id' => $meta['id'], 'message' => 'Moved to trash'];
 });
@@ -741,12 +760,29 @@ if ($path === '/api/trash/purge' && $method === 'POST') api_try(function()use($f
         'message' => $n === 1?'Permanently deleted 1 item':'Permanently deleted '.$n.' items'];
 });
 if ($path === '/api/files/rename' && $method === 'POST') api_try(function()use($fs, $config) {
-    $fs->writable(); $b = Http::body(); $a = $fs->existing((string)($b['oldPath']??'')); $z = $fs->destination((string)($b['newPath']??'')); if (!file_exists($a))throw new RuntimeException('Source not found', 404); if (file_exists($z)&&!$config['allow_overwrite'])throw new RuntimeException('Destination already exists', 409);
+    $fs->writable(); $b = Http::body(); $a = $fs->existing((string)($b['oldPath']??'')); $z = $fs->destination((string)($b['newPath']??'')); if (!file_exists($a))throw new RuntimeException('Source not found', 404);
+    /*
+     * A rename never destroys what is already there.
+     *
+     * ALLOW_OVERWRITE defaults to true, so this used to hand the path
+     * straight to rename() and silently delete the occupant -- no prompt, no
+     * trash, no audit entry -- and because the destination is any path, that
+     * included renaming across folders. The move/copy route takes the
+     * opposite decision under the very same flag, picking a free name, so the
+     * two disagreed about the same situation. This follows move/copy.
+     */
+    if (file_exists($z)) {
+        if (!$config['allow_overwrite'])throw new RuntimeException('Destination already exists', 409);
+        $z = $fs->freeName($z);
+    }
     $from = $fs->relative($a);
     if (!rename($a, $z))throw new RuntimeException('Rename failed', 500);
-    ledger()->relocate($from, $fs->relative($z));
-    return ['success' => true,
-        'message' => 'Renamed successfully'];
+    $to = $fs->relative($z);
+    ledger()->relocate($from, $to);
+    return ['success' => true, 'path' => $to, 'name' => basename($z),
+        'message' => basename($z) === basename((string)($b['newPath']??''))
+            ? 'Renamed successfully'
+            : 'Renamed to "'.basename($z).'" because that name was taken'];
 });
 /**
 * Resumable upload protocol.
@@ -767,7 +803,10 @@ if ($path === '/api/uploads/init' && $method === 'POST') api_try(function()use($
         (string)($b['uploadId']??''), (string)($b['conflict']??$config['upload_conflict'])
     );
 });
-if ($path === '/api/uploads/status' && $method === 'GET') api_try(fn() => uploads()->status((string)($_GET['id']??'')));
+if ($path === '/api/uploads/status' && $method === 'GET') api_try(function() {
+    release_session_lock();
+    return uploads()->status((string)($_GET['id']??''));
+});
 if ($path === '/api/uploads/chunk' && $method === 'PUT') api_try(function() {
     $id = (string)($_GET['id']??''); $offset = (int)($_SERVER['HTTP_X_UPLOAD_OFFSET']??-1);
     return uploads()->append($id, $offset, 'php://input');
@@ -851,6 +890,7 @@ if ($path === '/api/files/upload' && $method === 'POST') api_try(function()use($
             'files' => $saved];
     });
     if ($path === '/api/files/download-zip' && $method === 'POST') api_try(function()use($fs) {
+        release_session_lock();
         if (!class_exists('ZipArchive'))throw new RuntimeException('PHP zip extension is required', 500);
 
         $b = Http::body(262144);
@@ -861,6 +901,17 @@ if ($path === '/api/files/upload' && $method === 'POST') api_try(function()use($
 
         $tmp = tempnam(sys_get_temp_dir(), 'cfhzip');
         if ($tmp === false)throw new RuntimeException('Unable to create a temporary archive', 500);
+        /*
+         * Registered before anything can fail, because the archive has to be
+         * removed on paths this function never returns from.
+         *
+         * With the default ignore_user_abort=0, cancelling the download kills
+         * the script inside readfile() below, so the unlink after it never
+         * ran. Nothing else cleans sys_get_temp_dir(), so a few cancelled
+         * multi-gigabyte downloads filled the disk -- which then breaks
+         * session writes and uploads rather than just downloads.
+         */
+        register_shutdown_function(static function() use ($tmp): void { @unlink($tmp); });
 
         $zip = new ZipArchive();
         // tempnam() has already created the file, so OVERWRITE is required.
@@ -940,17 +991,39 @@ if ($path === '/api/files/upload' && $method === 'POST') api_try(function()use($
 
     if ($path === '/api/shares/create' && $method === 'POST') api_try(function()use($fs, $config, $basePath) {
         $b = Http::body(16384);
-        $rel = Http::string($b, 'filePath', 1, 4096);
-        $f = $fs->existing($rel);
+        $f = $fs->existing(Http::string($b, 'filePath', 1, 4096));
         if (!is_file($f))throw new RuntimeException('File not found', 404);
+        // The canonical path, not the caller's spelling of it: "/docs/a.pdf"
+        // and "/docs//a.pdf" are one file, and storing them as two different
+        // file_path values made the reuse lookup below miss and issue a
+        // second live token for the same file.
+        $rel = $fs->relative($f);
 
         $hours = Http::optionalInt($b, 'expiresInHours', 0, 8760, (int)$config['share_expiry_hours']);
         $pdo = db();
 
-        // Reuse a live link for the same file so repeated shares stay stable,
-        // unless the caller asked for a different lifetime.
-        $s = $pdo->prepare('SELECT token,expires_at FROM share_links WHERE file_path=? AND (expires_at IS NULL OR expires_at>UTC_TIMESTAMP()) LIMIT 1');
-        $s->execute([$rel]);
+        /*
+         * Reuse a live link for the same file so repeated shares stay stable,
+         * unless the caller asked for a different lifetime.
+         *
+         * The lifetime is part of the match. Without it the comment above was
+         * simply not implemented: $hours never reached the query, so asking
+         * for a one-hour link on a file that already had a permanent one
+         * returned the permanent token and reported expiresAt: null. The
+         * reverse was worse -- a file first shared for an hour could never be
+         * re-shared for longer, so the caller handed out a link that was
+         * already dead.
+         *
+         * A minute of tolerance absorbs the delay between the original
+         * INSERT and this request; anything further apart is a different
+         * lifetime and earns a new token.
+         */
+        $wantPermanent = $hours <= 0;
+        $s = $pdo->prepare($wantPermanent
+            ? 'SELECT token,expires_at FROM share_links WHERE file_path=? AND expires_at IS NULL LIMIT 1'
+            : 'SELECT token,expires_at FROM share_links WHERE file_path=? AND expires_at IS NOT NULL'
+                .' AND expires_at>UTC_TIMESTAMP() AND ABS(TIMESTAMPDIFF(SECOND, expires_at, ?))<=60 LIMIT 1');
+        $s->execute($wantPermanent ? [$rel] : [$rel, gmdate('Y-m-d H:i:s', time()+$hours*3600)]);
         $r = $s->fetch(PDO::FETCH_ASSOC);
 
         if (!$r) {
@@ -969,6 +1042,7 @@ if ($path === '/api/files/upload' && $method === 'POST') api_try(function()use($
             'expiresAt' => $r['expires_at']?gmdate('c', strtotime((string)$r['expires_at'])):null];
     });
     if ($path === '/api/shares/list' && $method === 'GET') api_try(function()use($config, $basePath, $fs) {
+        release_session_lock();
         Authorization::requireAdmin();
         $pdo = db();
         $pdo->exec('DELETE FROM share_links WHERE expires_at IS NOT NULL AND expires_at<UTC_TIMESTAMP()');
@@ -1122,6 +1196,7 @@ if ($path === '/api/files/upload' && $method === 'POST') api_try(function()use($
      * image of sane size before it is written.
      */
     if ($path === '/api/thumbnail/video' && $method === 'POST') api_try(function()use($fs) {
+        release_session_lock();
         $b = Http::body(512 * 1024);
         $rel = Http::string($b, 'path', 1, 4096);
 
@@ -1209,6 +1284,7 @@ if ($path === '/api/files/upload' && $method === 'POST') api_try(function()use($
 
     if ($path === '/api/users' && $method === 'GET') api_try(function() {
         Authorization::requireAdmin();
+        release_session_lock();
         return (new UserRepository(db()))->all();
     });
 
@@ -1279,6 +1355,7 @@ if ($path === '/api/files/upload' && $method === 'POST') api_try(function()use($
     });
 
     if ($path === '/api/security/events' && $method === 'GET') api_try(function() {
+        release_session_lock();
         Authorization::requireAdmin();
         $limit = max(1, min(200, (int)($_GET['limit']??100)));
         $stmt = db()->prepare('SELECT id,user_id,username,event_type,outcome,ip_address,user_agent,request_id,context_json,created_at FROM security_events ORDER BY id DESC LIMIT '.$limit);

@@ -60,7 +60,6 @@ CREATE TABLE IF NOT EXISTS file_metadata (
  mime_type VARCHAR(190) NULL,
  uploaded_by INT UNSIGNED NULL,
  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
- CONSTRAINT fk_file_metadata_server FOREIGN KEY(server_id) REFERENCES storage_servers(id) ON DELETE CASCADE,
  INDEX idx_file_server(server_id), INDEX idx_file_server_path(server_id, file_path(190)), INDEX idx_file_uploader(uploaded_by)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 

@@ -169,8 +169,16 @@ $checks['delete moves to the trash when it is enabled'] =
     && str_contains($index, "'trashed' => true");
 $checks['delete still honours an opt-out'] =
     str_contains($index, "if (!\$config['trash_enabled']) {") && str_contains($index, "'message' => 'Deleted permanently'");
+// Still driven by deletions, but throttled: trashPurgeExpired() reads one
+// meta.json per trash entry, and a selection is deleted one request at a
+// time, so running it on every delete cost thousands of file reads to answer
+// a question whose answer changes once a day.
 $checks['expired entries are purged as deletions happen'] =
-    str_contains($index, "\$fs->trashPurgeExpired((int)\$config['trash_retention_days']);");
+    str_contains($index, "purge_expired_trash_occasionally(\$fs, (int)\$config['trash_retention_days']);")
+    && str_contains($index, "\$fs->trashPurgeExpired(\$retentionDays);");
+$checks['the purge is throttled rather than run per delete'] =
+    str_contains($index, 'function purge_expired_trash_occasionally(')
+    && str_contains($index, "if (is_file(\$stamp) && time()-(int)@filemtime(\$stamp) < 60) return;");
 $checks['the new operations are audited'] = (function () use ($index): bool {
     foreach (['file.trash', 'file.restore', 'file.purge', "'file.'.\$verb"] as $event) {
         if (!str_contains($index, $event)) return false;
@@ -188,7 +196,21 @@ $checks['the trash settings are documented'] =
 // --- UI -----------------------------------------------------------------
 $checks['the search field has a scope toggle'] =
     str_contains($view, 'id="scope-all"') && str_contains($app, "function setScope(scope)");
-$checks['an all-folders search is debounced'] = str_contains($app, 'searchTimer = setTimeout(runSearch, 250)');
+// Both paths share the one timer now. Filtering the current folder used to
+// re-render the whole list on every character while only the remote search
+// was debounced.
+$checks['an all-folders search is debounced'] =
+    str_contains($app, "searchTimer = setTimeout(S.scope === 'all' ? runSearch : renderFiles, 250);");
+// The input handler must go through the timer on both branches rather than
+// calling renderFiles() straight out of the event.
+$checks['filtering the current folder is debounced too'] = (function () use ($app): bool {
+    $start = strpos($app, "\$('#search').addEventListener('input'");
+    if ($start === false) return false;
+    $handler = substr($app, $start, (int)strpos($app, '});', $start) - $start);
+    return str_contains($handler, 'clearTimeout(searchTimer);')
+        && str_contains($handler, 'setTimeout(')
+        && !preg_match('/^\s*renderFiles\(\);\s*$/m', $handler);
+})();
 $checks['a stale search cannot overwrite a newer one'] = str_contains($app, 'if (run !== searchRun) return;');
 $checks['search results say which folder they are in'] = str_contains($app, '` · in ${esc(parentLabel(f.path))}`');
 $checks['move and copy are offered on a selection'] =

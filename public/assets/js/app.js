@@ -175,17 +175,27 @@ function sortedFiles() {
     });
 }
 
-function updateSelectionUI() {
-    const n = S.selected.size, bar = $('#selection-bar');
-    bar.hidden = n === 0;
+function updateSelectionCount() {
+    const n = S.selected.size;
+    $('#selection-bar').hidden = n === 0;
     $('#selection-count').textContent = `${n} selected`;
+}
+
+/** Full resync. Needed after a re-render or select-all, not after one toggle. */
+function updateSelectionUI() {
+    updateSelectionCount();
     document.querySelectorAll('[data-sel]').forEach(c => c.checked = S.selected.has(decodeURIComponent(c.dataset.sel)));
     document.querySelectorAll('.file').forEach(card => card.classList.toggle('selected', S.selected.has(decodeURIComponent(card.dataset.path))));
 }
 
 function toggleSelection(path, checked) {
     checked ? S.selected.add(path) : S.selected.delete(path);
-    updateSelectionUI();
+    // Only the toggled card changed, so the full sweep -- two document-wide
+    // querySelectorAll passes plus a decodeURIComponent per node -- is not
+    // needed here. Ticking fifty files by hand ran it fifty times.
+    updateSelectionCount();
+    const card = document.querySelector(`.file[data-path="${CSS.escape(encodeURIComponent(path))}"]`);
+    if (card) card.classList.toggle('selected', checked);
 }
 
 
@@ -420,7 +430,14 @@ async function persistVideoThumbnail(path, blob) {
     }
 }
 
+let videoThumbObserver = null;
+
 function initVideoThumbnails() {
+    // Every render used to create another IntersectionObserver and leave the
+    // previous one observing nodes that renderFiles() had already thrown away,
+    // so filtering a folder left one live observer per keystroke.
+    if (videoThumbObserver) { videoThumbObserver.disconnect(); videoThumbObserver = null; }
+
     const buttons = [...document.querySelectorAll('.thumb-preview.video-thumb[data-video-thumb]')];
     if (!buttons.length) return;
 
@@ -450,7 +467,7 @@ function initVideoThumbnails() {
     };
 
     if ('IntersectionObserver' in window) {
-        const observer = new IntersectionObserver(entries => {
+        const observer = videoThumbObserver = new IntersectionObserver(entries => {
             for (const entry of entries) {
                 if (!entry.isIntersecting) continue;
                 observer.unobserve(entry.target);
@@ -1127,12 +1144,12 @@ $('#selection-copy').addEventListener('click', () => relocateSelected('copy'));
 $('#mkdir').addEventListener('click', makeFolder);
 $('#refresh').addEventListener('click', () => loadFiles());
 $('#search').addEventListener('input', () => {
-    if (S.scope === 'all') {
-        clearTimeout(searchTimer);
-        searchTimer = setTimeout(runSearch, 250);
-        return;
-    }
-    renderFiles();
+    // Both paths are debounced by the same 250ms. Filtering in "this folder"
+    // mode used to re-render on every character, and a render rebuilds the
+    // whole list -- every card, every <img>, and a fresh set of listeners --
+    // so typing an eight-character name rebuilt it eight times.
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(S.scope === 'all' ? runSearch : renderFiles, 250);
 });
 $('#sort-files').value = S.sort;
 $('#sort-files').addEventListener('change', e => {

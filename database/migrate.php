@@ -144,6 +144,55 @@ if (!indexExists($pdo, 'file_metadata', 'idx_file_server_path')) $pdo->exec('ALT
 // Per-user usage is a SUM grouped by this column on every upload attempt.
 if (!indexExists($pdo, 'file_metadata', 'idx_file_uploader')) $pdo->exec('ALTER TABLE file_metadata ADD INDEX idx_file_uploader (uploaded_by)');
 
+/*
+ * Usernames must be unique, and on an upgraded installation they were not.
+ *
+ * The UNIQUE KEY is declared in the CREATE TABLE above, which only runs when
+ * `users` does not yet exist -- so precisely the legacy table this script is
+ * written to repair never gained it. Without the constraint,
+ * UserRepository::create() is a check-then-insert with no transaction, and two
+ * concurrent requests can create two accounts with one name; Auth::login()
+ * then does WHERE username = ? LIMIT 1 with no ORDER BY, so which of them you
+ * authenticate as is whatever InnoDB returns first.
+ *
+ * Adding a unique index to a table that already holds duplicates fails, and
+ * this script must not abort half-way through on an installation that has
+ * them -- so they are reported for a human to resolve and the rest of the
+ * migration continues.
+ */
+if (!indexExists($pdo, 'users', 'uq_users_username')) {
+    $dupes = $pdo->query('SELECT username, COUNT(*) AS n FROM users GROUP BY username HAVING n > 1')->fetchAll();
+    if ($dupes) {
+        echo "\n!! users.username has no unique index and duplicates exist, so it cannot be added yet:\n";
+        foreach ($dupes as $d) echo "     {$d['username']} ({$d['n']} accounts)\n";
+        echo "   Which account a duplicated name signs in as is undefined until this is resolved.\n";
+        echo "   Keep one row per name, then re-run this script.\n\n";
+    } else {
+        $pdo->exec('ALTER TABLE users ADD UNIQUE KEY uq_users_username (username)');
+        echo "Added users.uq_users_username\n";
+    }
+}
+
+/*
+ * Deleting a storage server must not delete anybody's usage history.
+ *
+ * schema.sql used to declare this foreign key ON DELETE CASCADE while this
+ * script created the table without it, so a fresh installation and an upgraded
+ * one behaved completely differently: on a fresh one, removing a server row
+ * silently wiped every file_metadata row, and since sweep() only ever deletes
+ * rows and never re-inserts them, the accounting never recovered. server_id is
+ * a fiction anyway -- files always live on the local filesystem via
+ * FileService. The constraint is gone from schema.sql; drop it here so
+ * installations created before that converge.
+ */
+$fk = $pdo->query("SELECT CONSTRAINT_NAME FROM information_schema.TABLE_CONSTRAINTS
+    WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'file_metadata'
+      AND CONSTRAINT_TYPE = 'FOREIGN KEY' AND CONSTRAINT_NAME = 'fk_file_metadata_server'")->fetchColumn();
+if ($fk) {
+    $pdo->exec('ALTER TABLE file_metadata DROP FOREIGN KEY fk_file_metadata_server');
+    echo "Dropped file_metadata.fk_file_metadata_server (it cascade-deleted the usage ledger)\n";
+}
+
 // Phase 4 removed the predefined account: seeding a known password hash here
 // meant every migrated installation carried a working admin/change-me login.
 // Administrators are created deliberately instead.

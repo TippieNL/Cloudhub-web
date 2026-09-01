@@ -16,6 +16,16 @@ use RuntimeException;
  */
 final class UploadService
 {
+    /**
+     * Status for "this upload's metadata cannot be parsed".
+     *
+     * 422 rather than 500 because the staged bytes, not the server, are what
+     * is unprocessable -- and it has to be distinguishable from assertOwner()'s
+     * 404 so that init() never mistakes somebody else's session for a damaged
+     * one of its own.
+     */
+    private const META_UNREADABLE = 422;
+
     private string $stagingRoot;
 
     public function __construct(
@@ -73,9 +83,18 @@ final class UploadService
                 }
                 return $this->statusPayload($id, $meta);
             } catch (RuntimeException $e) {
-                if ($e->getCode() === 409) throw $e;
-                // A prior interrupted metadata write must not permanently block
-                // the same file. Remove the damaged session and recreate it.
+                /*
+                 * Only genuinely unreadable metadata may be recreated.
+                 *
+                 * assertOwner() throws 404, and this used to treat anything
+                 * that was not a 409 as "damaged session, start over" -- so a
+                 * session belonging to somebody else was deleted rather than
+                 * refused. Upload ids are a hash of path|name|size|lastModified
+                 * (see uploadKey() in app.js), not per-user, so two people
+                 * uploading the same file to the same folder collide by
+                 * construction and the second wiped the first's staged bytes.
+                 */
+                if ($e->getCode() !== self::META_UNREADABLE) throw $e;
                 $this->deleteStagingTree($dir);
             }
         }
@@ -108,15 +127,53 @@ final class UploadService
         $meta = $this->readMeta($id);
         $this->assertOwner($meta);
         $part = $this->sessionDir($id).'/data.part';
-        $current = is_file($part) ? (filesize($part) ?: 0) : 0;
-        if ($offset !== $current) throw new RuntimeException('Upload offset mismatch; expected '.$current, 409);
+        $chunkLimit = max(1, (int)$this->config['upload_chunk_mb']) * 1024 * 1024;
+
+        $in = fopen($input, 'rb');
+        // 'c+b' rather than 'ab': the write has to land at a position this
+        // method chooses, not wherever the file currently ends.
+        $out = fopen($part, 'c+b');
+        if (!$in || !$out) {
+            if ($in) fclose($in);
+            if ($out) fclose($out);
+            throw new RuntimeException('Unable to open upload stream', 500);
+        }
+
+        /*
+         * The offset is checked and the write positioned under one exclusive
+         * lock.
+         *
+         * Previously the size was read, compared, and then appended with 'ab'
+         * with nothing held in between. Because upload ids are deterministic
+         * (a hash of path|name|size|lastModified), the same file dropped into
+         * two tabs produces two requests with the same id: both read offset 0,
+         * both passed the check, and both appended -- leaving data.part at
+         * twice the length. From then on complete() failed 409 "incomplete"
+         * forever and append() failed 413, because $remaining went negative.
+         * The session could not be recovered before the 24-hour sweep.
+         */
+        $written = 0;
+        if (!flock($out, LOCK_EX)) {
+            fclose($in);
+            fclose($out);
+            throw new RuntimeException('Unable to lock the upload for writing', 500);
+        }
+        clearstatcache(true, $part);
+        $current = (int)(fstat($out)['size'] ?? 0);
+        if ($offset !== $current) {
+            flock($out, LOCK_UN);
+            fclose($in);
+            fclose($out);
+            throw new RuntimeException('Upload offset mismatch; expected '.$current, 409);
+        }
+        if (fseek($out, $current) !== 0) {
+            flock($out, LOCK_UN);
+            fclose($in);
+            fclose($out);
+            throw new RuntimeException('Unable to position the upload for writing', 500);
+        }
 
         $remaining = (int)$meta['size'] - $current;
-        $chunkLimit = max(1, (int)$this->config['upload_chunk_mb']) * 1024 * 1024;
-        $in = fopen($input, 'rb');
-        $out = fopen($part, 'ab');
-        if (!$in || !$out) throw new RuntimeException('Unable to open upload stream', 500);
-        $written = 0;
         try {
             // The browser sends exactly chunkBytes per chunk, so $written
             // reaches $chunkLimit while the stream is not yet at EOF. Testing
@@ -141,6 +198,11 @@ final class UploadService
                 }
             }
         } finally {
+            // Flush before releasing: another waiter must observe this chunk's
+            // bytes in the size it reads under the lock, or it would compute
+            // the same offset again.
+            fflush($out);
+            flock($out, LOCK_UN);
             fclose($in);
             fclose($out);
         }
@@ -172,11 +234,38 @@ final class UploadService
                 throw new RuntimeException('Overwrite is disabled by server configuration', 403);
             }
             if ($policy === 'overwrite' && is_dir($dest)) throw new RuntimeException('Destination is a directory', 409);
-            if ($policy === 'overwrite' && is_file($dest) && !unlink($dest)) throw new RuntimeException('Unable to replace existing file', 500);
         }
 
-        if (!rename($part, $dest)) {
-            if (!copy($part, $dest) || !unlink($part)) throw new RuntimeException('Unable to finalise uploaded file', 500);
+        /*
+         * The existing file is never removed before its replacement is in
+         * place.
+         *
+         * unlink($dest) used to run first, so an overwrite that then failed
+         * both rename() and copy() -- staging on another filesystem gives
+         * EXDEV, a full target disk gives ENOSPC -- destroyed the old file
+         * without writing the new one. Nothing restored it and it never
+         * reached the trash.
+         *
+         * rename() over an existing path is atomic on POSIX, so the common
+         * case needs no unlink at all. The cross-device fallback copies to a
+         * temporary name *in the destination directory* and renames that into
+         * place, so the destination is only ever replaced by a complete file.
+         */
+        if (!@rename($part, $dest)) {
+            $staged = $dest.'.cfh-incoming-'.bin2hex(random_bytes(6));
+            if (!copy($part, $staged)) {
+                @unlink($staged);
+                throw new RuntimeException('Unable to finalise uploaded file', 500);
+            }
+            if (!rename($staged, $dest)) {
+                @unlink($staged);
+                throw new RuntimeException('Unable to finalise uploaded file', 500);
+            }
+            // The bytes are committed. A staging file that will not delete is
+            // a cleanup problem, not a reason to fail an upload that landed --
+            // reporting failure here made clients retry and produce a
+            // duplicate "name (1).ext" from the very same part file.
+            if (!@unlink($part)) error_log('[upload] could not remove staging file '.$part);
         }
         @unlink($dir.'/meta.json');
         @rmdir($dir);
@@ -215,7 +304,11 @@ final class UploadService
         $file = $this->sessionDir($id).'/meta.json';
         if (!is_file($file)) throw new RuntimeException('Upload session not found or expired', 404);
         $meta = json_decode((string)file_get_contents($file), true);
-        if (!is_array($meta)) throw new RuntimeException('Upload metadata is invalid', 500);
+        // Distinct from every other failure so init() can tell "this session's
+        // metadata is unreadable, so recreate it" apart from "this session
+        // belongs to someone else, so refuse". Those two were previously
+        // indistinguishable, and the second was treated as the first.
+        if (!is_array($meta)) throw new RuntimeException('Upload metadata is invalid', self::META_UNREADABLE);
         return $meta;
     }
 

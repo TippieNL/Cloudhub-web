@@ -39,7 +39,17 @@ final class Auth {
         if((isset($_SESSION['created_at'])&&$now-(int)$_SESSION['created_at']>$absolute)||(isset($_SESSION['last_seen_at'])&&$now-(int)$_SESSION['last_seen_at']>$idle)){
             self::destroySession();session_start();
         }
-        $_SESSION['created_at']??=$now;$_SESSION['last_seen_at']=$now;$_SESSION['csrf']??=bin2hex(random_bytes(32));
+        $_SESSION['created_at']??=$now;$_SESSION['csrf']??=bin2hex(random_bytes(32));
+        /*
+         * Only move last_seen_at when it has actually aged.
+         *
+         * session.lazy_write (on by default) skips writing the session file
+         * when nothing in $_SESSION changed -- but stamping the clock on every
+         * request changed it every time, so a gallery load's ~240 requests
+         * meant ~240 session writes to Android flash. A minute of granularity
+         * is invisible to the idle check above, whose floor is 300 seconds.
+         */
+        if($now-(int)($_SESSION['last_seen_at']??0)>=60)$_SESSION['last_seen_at']=$now;
         // A session carried forward from a rotation is only valid for the short
         // grace window below; once it lapses the successor ID is the only one
         // accepted. Requests still holding the old ID are shown the door here
