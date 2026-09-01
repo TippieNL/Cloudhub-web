@@ -184,7 +184,7 @@ final class FileService {
   $this->assertContained(str_replace('\\','/',$src));$this->assertContained(str_replace('\\','/',$dst));
   if(is_link($src))throw new RuntimeException('Symlinks cannot be copied',403);
   if(is_dir($src)){
-   if(!is_dir($dst)&&!mkdir($dst,0775,true)&&!is_dir($dst))throw new RuntimeException('Unable to create the destination directory',500);
+   if(!is_dir($dst)&&!@mkdir($dst,0775,true)&&!is_dir($dst))throw new RuntimeException('Unable to create the destination directory',500);
    foreach(scandir($src)?:[] as $n){if($n==='.'||$n==='..')continue;$this->copyTree($src.'/'.$n,$dst.'/'.$n);}
    return;
   }
@@ -344,7 +344,10 @@ final class FileService {
 
   $id=gmdate('Ymd-His').'-'.bin2hex(random_bytes(4));
   $entry=$this->trashRoot().'/'.$id;
-  if(!mkdir($entry.'/payload',0775,true))throw new RuntimeException('Unable to open the trash',500);
+  // Suppressed because the return value is checked right here and turned
+  // into an exception that says what failed and why; the raw warning is the
+  // same fact with less context, and bootstrap's handler logs the throw.
+  if(!@mkdir($entry.'/payload',0775,true))throw new RuntimeException('Unable to open the trash',500);
 
   $name=basename($realPath);
   if(!rename($realPath,$entry.'/payload/'.$name)){
@@ -406,7 +409,7 @@ final class FileService {
 
   $target=$this->sanitize((string)$meta['originalPath']);
   $parent=dirname($target);
-  if(!is_dir($parent)&&!mkdir($parent,0775,true)&&!is_dir($parent))throw new RuntimeException('Unable to recreate the original folder',500);
+  if(!is_dir($parent)&&!@mkdir($parent,0775,true)&&!is_dir($parent))throw new RuntimeException('Unable to recreate the original folder',500);
   $target=$this->freeName($target);
 
   if(!rename($payload,$target))throw new RuntimeException('Unable to restore '.$meta['name'],500);
