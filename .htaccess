@@ -16,6 +16,34 @@ RewriteCond %{REQUEST_FILENAME} -f [OR]
 RewriteCond %{REQUEST_FILENAME} -d
 RewriteRule ^public/ - [L]
 
+# Compress text assets. app.js alone is 74 KB before compression, and the
+# stylesheets and player modules add to that on a first visit. Wrapped in
+# IfModule so the file stays valid where the module is not built in -- KSWEB's
+# Apache is not guaranteed to carry either of these.
+<IfModule mod_deflate.c>
+  AddOutputFilterByType DEFLATE text/html text/plain text/css text/javascript
+  AddOutputFilterByType DEFLATE application/javascript application/json
+  AddOutputFilterByType DEFLATE image/svg+xml application/xml
+</IfModule>
+
+# Static assets are versionless, so they are revalidated rather than held
+# indefinitely: a week with must-revalidate keeps a deploy from serving stale
+# JavaScript to a browser that already has it. The thumbnail route sets its own
+# immutable, year-long policy in PHP, because those URLs do change per file.
+<IfModule mod_expires.c>
+  ExpiresActive On
+  ExpiresByType text/css "access plus 7 days"
+  ExpiresByType text/javascript "access plus 7 days"
+  ExpiresByType application/javascript "access plus 7 days"
+  ExpiresByType image/png "access plus 30 days"
+  ExpiresByType image/svg+xml "access plus 30 days"
+</IfModule>
+<IfModule mod_headers.c>
+  <FilesMatch "\.(css|js)$">
+    Header append Cache-Control "must-revalidate"
+  </FilesMatch>
+</IfModule>
+
 # Everything else goes through the root bootstrap. This intentionally also
 # handles the existing project directory itself when installed in a subfolder.
 RewriteCond %{REQUEST_FILENAME} !-f

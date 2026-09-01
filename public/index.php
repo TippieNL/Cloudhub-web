@@ -1217,6 +1217,14 @@ if ($path === '/api/files/upload' && $method === 'POST') api_try(function()use($
         $nw = max(1, (int)round($w * $scale));
         $nh = max(1, (int)round($h * $scale));
         $im = imagecreatetruecolor($nw, $nh);
+        // A truecolor canvas starts opaque black with save-alpha off, so a
+        // transparent PNG or GIF resampled onto it came out with black behind
+        // whatever should have shown through, and imagewebp() then wrote no
+        // alpha channel at all. Blending is turned off so the source alpha is
+        // copied rather than composited against the black.
+        imagealphablending($im, false);
+        imagesavealpha($im, true);
+        imagefill($im, 0, 0, imagecolorallocatealpha($im, 0, 0, 0, 127));
         imagecopyresampled($im, $create, 0, 0, 0, 0, $nw, $nh, $w, $h);
 
         // Write through a temporary file: two browsers asking for the same new

@@ -94,6 +94,28 @@ $assets = htmlspecialchars($assetBase, ENT_QUOTES, 'UTF-8');
         </main>
     <?php endif; ?>
 
+    <?php
+    /*
+     * The player is a module graph three levels deep: the browser cannot see
+     * PlayerUI's twelve imports until PlayerUI itself has downloaded and
+     * parsed, and VTTParser only after SubtitleManager does. Preloading the
+     * dependencies starts every request in the same round trip; the graph
+     * itself is unchanged, so this is a hint and nothing depends on it.
+     */
+    ?>
+    <link rel="modulepreload" href="<?= $assets ?>/assets/js/player/PlayerSettings.js">
+    <link rel="modulepreload" href="<?= $assets ?>/assets/js/player/SubtitleManager.js">
+    <link rel="modulepreload" href="<?= $assets ?>/assets/js/player/ThumbnailProvider.js">
+    <link rel="modulepreload" href="<?= $assets ?>/assets/js/player/ThumbnailPreview.js">
+    <link rel="modulepreload" href="<?= $assets ?>/assets/js/player/SeekBar.js">
+    <link rel="modulepreload" href="<?= $assets ?>/assets/js/player/KeyboardShortcuts.js">
+    <link rel="modulepreload" href="<?= $assets ?>/assets/js/player/TouchGestures.js">
+    <link rel="modulepreload" href="<?= $assets ?>/assets/js/player/VolumeManager.js">
+    <link rel="modulepreload" href="<?= $assets ?>/assets/js/player/PlaybackSpeed.js">
+    <link rel="modulepreload" href="<?= $assets ?>/assets/js/player/PictureInPicture.js">
+    <link rel="modulepreload" href="<?= $assets ?>/assets/js/player/FullscreenManager.js">
+    <link rel="modulepreload" href="<?= $assets ?>/assets/js/player/Overlay.js">
+    <link rel="modulepreload" href="<?= $assets ?>/assets/js/player/VTTParser.js">
     <script type="module" nonce="<?= $nonce ?>" src="<?= $assets ?>/assets/js/player/PlayerUI.js"></script>
     <script nonce="<?= $nonce ?>">
         window.CLOUDHUB_BASE = <?= json_encode($basePath, JSON_UNESCAPED_SLASHES) ?>;
