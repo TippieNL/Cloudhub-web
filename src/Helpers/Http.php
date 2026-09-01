@@ -66,7 +66,10 @@ final class Http {
   $raw=file_get_contents('php://input',false,null,0,$max+1);if($raw===false)self::error(400,'INVALID_REQUEST','Unable to read request body');
   if(strlen($raw)>$max)self::error(413,'REQUEST_TOO_LARGE','Request body is too large');if(trim($raw)==='')return [];
   try{$v=json_decode($raw,true,64,JSON_THROW_ON_ERROR);}catch(\JsonException){self::error(400,'INVALID_JSON','Request body contains invalid JSON');}
-  if(!is_array($v)||array_is_list($v))self::error(400,'INVALID_JSON','JSON request body must be an object');return $v;
+  // array_is_list([]) is true, and json_decode('{}',true) is [] -- so the
+  // list check alone rejected a valid empty object. An entirely empty body
+  // already returns [] a line above, which means the same thing.
+  if(!is_array($v)||($v!==[]&&array_is_list($v)))self::error(400,'INVALID_JSON','JSON request body must be an object');return $v;
  }
  public static function error(int $status,string $code,string $message,array $details=[]):never{
   http_response_code($status);header('Content-Type: application/json; charset=utf-8');header('Cache-Control: no-store');header('X-Request-ID: '.self::requestId());

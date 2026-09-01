@@ -117,12 +117,35 @@ function serve_file_range(string $file, string $mime, string $disposition, strin
         } else {
             $start = (int)$first;
             $end = $last === ''?$size-1:min((int)$last, $size-1);
-            if ($start >= $size || $start > $end)$unsatisfiable();
         }
+        // Checked for both range forms rather than only the explicit one. A
+        // zero-length file has no satisfiable byte range at all, but the
+        // suffix branch fell through to $start=0, $end=-1 and answered 206
+        // with "Content-Range: bytes 0--1/0", which is not a range.
+        if ($start >= $size || $start > $end)$unsatisfiable();
         $status = 206;
     }
 
     $length = $size === 0?0:($end-$start+1);
+
+    /*
+     * The handle is opened and positioned before a single header goes out.
+     *
+     * Opening it afterwards meant a failure here threw with Content-Length
+     * already committed, and the handler in config/bootstrap.php -- which
+     * guards only the status code behind headers_sent() -- then wrote a JSON
+     * error object into the bytes the client was reading as the file.
+     */
+    $handle = null;
+    if ($method !== 'HEAD' && $length > 0) {
+        $handle = @fopen($file, 'rb');
+        if ($handle === false)throw new RuntimeException('Unable to open file for streaming', 500);
+        if ($start > 0 && fseek($handle, $start) !== 0) {
+            fclose($handle);
+            throw new RuntimeException('Unable to seek file for streaming', 500);
+        }
+    }
+
     http_response_code($status);
     header('Content-Type: '.$mime);
     header('Content-Disposition: '.$disposition.'; filename="'.str_replace(['"', "\r", "\n"], '_', basename($file)).'"');
@@ -132,17 +155,10 @@ function serve_file_range(string $file, string $mime, string $disposition, strin
     foreach ($extraHeaders as $header)header($header);
     if ($status === 206)header('Content-Range: bytes '.$start.'-'.$end.'/'.$size);
 
-    if ($method === 'HEAD' || $length === 0)exit;
+    if ($handle === null)exit;
 
     @set_time_limit(0);
     while (ob_get_level() > 0)@ob_end_clean();
-
-    $handle = @fopen($file, 'rb');
-    if ($handle === false)throw new RuntimeException('Unable to open file for streaming', 500);
-    if ($start > 0 && fseek($handle, $start) !== 0) {
-        fclose($handle);
-        throw new RuntimeException('Unable to seek file for streaming', 500);
-    }
 
     $remaining = $length;
     $bufferSize = 1024*1024; // 1 MiB server-side streaming buffer.
@@ -233,7 +249,10 @@ function send_thumbnail(string $cache): never {
         exit;
     }
 
-    header('Content-Length: '.filesize($cache));
+    // filesize() returns false on failure, which interpolates to an empty
+    // Content-Length header rather than a number.
+    $cachedSize = @filesize($cache);
+    if ($cachedSize !== false)header('Content-Length: '.$cachedSize);
     readfile($cache);
     exit;
 }
@@ -406,9 +425,20 @@ function share_resolve(FileService $fs, string $token): array {
  * particular script-capable text such as HTML or SVG -- is downloaded instead,
  * so a share link can never execute markup on this origin.
  */
+function mime_renders_markup(string $mime): bool {
+    // SVG is the one that hides inside an image/* prefix check: it is a
+    // document that can carry <script>, so serving it inline puts attacker
+    // markup on this origin under the viewer's session.
+    return $mime === 'image/svg+xml'
+        || $mime === 'text/html'
+        || $mime === 'application/xhtml+xml'
+        || $mime === 'text/xml'
+        || $mime === 'application/xml';
+}
+
 function share_media_kind(string $file): string {
     $mime = media_mime_type($file);
-    if ($mime === 'image/svg+xml')return 'other';
+    if (mime_renders_markup($mime))return 'other';
     if (str_starts_with($mime, 'image/'))return 'image';
     if (str_starts_with($mime, 'video/'))return 'video';
     if (str_starts_with($mime, 'audio/'))return 'audio';
@@ -491,7 +521,7 @@ if ($path === '/api/files/list' && $method === 'GET') api_try(function()use($fs)
 });
 if ($path === '/api/files/download' && $method === 'GET') api_try(function()use($fs) {
     release_session_lock();
-    $f = $fs->existing((string)($_GET['path']??'')); if (!is_file($f))throw new RuntimeException('File not found', 404); header('Content-Type: '.mime_type($f)); header('Content-Disposition: attachment; filename="'.str_replace(['"', "\r", "\n"], '_', basename($f)).'"'); header('Content-Length: '.filesize($f)); readfile($f); exit;
+    $f = $fs->existing((string)($_GET['path']??'')); if (!is_file($f))throw new RuntimeException('File not found', 404); header('Content-Type: '.mime_type($f)); header('Content-Disposition: attachment; filename="'.str_replace(['"', "\r", "\n"], '_', basename($f)).'"'); $downloadSize = @filesize($f); if ($downloadSize !== false)header('Content-Length: '.$downloadSize); readfile($f); exit;
 });
 /**
 * Streams a file for the authenticated preview dialog.
@@ -525,7 +555,8 @@ if (($path === '/api/files/preview') && ($method === 'GET' || $method === 'HEAD'
     if (!is_file($f))throw new RuntimeException('File not found', 404);
 
     $mime = mime_type($f);
-    $inline = str_starts_with($mime, 'image/') || str_starts_with($mime, 'audio/') || $mime === 'application/pdf' || $mime === 'text/plain';
+    $inline = (str_starts_with($mime, 'image/') || str_starts_with($mime, 'audio/') || $mime === 'application/pdf' || $mime === 'text/plain')
+        && !mime_renders_markup($mime);
     if (!$inline)throw new RuntimeException('This file type does not support inline preview', 415);
 
     serve_file_range($f, $mime, 'inline', $method, ['Cache-Control: private,max-age=300']);
@@ -981,9 +1012,10 @@ if ($path === '/api/files/upload' && $method === 'POST') api_try(function()use($
         }
 
         clearstatcache(true, $tmp);
+        $zipSize = @filesize($tmp);
         header('Content-Type: application/zip');
         header('Content-Disposition: attachment; filename="download.zip"');
-        header('Content-Length: '.filesize($tmp));
+        if ($zipSize !== false)header('Content-Length: '.$zipSize);
         readfile($tmp);
         unlink($tmp);
         exit;

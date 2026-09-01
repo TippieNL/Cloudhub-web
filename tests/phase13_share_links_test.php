@@ -53,8 +53,12 @@ $checks['image extensions resolve without libmagic'] =
 $checks['only image, video and audio render inline'] =
     str_contains($index, 'function share_media_kind(') && str_contains($index, "return 'image'")
     && str_contains($index, "return 'video'") && str_contains($index, "return 'audio'");
+// The rule moved into one predicate shared with the authenticated preview
+// route, so the two paths cannot drift apart again. phase24 proves the
+// behaviour against real .svg and .html files.
 $checks['svg is never treated as inline media'] =
-    (bool)preg_match("/if \(\\\$mime === 'image\/svg\\+xml'\)return 'other';/", $index);
+    str_contains($index, "if (mime_renders_markup(\$mime))return 'other';")
+    && str_contains($index, "return \$mime === 'image/svg+xml'");
 $checks['non-media is served as an attachment'] =
     str_contains($index, "\$disposition = (\$variant === 'raw' && \$kind !== 'other')?'inline':'attachment';");
 $checks['raw bytes keep the sandbox CSP'] =
