@@ -374,6 +374,38 @@ Existing image thumbnails continue to use the on-disk thumbnail cache. Full
 media is loaded only after the user requests a preview.
 
 
+## Checking what the storage can do
+
+When uploads are slow, or a deployment cannot write where it expects to, the
+answer is usually in what the filesystem underneath actually does. Two ways to
+ask, both producing the same report:
+
+```text
+php tools/storage-check.php          facts only
+php tools/storage-check.php 32       and measure 32 MB of throughput
+```
+
+```text
+GET /api/system/storage              facts only, administrator-only
+GET /api/system/storage?measure=1&mb=16
+```
+
+It reports, for ROOT_DIR, the upload staging directory, the thumbnail cache and
+`logs/`: whether PHP can genuinely create and remove files there (a real probe,
+not `is_writable()`, which Android shared storage answers unreliably), how many
+entries each holds, the PHP version and SAPI, the request-size limits with a
+warning when one sits at or below the chunk size, the deployed commit, and
+whether finishing an upload is an instant rename or a whole-file copy.
+
+**Prefer the endpoint on Android.** A KSWEB install may not expose PHP CLI at
+all, and where a shell is available it is often a different PHP — Termux, for
+instance — which would report its own `php.ini`, user and permissions rather
+than the ones actually serving uploads.
+
+The endpoint is administrator-only and reports directory entry counts, never
+filenames. `?measure=1` writes and reads a probe file, so it is opt-in and `mb`
+is capped; without it the call is cheap.
+
 ## Duplicate finder
 
 Finds photos and videos that are stored more than once. Matches are

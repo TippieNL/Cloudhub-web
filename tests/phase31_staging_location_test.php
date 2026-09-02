@@ -116,15 +116,22 @@ $checks['the default is the storage root'] =
 
 // --- the diagnostic reports the distinction ------------------------------
 
+// The report itself now lives in StorageDiagnostics, so the CLI tool and the
+// admin route cannot drift apart; these look where the logic is rather than
+// where it used to be. phase32 exercises the behaviour against real paths.
 $tool = (string)file_get_contents($root.'/tools/storage-check.php');
+$service = (string)file_get_contents($root.'/src/Services/StorageDiagnostics.php');
 $checks['the diagnostic resolves a missing directory to its parent'] =
-    str_contains($tool, 'function device_of(string $path): ?int');
-$checks['it names the copy case explicitly'] = str_contains($tool, 'DIFFERENT filesystems');
+    str_contains($service, 'private static function deviceOf(string $path): ?int');
+$checks['it names the copy case explicitly'] = str_contains($service, 'DIFFERENT filesystems');
 $checks['it measures throughput the way the uploader writes'] =
-    str_contains($tool, '1 MiB blocks through PHP');
+    str_contains($service, 'private const BLOCK_BYTES = 1048576;')
+    && str_contains($tool, '1 MiB blocks through PHP');
 $checks['it flags a request limit at or below the chunk size'] =
-    str_contains($tool, 'is not above the ') && str_contains($tool, 'chunk size; lower UPLOAD_CHUNK_MB');
+    str_contains($service, 'is not above the ') && str_contains($service, 'chunk size; lower UPLOAD_CHUNK_MB');
 $checks['it is still CLI-only'] = str_contains($tool, "PHP_SAPI !== 'cli'");
+$checks['and the same report is reachable without a shell'] =
+    str_contains((string)file_get_contents($root.'/public/index.php'), "'/api/system/storage'");
 
 rmrf31($base);
 

@@ -57,6 +57,35 @@ $checks['L6 the CLI tool refuses web requests'] =
 $checks['L11 the stale ffmpeg diagnostic is gone'] = !is_file($root.'/tools/ffmpeg-check.php');
 $checks['L11 the thumbnail service is still browser-based'] =
     str_contains((string)file_get_contents($root.'/src/Services/VideoThumbnailService.php'), "'mode' => 'browser'");
+// The KSWEB ffmpeg guide went with it: it documented copying binaries into
+// bin/ (dropped at import), FFMPEG_PATH (not read by config.php) and a check
+// tool that no longer exists, and pointed at GET /api/system/ffmpeg, which
+// never existed at all. The README covers how video thumbnails actually work.
+$checks['L11 the stale ffmpeg guide is gone'] = !is_file($root.'/docs_KSWEB_FFMPEG.md');
+// Scanned over shipped files only: tests/ names removed things on purpose, to
+// assert they stay removed, and this very check contains the string it looks
+// for. A hygiene rule that trips on its own wording is measuring itself.
+$advertised = [];
+foreach (['public', 'src', 'views', 'config', 'tools', 'database', 'deploy'] as $dir) {
+    if (!is_dir($root.'/'.$dir)) continue;
+    $it = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($root.'/'.$dir));
+    foreach ($it as $file) {
+        if (!$file->isFile()) continue;
+        if (!in_array($file->getExtension(), ['php', 'js', 'md', 'html'], true)) continue;
+        if (str_contains((string)file_get_contents($file->getPathname()), 'api/system/ffmpeg')) {
+            $advertised[] = $file->getFilename();
+        }
+    }
+}
+foreach (glob($root.'/*.md') ?: [] as $doc) {
+    if (str_contains((string)file_get_contents($doc), 'api/system/ffmpeg')) $advertised[] = basename($doc);
+}
+$checks['L11 nothing still advertises the ffmpeg endpoint'] = $advertised === [];
+if ($advertised !== []) echo '       still referenced in: '.implode(', ', $advertised).PHP_EOL;
+// The diagnostic that replaced it is reachable and admin-gated.
+$checks['L11 the storage diagnostic has a route'] =
+    str_contains((string)file_get_contents($root.'/public/index.php'), "'/api/system/storage'");
+
 // Every remaining tool refuses to run as a web request.
 foreach (glob($root.'/tools/*.php') ?: [] as $tool) {
     $checks['L11 '.basename($tool).' refuses web requests'] =

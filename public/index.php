@@ -12,6 +12,7 @@ use CloudHub\Services\Security;
 use CloudHub\Services\LoginRateLimiter;
 use CloudHub\Services\Authorization;
 use CloudHub\Services\DuplicateFinder;
+use CloudHub\Services\StorageDiagnostics;
 use CloudHub\Services\AuditLog;
 
 $fs = new FileService($config); $basePath = Http::basePath(); $assetBase = Http::assetBase(); $path = Http::requestPath($basePath); $method = $_SERVER['REQUEST_METHOD']??'GET';
@@ -760,6 +761,35 @@ if ($path === '/api/duplicates/scan' && $method === 'DELETE') api_try(function()
     Authorization::requireRead();
     duplicates()->reset();
     return ['success' => true];
+});
+/**
+* What the storage this install writes to can actually do.
+*
+* The same report tools/storage-check.php prints, for an install with no PHP
+* CLI -- which KSWEB may well be. It is also the more trustworthy of the two
+* there: a shell from a different PHP, Termux for instance, reports its own
+* php.ini, user and permissions rather than the ones actually serving uploads,
+* which are the values a deployment question is about.
+*
+* Administrator-only. An earlier version of this diagnostic sat at the project
+* root reachable by anyone, dumping absolute paths and a listing of every user
+* file, and was removed for it; tools/storage-check.php's docblock records why.
+* This one is authenticated, admin-gated, and reports directory entry counts
+* rather than names. Absolute paths stay: an administrator can already read
+* every file in the store, so a path tells them nothing new, and it is usually
+* where a broken deployment is hiding.
+*
+* Measuring throughput writes and reads a probe file, so it is opt-in via
+* ?measure=1 and bounded by ?mb=. A route that moves tens of megabytes every
+* time it is called is a way to make the server do expensive work on demand --
+* the objection that kept ?refresh off /api/storage/me.
+*/
+if ($path === '/api/system/storage' && $method === 'GET') api_try(function()use($config) {
+    Authorization::requireAdmin();
+    release_session_lock();
+
+    $megabytes = empty($_GET['measure']) ? 0 : max(1, min(64, (int)($_GET['mb'] ?? 16)));
+    return (new StorageDiagnostics($config, dirname(__DIR__)))->report($megabytes);
 });
 if ($path === '/api/storage/usage' && $method === 'GET') api_try(function()use($fs, $config) {
     Authorization::requireAdmin();
