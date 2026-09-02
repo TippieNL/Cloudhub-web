@@ -329,8 +329,75 @@ $checks['the styles are defined'] = str_contains($css, '.dupe-group{') && str_co
 
 // The scan route is read-only and must not hold the session lock while the
 // browser polls it.
+// Scoped to the route body rather than pinned to the lines next to it: a
+// comment between them is not a behaviour change, and an assertion that breaks
+// on one is measuring the wrong thing.
+$scanRoute = (static function(string $index): string {
+    $at = strpos($index, "if (\$path === '/api/duplicates/scan' && \$method === 'POST')");
+    if ($at === false) return '';
+    return substr($index, $at, (int)strpos($index, "\n});", $at) - $at);
+})($index);
 $checks['the scan route releases the session lock'] =
-    str_contains($index, "if (\$path === '/api/duplicates/scan' && \$method === 'POST') api_try(function() {\n    Authorization::requireRead();\n    release_session_lock();");
+    $scanRoute !== '' && str_contains($scanRoute, 'release_session_lock();');
+$checks['and polling it does not need write on the read path'] =
+    str_contains($index, "// The operative check for reading a finished scan");
+
+// --- the response contract -----------------------------------------------
+
+/*
+ * A second client codes against these names now, so a rename is a breaking
+ * change rather than a refactor and has to fail here rather than in somebody
+ * else's app. Adding a field is free; renaming or removing one is not.
+ */
+$expectedTop = ['path', 'done', 'scanned', 'candidates', 'hashed', 'computed', 'toHash',
+    'truncated', 'groups', 'duplicateFiles', 'reclaimable', 'startedAt', 'finishedAt'];
+$actualTop = array_keys($r);
+sort($actualTop);
+$wantTop = $expectedTop; sort($wantTop);
+// 'slices' is added by this file's own driver, not by the API.
+$actualTop = array_values(array_diff($actualTop, ['slices']));
+$checks['the scan response carries exactly the documented fields'] = $actualTop === $wantTop;
+if ($actualTop !== $wantTop) {
+    echo '       extra: '.implode(', ', array_diff($actualTop, $wantTop)).PHP_EOL;
+    echo '       missing: '.implode(', ', array_diff($wantTop, $actualTop)).PHP_EOL;
+}
+
+$groupKeys = array_keys($r['groups'][0]);
+sort($groupKeys);
+$checks['a group carries exactly the documented fields'] = $groupKeys === ['bytes', 'count', 'files', 'reclaimable'];
+$fileKeys = array_keys($r['groups'][0]['files'][0]);
+sort($fileKeys);
+$checks['a file in a group carries exactly the documented fields'] = $fileKeys === ['bytes', 'mtime', 'path'];
+
+// The README documents that shape; it must not drift from what is returned.
+$readme = (string)file_get_contents($root.'/README.md');
+$start = strpos($readme, '## Duplicate finder');
+$checks['the README documents the endpoint'] = $start !== false;
+if ($start !== false) {
+    $section = substr($readme, $start, (int)strpos($readme, '## Resumable large-file uploads') - $start);
+    $undocumented = [];
+    foreach ($expectedTop as $field) {
+        if (!str_contains($section, '"'.$field.'"')) $undocumented[] = $field;
+    }
+    $checks['every response field appears in the documented example'] = $undocumented === [];
+    if ($undocumented !== []) echo '       undocumented: '.implode(', ', $undocumented).PHP_EOL;
+
+    foreach (['POST /api/duplicates/scan', 'GET /api/duplicates/scan', 'DELETE /api/duplicates/scan',
+              'DELETE /api/files/delete', 'X-CSRF-Token', 'editor account'] as $needed) {
+        $checks['the README covers '.$needed] = str_contains($section, $needed);
+    }
+}
+
+// The limits a second client would otherwise hardcode.
+$checks['the config route publishes the duplicate limits'] =
+    str_contains($index, "'duplicateMinBytes' => \$config['duplicate_min_bytes']")
+    && str_contains($index, "'duplicateScanSeconds' => \$config['duplicate_scan_seconds']")
+    && str_contains($index, "'duplicateMaxFiles' => \$config['duplicate_max_files']");
+
+// Editor-only scanning is a decision, and the guard says so.
+$checks['the guard records why scanning is not write-exempt'] =
+    str_contains($index, 'POST /api/duplicates/scan is deliberately NOT on this list')
+    && !str_contains($index, "\$writeExemptPost = ['/api/files/download-zip', '/api/thumbnail/video', '/api/users/me/password', '/api/duplicates/scan']");
 
 rmrf29($project);
 

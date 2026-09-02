@@ -374,6 +374,106 @@ Existing image thumbnails continue to use the on-disk thumbnail cache. Full
 media is loaded only after the user requests a preview.
 
 
+## Duplicate finder
+
+Finds photos and videos that are stored more than once. Matches are
+**byte-identical only**: a match is never a judgement call, so deleting one copy
+cannot lose a file that was merely similar. A resized or re-encoded copy is a
+different file and is not reported, and perceptual matching is not possible for
+video in this application at all, which has no server-side decoder and extracts
+video frames in the browser.
+
+Almost none of the work happens. Files are grouped by exact byte size first,
+then by a hash of their first and last 64 KB, and only what survives both is
+read in full. Measured on 440 files across 92.5 MB, size grouping alone
+discarded 356 of them before a single byte was read.
+
+### Protocol
+
+Scanning is a poll loop, because hashing a media library does not finish inside
+one request on a phone:
+
+1. `POST /api/duplicates/scan` with `{"path": "/", "restart": true}` starts a
+   scan and does one bounded slice of the work.
+2. `POST /api/duplicates/scan` with `{"path": "/"}` continues it. Repeat while
+   the response has `"done": false`.
+3. `GET /api/duplicates/scan` returns the last result without doing any work.
+4. `DELETE /api/duplicates/scan` discards the saved scan state.
+
+Each slice runs for `DUPLICATE_SCAN_SECONDS` and returns:
+
+```json
+{
+  "path": "/", "done": false, "truncated": false,
+  "scanned": 440, "candidates": 84, "hashed": 120, "computed": 118, "toHash": 164,
+  "duplicateFiles": 40, "reclaimable": 8798208,
+  "startedAt": "2026-09-02T14:57:54+00:00", "finishedAt": null,
+  "groups": [
+    { "bytes": 220000, "count": 2, "reclaimable": 220000,
+      "files": [ { "path": "/Photos/p1.jpg", "bytes": 220000, "mtime": 1788360664 } ] }
+  ]
+}
+```
+
+`scanned` counts media files walked and `candidates` how many shared a size with
+another file; `hashed` is progress through those and `computed` how many digests
+were actually calculated rather than reused from cache, so a re-scan of an
+unchanged library reports `computed: 0`. `reclaimable` is what deleting the
+extra copies would free — group size × (copies − 1), never × copies.
+`truncated` is true when the walk hit `DUPLICATE_MAX_FILES`, so a client can say
+the result is partial rather than quietly under-reporting.
+
+Digests are cached by path, size and mtime. A cached digest is only reused when
+the file is strictly older than the moment it was hashed, because mtime has
+one-second granularity and a file rewritten in the same second would otherwise
+keep a stale digest — which in this feature means reporting two files as
+identical when they are not. No mtime-keyed cache can detect a write that
+preserves the timestamp; deleting `storage/.cache/duplicate-hashes.json` forces
+a full re-read.
+
+### Permissions
+
+Reading a finished scan needs only read access. **Starting one requires an
+editor account**, because a scan walks the whole store and reads files — the
+same on-demand expense `/api/storage/me` declines to hand every account. A
+viewer can therefore see what a scan found but cannot trigger one.
+
+### Deleting duplicates
+
+There is no bulk-delete endpoint. Clients call the ordinary
+`DELETE /api/files/delete` once per file, which moves each to the trash, honours
+`ALLOW_DELETE`, forgets the ledger row and writes the audit entry. Keeping one
+copy per group is a client-side affordance and the server does not enforce it:
+deleting every copy is something the file list already allows, so the scan adds
+no capability that did not exist.
+
+### Other clients
+
+The endpoints are plain JSON with no browser-specific behaviour, and the
+Android build (`TippieNL/Cloudhub-2`) already has what it needs to call them:
+its OkHttp client keeps the session cookie jar and sends `X-CSRF-Token` on
+mutating requests. Authenticate with `POST /api/auth/login`, which returns
+`csrfToken` and sets the session cookie; `GET /api/auth/status` returns the
+token again for a restored session. A native client does not send
+`Sec-Fetch-Site: cross-site`, so the cross-site guard does not apply to it.
+
+`GET /api/files/config` publishes `duplicateMinBytes`, `duplicateScanSeconds`
+and `duplicateMaxFiles` alongside the upload limits, so a client reads them from
+the server rather than keeping its own copy of the defaults.
+
+### Relevant environment settings
+
+```ini
+DUPLICATE_MIN_BYTES=1024
+DUPLICATE_SCAN_SECONDS=8
+DUPLICATE_MAX_FILES=50000
+```
+
+Files below `DUPLICATE_MIN_BYTES` are skipped: every empty file is identical to
+every other one, which would otherwise produce a single enormous and useless
+group.
+
+
 ## Resumable large-file uploads
 
 Cloud File Hub now uploads files in configurable chunks rather than one large

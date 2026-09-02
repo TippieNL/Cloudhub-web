@@ -495,6 +495,13 @@ if ($isProtectedApi && $method !== 'OPTIONS') {
      *   users/me/password  changes the caller's own password, proven by
      *                    supplying the current one -- a viewer must be able to
      *                    rotate their own credentials
+     *
+     * POST /api/duplicates/scan is deliberately NOT on this list, though it
+     * writes nothing to the file store either. Starting a scan walks the whole
+     * store and reads files, which is precisely the on-demand expense
+     * /api/storage/me refused to hand every account when it declined to honour
+     * ?refresh. Reading the last result is a GET and needs only read, so a
+     * viewer can see what a scan found without being able to start one.
      */
     $writeExemptPost = ['/api/files/download-zip', '/api/thumbnail/video', '/api/users/me/password'];
     if (in_array($method, ['POST', 'PUT', 'PATCH', 'DELETE'], true)) {
@@ -507,7 +514,15 @@ if ($path === '/api/files/config') Http::json([
     'readOnly' => $config['read_only'], 'allowDelete' => $config['allow_delete'], 'allowOverwrite' => $config['allow_overwrite'],
     'maxUploadMb' => $config['max_upload_mb'], 'maxUploadFiles' => $config['max_upload_files'],
     'chunkMb' => $config['upload_chunk_mb'], 'retryCount' => $config['upload_retry_count'],
-    'conflict' => $config['upload_conflict']
+    'conflict' => $config['upload_conflict'],
+    // Published for the same reason the upload limits are: so a client sizes
+    // its progress reporting from the server rather than a second copy of the
+    // defaults, and can tell why files below a threshold never appear in a
+    // duplicate scan. Their presence also tells a client whether this build
+    // has the feature at all.
+    'duplicateMinBytes' => $config['duplicate_min_bytes'],
+    'duplicateScanSeconds' => $config['duplicate_scan_seconds'],
+    'duplicateMaxFiles' => $config['duplicate_max_files']
 ]);
 if ($path === '/api/files/list' && $method === 'GET') api_try(function()use($fs) {
     release_session_lock();
@@ -724,12 +739,18 @@ if ($path === '/api/files/search' && $method === 'GET') api_try(function()use($f
 * loop would serialise every other request the page makes behind it.
 */
 if ($path === '/api/duplicates/scan' && $method === 'POST') api_try(function() {
+    // Defence in depth rather than the operative check: the guard above has
+    // already required write for any POST, which is what keeps starting a scan
+    // to editors. See the note beside $writeExemptPost for why that is
+    // deliberate here.
     Authorization::requireRead();
     release_session_lock();
 
     $b = Http::body();
     return duplicates()->scan((string)($b['path'] ?? '/'), !empty($b['restart']));
 });
+// The operative check for reading a finished scan: any signed-in account may
+// see what the last one found.
 if ($path === '/api/duplicates/scan' && $method === 'GET') api_try(function() {
     Authorization::requireRead();
     release_session_lock();
