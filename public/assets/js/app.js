@@ -272,6 +272,28 @@ function waitForVideoEvent(video, eventName, timeoutMs = 15000) {
     });
 }
 
+/**
+ * Note that this browser could not decode a video, on its card.
+ *
+ * Advisory and nothing more: the card keeps working and stays clickable, so
+ * somebody who knows better than the browser can still try it, and the player
+ * will name the codec if it fails again. A listing that hid files on this basis
+ * would be worse than the problem -- the verdict is per-browser, and a file
+ * this one refuses may play perfectly in the next.
+ */
+function markUndecodable(button, status) {
+    button.classList.add('undecodable');
+    button.title = 'This browser cannot decode this video. Open it to see which codec it is.';
+    if (status) status.textContent = 'Not playable here';
+    const card = button.closest('.file');
+    if (card && !card.querySelector('.codec-warning')) {
+        const note = document.createElement('span');
+        note.className = 'codec-warning';
+        note.textContent = 'not playable in this browser';
+        card.querySelector('.file-info')?.append(note);
+    }
+}
+
 async function captureVideoFrame(button) {
     const source = button.dataset.videoThumb;
     const image = button.querySelector('img');
@@ -382,6 +404,21 @@ async function captureVideoFrame(button) {
         // next visit -- has to download and decode the video again.
         persistVideoThumbnail(decodeURIComponent(button.dataset.thumbPath || ''), blob);
     } catch (error) {
+        /*
+         * Tell "this browser cannot decode the file" apart from "the canvas
+         * step failed". The <video> element has already tried, so its own error
+         * is the authority -- codes 3 and 4 mean the decode never happened, and
+         * the fallback below would fail for the same reason.
+         *
+         * Marking it here costs nothing: this pass already loads every visible
+         * video lazily, so the answer was being produced and thrown away.
+         */
+        const code = video.error?.code;
+        if (code === MediaError.MEDIA_ERR_DECODE || code === MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED) {
+            markUndecodable(button, status);
+            return;
+        }
+
         /*
          * Canvas extraction is not available in every Android WebView.
          * Keep a native <video> fallback showing the same decoded frame.

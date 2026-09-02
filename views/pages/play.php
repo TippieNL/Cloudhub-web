@@ -121,6 +121,13 @@ $assets = htmlspecialchars($assetBase, ENT_QUOTES, 'UTF-8');
         window.CLOUDHUB_BASE = <?= json_encode($basePath, JSON_UNESCAPED_SLASHES) ?>;
         window.CLOUDHUB_FRONT = <?= json_encode($frontController, JSON_UNESCAPED_SLASHES) ?>;
         window.CLOUDHUB_ROUTE = <?= json_encode($path, JSON_UNESCAPED_SLASHES) ?>;
+        <?php /* So a failure can name the codec and offer a way out of it. */ ?>
+        window.CLOUDHUB_MEDIA = <?= json_encode([
+            'codec' => $mediaFile['codec'] ?? null,
+            'codecWidelySupported' => $mediaFile['codecWidelySupported'] ?? null,
+            'downloadUrl' => $mediaFile['download_url'] ?? null,
+            'name' => $mediaFile['name'] ?? null,
+        ], JSON_UNESCAPED_SLASHES) ?>;
     </script>
 </body>
 </html>

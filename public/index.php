@@ -13,6 +13,7 @@ use CloudHub\Services\LoginRateLimiter;
 use CloudHub\Services\Authorization;
 use CloudHub\Services\DuplicateFinder;
 use CloudHub\Services\StorageDiagnostics;
+use CloudHub\Services\MediaProbe;
 use CloudHub\Services\AuditLog;
 
 $fs = new FileService($config); $basePath = Http::basePath(); $assetBase = Http::assetBase(); $path = Http::requestPath($basePath); $method = $_SERVER['REQUEST_METHOD']??'GET';
@@ -1557,14 +1558,25 @@ if ($path === '/play' && $method === 'GET') {
         try {
             $f = $fs->existing($relPath);
             if (is_file($f)) {
-                $mime = mime_type($f);
+                // media_mime_type(), not mime_type(): /api/files/stream decides
+                // with the extension-first mapper that exists because libmagic
+                // is unreliable here, and two functions answering one question
+                // meant a video libmagic misread got "Media not available" from
+                // this page while the stream route would have served it.
+                $mime = media_mime_type($f);
                 if (str_starts_with($mime, 'video/') || str_starts_with($mime, 'audio/')) {
                     $size = filesize($f);
+                    // So a browser that cannot decode it can say which codec it
+                    // is, rather than only that something is unsupported.
+                    $codec = (new MediaProbe(dirname(__DIR__).'/storage/.cache'))->probe($f);
                     $mediaFile = [
                         'name' => basename($f),
                         'path' => $relPath,
                         'formatted_size' => method_exists($fs, 'formatSize') ? $fs->formatSize($size) : round($size / 1024 / 1024, 2) . ' MB',
                         'stream_url' => $frontController . '?route=%2Fapi%2Ffiles%2Fstream&path=' . urlencode($relPath),
+                        'download_url' => $frontController . '?route=%2Fapi%2Ffiles%2Fdownload&path=' . urlencode($relPath),
+                        'codec' => $codec['name'],
+                        'codecWidelySupported' => $codec['widelySupported'],
                         'sprite_url' => ''
                     ];
                 }

@@ -325,25 +325,47 @@ export class PlayerUI {
     handleMediaError() {
         const error = this.video.error;
         const code = error?.code;
+        const media = window.CLOUDHUB_MEDIA || {};
+
+        /*
+         * Both decode failures mean the same thing to a person: this browser
+         * cannot play this file. Saying only that leaves them with nowhere to
+         * go, so name the codec the server read out of the container -- H.265
+         * is the usual answer, and it is not a fault of the file or the
+         * server -- and offer the download beside it.
+         */
+        const undecodable = code === MediaError.MEDIA_ERR_DECODE
+            || code === MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED;
 
         let message = 'Unable to load this media.';
         if (code === MediaError.MEDIA_ERR_NETWORK) {
             message = 'Network error while loading the media.';
-        } else if (code === MediaError.MEDIA_ERR_DECODE) {
-            message = 'This video format or codec is not supported by the browser.';
-        } else if (code === MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED) {
-            message = 'This media format is not supported by the browser.';
+        } else if (undecodable) {
+            message = media.codec && media.codec !== 'unknown'
+                ? `This browser cannot decode ${media.codec}. The file itself is fine — download it to play in another app.`
+                : 'This browser cannot decode this video. The file itself is fine — download it to play in another app.';
         }
 
-        this.showStatus(message, true);
+        this.showStatus(message, true, undecodable ? media.downloadUrl : null);
         this.updatePlayState(false);
     }
 
-    showStatus(message, persistent = false) {
+    showStatus(message, persistent = false, downloadUrl = null) {
         const status = this.container.querySelector('#cfh-player-status');
         if (!status) return;
 
+        // textContent, then the link appended as an element: the message can
+        // carry a filename, and building this as HTML would put a name chosen
+        // by whoever uploaded the file into the markup.
         status.textContent = message;
+        if (downloadUrl) {
+            const link = document.createElement('a');
+            link.className = 'cfh-status-download';
+            link.href = downloadUrl;
+            link.setAttribute('download', '');
+            link.textContent = 'Download';
+            status.append(' ', link);
+        }
         status.hidden = false;
         status.classList.toggle('cfh-status-persistent', persistent);
     }
