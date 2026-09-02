@@ -25,6 +25,7 @@
             <a href="<?= htmlspecialchars($frontController, ENT_QUOTES) ?>?route=%2Fservers" data-route="/servers">Servers</a>
             <a href="<?= htmlspecialchars($frontController, ENT_QUOTES) ?>?route=%2Ftrash" data-route="/trash">Trash</a>
             <a href="<?= htmlspecialchars($frontController, ENT_QUOTES) ?>?route=%2Fbrowse" data-route="/browse">Browse</a>
+            <a href="<?= htmlspecialchars($frontController, ENT_QUOTES) ?>?route=%2Fduplicates" data-route="/duplicates">Duplicates</a>
             <a id="nav-users" href="<?= htmlspecialchars($frontController, ENT_QUOTES) ?>?route=%2Fusers" data-route="/users" hidden>Users</a>
             <a id="nav-storage" href="<?= htmlspecialchars($frontController, ENT_QUOTES) ?>?route=%2Fstorage" data-route="/storage" hidden>Storage</a>
         </nav>
@@ -278,6 +279,30 @@
             <p id="usage-note" class="muted"></p>
             <div id="usage-summary"></div>
             <div id="usage-detail" class="usage-columns"></div>
+        </section>
+        <section id="duplicates-page" hidden>
+            <div class="toolbar">
+                <h2>Duplicates</h2>
+                <label class="dupe-scope">Folder
+                    <input id="dupe-path" type="text" value="/" spellcheck="false" aria-label="Folder to scan">
+                </label>
+                <button id="dupe-scan" type="button">Scan</button>
+            </div>
+            <p class="muted">
+                Finds photos and videos that are byte-for-byte identical, so a match is never a guess.
+                Copies that were resized or re-saved are not the same file and are not reported.
+            </p>
+            <div id="dupe-progress" hidden>
+                <progress id="dupe-bar" max="100" value="0"></progress>
+                <p id="dupe-status" class="muted"></p>
+            </div>
+            <div id="dupe-summary"></div>
+            <div class="toolbar" id="dupe-actions" hidden>
+                <button id="dupe-select-extras" type="button">Select every copy but one</button>
+                <button id="dupe-clear" type="button">Clear selection</button>
+                <button id="dupe-delete" type="button" class="danger-button" disabled>Delete selected</button>
+            </div>
+            <div id="dupe-groups"></div>
         </section>
         <section id="browse-page" hidden>
             <h2>Remote server browser</h2>

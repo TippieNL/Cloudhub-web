@@ -224,3 +224,21 @@ header>nav a{padding:8px 12px;white-space:nowrap;flex:0 0 auto}
   .file-grid .folder-icon,.file-grid .file-icon{font-size:58px}
   .thumb-preview.video-thumb{height:100%}
 }
+
+/* Duplicates. The thumbnail is the point -- a path tells you two files share a
+   name, a picture tells you they are the same photo -- so the row is built
+   around it and the whole row is the checkbox label. */
+.dupe-scope{display:flex;align-items:center;gap:8px;color:var(--muted);font-size:13px}
+.dupe-scope input{width:min(260px,50vw)}
+.dupe-group{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:12px;margin:10px 0}
+.dupe-group h3{margin:0 0 8px;font-size:14px}
+.dupe-group ul{list-style:none;margin:0;padding:0;display:grid;gap:6px}
+.dupe-file label{display:grid;grid-template-columns:22px 56px minmax(0,1fr);gap:10px;align-items:center;cursor:pointer;padding:6px;border-radius:8px}
+.dupe-file label:hover{background:color-mix(in srgb,var(--primary) 8%,transparent)}
+.dupe-file input{width:18px;height:18px;padding:0;margin:0}
+.dupe-thumb{width:56px;height:56px;object-fit:cover;border-radius:6px;background:color-mix(in srgb,var(--fg) 8%,transparent)}
+.dupe-meta{min-width:0;display:flex;flex-direction:column;gap:2px;font-size:13px}
+.dupe-path{word-break:break-all}
+.dupe-keep{border:1px solid var(--border);border-radius:99px;padding:1px 7px;font-size:11px;white-space:nowrap}
+#dupe-progress progress{width:100%;height:8px}
+@media(max-width:650px){.dupe-scope{width:100%}.dupe-scope input{flex:1;width:auto}}

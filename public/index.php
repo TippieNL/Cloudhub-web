@@ -11,6 +11,7 @@ use CloudHub\Services\UploadService;
 use CloudHub\Services\Security;
 use CloudHub\Services\LoginRateLimiter;
 use CloudHub\Services\Authorization;
+use CloudHub\Services\DuplicateFinder;
 use CloudHub\Services\AuditLog;
 
 $fs = new FileService($config); $basePath = Http::basePath(); $assetBase = Http::assetBase(); $path = Http::requestPath($basePath); $method = $_SERVER['REQUEST_METHOD']??'GET';
@@ -298,6 +299,13 @@ function api_try(callable $fn): never {
 function uploads(): UploadService {
     static $uploads; global $config, $fs;
     return $uploads ??= new UploadService($config, $fs);
+}
+/**
+* The duplicate finder, built on first use like the upload service.
+*/
+function duplicates(): DuplicateFinder {
+    static $finder; global $config, $fs;
+    return $finder ??= new DuplicateFinder($config, $fs);
 }
 /**
 * The upload ledger, sharing the request's database connection.
@@ -704,6 +712,34 @@ if ($path === '/api/files/search' && $method === 'GET') api_try(function()use($f
 * Measuring walks the whole tree, so the result is cached; ?refresh=1 forces a
 * fresh measurement for the Recalculate button.
 */
+/**
+* Find byte-identical photos and videos.
+*
+* One POST does a bounded slice of the work and returns progress; the browser
+* polls until `done`. Hashing a media library outright would not finish inside
+* one request on the device this runs on, and a scan that cannot report
+* progress is indistinguishable from one that has hung.
+*
+* Reading only, so the session lock goes back immediately -- otherwise the poll
+* loop would serialise every other request the page makes behind it.
+*/
+if ($path === '/api/duplicates/scan' && $method === 'POST') api_try(function() {
+    Authorization::requireRead();
+    release_session_lock();
+
+    $b = Http::body();
+    return duplicates()->scan((string)($b['path'] ?? '/'), !empty($b['restart']));
+});
+if ($path === '/api/duplicates/scan' && $method === 'GET') api_try(function() {
+    Authorization::requireRead();
+    release_session_lock();
+    return duplicates()->state() ?? ['done' => false, 'groups' => [], 'scanned' => 0, 'started' => false];
+});
+if ($path === '/api/duplicates/scan' && $method === 'DELETE') api_try(function() {
+    Authorization::requireRead();
+    duplicates()->reset();
+    return ['success' => true];
+});
 if ($path === '/api/storage/usage' && $method === 'GET') api_try(function()use($fs, $config) {
     Authorization::requireAdmin();
     release_session_lock();
@@ -1447,7 +1483,7 @@ if ($path === '/api/files/upload' && $method === 'POST') api_try(function()use($
         http_response_code(204); header('Allow: GET, POST, PUT, PATCH, DELETE, OPTIONS'); exit;
     }
     if (str_starts_with($path, '/api/'))Http::error(404, 'NOT_FOUND', 'API endpoint not found');
-    if (in_array($path, ['/', '/servers', '/browse', '/users', '/trash', '/storage'], true)) {
+    if (in_array($path, ['/', '/servers', '/browse', '/users', '/trash', '/storage', '/duplicates'], true)) {
         require dirname(__DIR__).'/views/pages/app.php'; exit;
     }
 /**

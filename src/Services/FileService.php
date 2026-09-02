@@ -123,6 +123,17 @@ final class FileService {
   return $out;
  }
 
+ /**
+  * The readable children of a directory as absolute paths.
+  *
+  * children() applies the symlink and reserved-name rules that every traversal
+  * in this class depends on; a caller that walks the tree itself needs those
+  * same rules, not its own scandir().
+  *
+  * @return list<string>
+  */
+ public function childPaths(string $dir): array { return $this->children($dir); }
+
  /** One listing row. Shared so search results and folder listings never drift apart. */
  private function entry(string $full): array {
   $name=basename($full);$isDir=is_dir($full);

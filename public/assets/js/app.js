@@ -1827,9 +1827,187 @@ async function loadStorage(refresh = false) {
 
 $('#recalculate-usage').addEventListener('click', () => loadStorage(true));
 
+/* ---- Duplicates ---------------------------------------------------------
+ *
+ * The scan is a poll loop: each request does a bounded slice of hashing on the
+ * server and returns progress, because hashing a media library does not finish
+ * inside one request on the device this runs on.
+ *
+ * Deletion goes through the ordinary /api/files/delete route, once per file,
+ * exactly as the file list's bulk delete does. That route already moves items
+ * to the trash, honours ALLOW_DELETE, forgets the ledger row and writes the
+ * audit entry; a second path to the same dangerous operation is the last thing
+ * this feature should add.
+ */
+const dupeState = { groups: [], selected: new Set(), scanning: false, cancel: false };
+
+function dupeKept(group) {
+    // The copy to keep by default: shallowest path, then oldest, then by name,
+    // so the original in place beats the copy in a backup folder.
+    return [...group.files].sort((a, b) => {
+        const depth = a.path.split('/').length - b.path.split('/').length;
+        if (depth) return depth;
+        const age = (a.mtime || 0) - (b.mtime || 0);
+        if (age) return age;
+        return a.path.localeCompare(b.path);
+    })[0].path;
+}
+
+function renderDuplicates() {
+    const wrap = $('#dupe-groups');
+    const groups = dupeState.groups;
+    $('#dupe-actions').hidden = groups.length === 0;
+
+    if (!groups.length) {
+        wrap.innerHTML = dupeState.scanning ? '' : '<p class="muted">No duplicates found.</p>';
+        return;
+    }
+
+    wrap.innerHTML = groups.map((g, gi) => {
+        const keep = dupeKept(g);
+        const rows = g.files.map(f => {
+            const checked = dupeState.selected.has(f.path) ? ' checked' : '';
+            const isKeep = f.path === keep ? '<span class="dupe-keep">suggested keep</span>' : '';
+            return `<li class="dupe-file">
+                <label>
+                    <input type="checkbox" data-dupe="${esc(encodeURIComponent(f.path))}"${checked}>
+                    <img class="dupe-thumb" loading="lazy" alt="" src="${esc(appUrl('/api/thumbnail?path=' + encodeURIComponent(f.path)))}">
+                    <span class="dupe-meta">
+                        <span class="dupe-path">${esc(f.path)}</span>
+                        <span class="muted">${fmt(f.bytes)}${f.mtime ? ' · ' + new Date(f.mtime * 1000).toLocaleDateString() : ''} ${isKeep}</span>
+                    </span>
+                </label>
+            </li>`;
+        }).join('');
+        return `<section class="dupe-group">
+            <h3>${g.count} copies · ${fmt(g.bytes)} each · ${fmt(g.reclaimable)} reclaimable</h3>
+            <ul>${rows}</ul>
+        </section>`;
+    }).join('');
+
+    wrap.querySelectorAll('[data-dupe]').forEach(box => {
+        box.addEventListener('change', () => {
+            const path = decodeURIComponent(box.dataset.dupe);
+            box.checked ? dupeState.selected.add(path) : dupeState.selected.delete(path);
+            updateDupeSummary();
+        });
+    });
+    updateDupeSummary();
+}
+
+function updateDupeSummary() {
+    const groups = dupeState.groups;
+    let bytes = 0;
+    for (const g of groups) for (const f of g.files) if (dupeState.selected.has(f.path)) bytes += g.bytes;
+    const total = groups.reduce((n, g) => n + g.reclaimable, 0);
+    $('#dupe-summary').innerHTML = groups.length
+        ? `<div class="usage-summary">
+             <div class="usage-figure"><span class="usage-value">${groups.length}</span><span class="muted">group${groups.length === 1 ? '' : 's'}</span></div>
+             <div class="usage-figure"><span class="usage-value">${fmt(total)}</span><span class="muted">reclaimable in total</span></div>
+             <div class="usage-figure"><span class="usage-value">${dupeState.selected.size}</span><span class="muted">selected · ${fmt(bytes)}</span></div>
+           </div>`
+        : '';
+    $('#dupe-delete').disabled = dupeState.selected.size === 0;
+}
+
+function applyDupeProgress(d) {
+    dupeState.groups = d.groups || [];
+    // Drop selections for files that are no longer in a group, so the count
+    // never claims something that is not on screen.
+    const live = new Set(dupeState.groups.flatMap(g => g.files.map(f => f.path)));
+    for (const p of [...dupeState.selected]) if (!live.has(p)) dupeState.selected.delete(p);
+
+    const pct = d.toHash ? Math.min(100, Math.floor((d.hashed / d.toHash) * 100)) : (d.done ? 100 : 0);
+    $('#dupe-bar').value = pct;
+    $('#dupe-status').textContent = d.done
+        ? `Scanned ${d.scanned} file${d.scanned === 1 ? '' : 's'}${d.truncated ? ' (stopped at the file limit)' : ''}.`
+        : `Comparing ${d.hashed} of ${d.toHash} candidate${d.toHash === 1 ? '' : 's'} from ${d.scanned} file${d.scanned === 1 ? '' : 's'}…`;
+}
+
+async function scanDuplicates() {
+    if (dupeState.scanning) { dupeState.cancel = true; return; }
+
+    dupeState.scanning = true;
+    dupeState.cancel = false;
+    dupeState.selected.clear();
+    $('#dupe-scan').textContent = 'Stop';
+    $('#dupe-progress').hidden = false;
+    $('#dupe-groups').innerHTML = '';
+
+    const path = $('#dupe-path').value.trim() || '/';
+    let restart = true;
+    try {
+        for (;;) {
+            const d = await (await api('/api/duplicates/scan', { method: 'POST', body: { path, restart } })).json();
+            restart = false;
+            applyDupeProgress(d);
+            renderDuplicates();
+            if (d.done) break;
+            if (dupeState.cancel) { $('#dupe-status').textContent += ' Stopped.'; break; }
+        }
+    } catch (e) {
+        $('#dupe-status').textContent = e.message;
+    } finally {
+        dupeState.scanning = false;
+        dupeState.cancel = false;
+        $('#dupe-scan').textContent = 'Scan';
+    }
+}
+
+$('#dupe-scan').addEventListener('click', scanDuplicates);
+
+$('#dupe-select-extras').addEventListener('click', () => {
+    dupeState.selected.clear();
+    for (const g of dupeState.groups) {
+        const keep = dupeKept(g);
+        for (const f of g.files) if (f.path !== keep) dupeState.selected.add(f.path);
+    }
+    renderDuplicates();
+});
+
+$('#dupe-clear').addEventListener('click', () => {
+    dupeState.selected.clear();
+    renderDuplicates();
+});
+
+$('#dupe-delete').addEventListener('click', async () => {
+    const paths = [...dupeState.selected];
+    if (!paths.length) return;
+
+    // Refuse to empty a group. The server cannot enforce this -- these are
+    // ordinary delete calls, and the file list can already delete anything --
+    // but nothing in this page should be the thing that talks somebody into
+    // deleting every copy of a photo.
+    const emptied = dupeState.groups.filter(g => g.files.every(f => dupeState.selected.has(f.path)));
+    if (emptied.length) {
+        toast(`Leave at least one copy in each group (${emptied.length} group${emptied.length === 1 ? ' has' : 's have'} every copy selected).`);
+        return;
+    }
+
+    let bytes = 0;
+    for (const g of dupeState.groups) for (const f of g.files) if (dupeState.selected.has(f.path)) bytes += g.bytes;
+    const warning = await trashEnabled() ? 'They can be restored from the trash.' : 'This cannot be undone.';
+    if (!await askConfirm('Delete duplicates',
+        `Delete ${paths.length} duplicate file${paths.length === 1 ? '' : 's'}, freeing ${fmt(bytes)}? ${warning}`, 'Delete')) return;
+
+    let failed = 0;
+    for (const path of paths) {
+        try {
+            await api('/api/files/delete', { method: 'DELETE', body: { path } });
+            dupeState.selected.delete(path);
+        } catch {
+            failed++;
+        }
+    }
+    // Re-scan rather than patching the list: the groups on screen describe a
+    // tree that has just changed underneath them.
+    toast(failed ? `${failed} file(s) could not be deleted` : 'Duplicates moved to trash');
+    await scanDuplicates();
+});
+
 async function route() {
     const p = window.CLOUDHUB_ROUTE || new URLSearchParams(location.search).get('route') || '/';
-    ['files', 'servers', 'browse', 'users', 'trash', 'storage'].forEach(x => $(`#${x}-page`).hidden = true);
+    ['files', 'servers', 'browse', 'users', 'trash', 'storage', 'duplicates'].forEach(x => $(`#${x}-page`).hidden = true);
     document.querySelectorAll('nav a').forEach(a => a.classList.toggle('active', (a.dataset.route || '/') === p));
     if (p === '/trash') {
         $('#trash-page').hidden = false;
@@ -1837,6 +2015,14 @@ async function route() {
     } else if (p === '/storage') {
         $('#storage-page').hidden = false;
         await loadStorage();
+    } else if (p === '/duplicates') {
+        $('#duplicates-page').hidden = false;
+        // Show whatever the last scan found without starting a new one: a scan
+        // reads files, and opening a tab should not.
+        try {
+            const d = await (await api('/api/duplicates/scan')).json();
+            if (d.started !== false) { applyDupeProgress(d); renderDuplicates(); }
+        } catch { /* nothing scanned yet */ }
     } else if (p === '/users') {
         $('#users-page').hidden = false;
         await users();

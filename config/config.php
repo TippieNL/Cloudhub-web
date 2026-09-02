@@ -30,4 +30,11 @@ return [
  'upload_chunk_mb'=>(int)env('UPLOAD_CHUNK_MB',8), 'upload_retry_count'=>(int)env('UPLOAD_RETRY_COUNT',3),
  'upload_abandon_hours'=>(int)env('UPLOAD_ABANDON_HOURS',24), 'upload_conflict'=>(string)env('UPLOAD_CONFLICT','rename'),
  'upload_staging_dir'=>(string)env('UPLOAD_STAGING_DIR',''),
+ // Duplicate finder. The minimum size exists because every empty file is
+ // identical to every other one; the scan budget keeps a slice inside
+ // max_execution_time on a phone; the file cap is reported as `truncated`
+ // rather than quietly shortening the answer.
+ 'duplicate_min_bytes'=>(int)env('DUPLICATE_MIN_BYTES',1024),
+ 'duplicate_scan_seconds'=>(int)env('DUPLICATE_SCAN_SECONDS',8),
+ 'duplicate_max_files'=>(int)env('DUPLICATE_MAX_FILES',50000),
 ];
