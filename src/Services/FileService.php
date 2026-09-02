@@ -16,8 +16,12 @@ final class FileService {
   * They are never listed and can never be addressed by a client path.
   * Without this the trash could be browsed and hard-deleted through the
   * ordinary file routes, which defeats the point of having a trash.
+  *
+  * .uploads holds in-progress upload staging. It lives here for the same
+  * reason .trash does: finishing an upload is then a same-filesystem rename
+  * rather than a copy of every byte. See UploadService::__construct().
   */
- public const RESERVED_ROOT_NAMES=['.trash','.thumbnails'];
+ public const RESERVED_ROOT_NAMES=['.trash','.thumbnails','.uploads'];
 
  private string $root;
  public function __construct(private array $config) {

@@ -32,10 +32,28 @@ final class UploadService
         private readonly array $config,
         private readonly FileService $files
     ) {
+        /*
+         * Staging defaults inside the storage root, as .trash already does and
+         * for the same reason its docblock gives: a file finished there moves
+         * into place with a rename, "an instant, atomic operation that cannot
+         * half-finish, and cannot fail because the root is a separate mount".
+         *
+         * The old default was <project>/storage/uploads, which is only on the
+         * same filesystem as the destination by coincidence of how an install
+         * happens to be laid out. Where it is not -- an app in the web root and
+         * ROOT_DIR on shared storage, the ordinary Android arrangement --
+         * complete() hits EXDEV and copies the whole file, so every upload
+         * writes every byte twice and the second write lands in one blocking
+         * burst at the end. .uploads is reserved in FileService, so it is never
+         * listed, searched, counted or addressable.
+         *
+         * UPLOAD_STAGING_DIR still overrides, for an install that deliberately
+         * stages somewhere else.
+         */
         $configured = trim((string)($this->config['upload_staging_dir'] ?? ''));
         $this->stagingRoot = $configured !== ''
             ? rtrim($configured, DIRECTORY_SEPARATOR)
-            : dirname(__DIR__, 2).'/storage/uploads';
+            : $this->files->root().'/.uploads';
 
         $this->ensureStagingRoot();
     }
