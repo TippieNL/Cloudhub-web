@@ -37,7 +37,9 @@ foreach ($report['paths'] as $row) {
     echo '  directory : '.($row['isDirectory'] ? 'yes' : 'no').PHP_EOL;
     echo '  readable  : '.($row['readable'] ? 'yes' : 'no').PHP_EOL;
     echo '  writable  : '.match ($row['writable']) {
-        null => 'n/a',
+        null => ($row['createdOnDemand'] ?? false)
+            ? ('n/a — created on first use'.(($row['parentWritable'] ?? false) ? '' : ', BUT the directory above it is not writable'))
+            : 'n/a',
         true => 'yes',
         false => 'NO — PHP cannot create/remove files here',
     }.PHP_EOL;
@@ -54,6 +56,9 @@ foreach ($runtime['limits'] as $key => $value) {
 echo '  chunk size: '.$runtime['chunkMb'].' MB'.PHP_EOL;
 foreach ($runtime['warnings'] as $warning) echo '  ! '.$warning.PHP_EOL;
 echo '  commit    : '.($runtime['commit'] ?? '(not a git checkout)').PHP_EOL;
+foreach ($runtime['sources'] as $label => $hash) {
+    echo '  '.str_pad($label, 10).': '.($hash ?? 'missing').PHP_EOL;
+}
 
 $finishing = $report['finishing'];
 echo PHP_EOL.'Finishing an upload'.PHP_EOL;

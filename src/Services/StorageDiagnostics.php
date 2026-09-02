@@ -41,6 +41,19 @@ final class StorageDiagnostics
     }
 
     /**
+     * Which of those the application creates for itself when it first needs
+     * them. Only ROOT_DIR has to exist already; reporting the others as faults
+     * before anything has used them is a false alarm, and this diagnostic
+     * exists to end guesswork rather than manufacture it.
+     *
+     * @return list<string>
+     */
+    private function createdOnDemand(): array
+    {
+        return ['upload staging', 'thumbnail cache', 'logs'];
+    }
+
+    /**
      * The whole report.
      *
      * $measureMb of 0 skips the throughput probe, which writes and reads that
@@ -67,7 +80,18 @@ final class StorageDiagnostics
             ];
 
             if (!is_dir($path)) {
-                $problems[] = $label.' is not a directory PHP can see.';
+                // Not yet created is only a fault if something else has to
+                // create it. Where the application makes it itself, what
+                // matters is whether it will be able to.
+                $parentWritable = self::nearestExistingWritable($path);
+                $row['createdOnDemand'] = in_array($label, $this->createdOnDemand(), true);
+                $row['parentWritable'] = $parentWritable;
+                if (!$row['createdOnDemand']) {
+                    $problems[] = $label.' does not exist, and the application does not create it.';
+                } elseif (!$parentWritable) {
+                    $problems[] = $label.' will be created on first use, but PHP cannot write to the '
+                        .'directory above it.';
+                }
                 $paths[] = $row;
                 continue;
             }
@@ -135,6 +159,7 @@ final class StorageDiagnostics
             'chunkMb' => (int)$this->config['upload_chunk_mb'],
             'warnings' => $warnings,
             'commit' => $this->commit(),
+            'sources' => $this->sourceFingerprints(),
         ];
     }
 
@@ -231,6 +256,24 @@ final class StorageDiagnostics
         return null;
     }
 
+    /** Whether the nearest directory that does exist above $path can be written to. */
+    private static function nearestExistingWritable(string $path): bool
+    {
+        $candidate = dirname($path);
+        for ($i = 0; $i < 32; $i++) {
+            if (is_dir($candidate)) {
+                $probe = rtrim($candidate, '/').'/.storage-check-'.bin2hex(random_bytes(6));
+                $ok = @file_put_contents($probe, 'probe') !== false;
+                @unlink($probe);
+                return $ok;
+            }
+            $parent = dirname($candidate);
+            if ($parent === $candidate) return false;
+            $candidate = $parent;
+        }
+        return false;
+    }
+
     /** So "is the fix actually deployed" stops being a question. */
     private function commit(): ?string
     {
@@ -238,6 +281,33 @@ final class StorageDiagnostics
         $head = @shell_exec('git -C '.escapeshellarg($this->projectDir).' rev-parse --short HEAD 2>/dev/null');
         $head = is_string($head) ? trim($head) : '';
         return $head === '' ? null : $head;
+    }
+
+    /**
+     * Short content hashes of the files these questions keep coming back to.
+     *
+     * commit() returns null whenever the deployment is a copy rather than a
+     * checkout, which is the ordinary way this is installed on a phone -- and
+     * then "is that fix actually running" has no answer. A hash of the file
+     * itself has one, and can be compared against any revision without needing
+     * git on the device.
+     *
+     * @return array<string,?string>
+     */
+    private function sourceFingerprints(): array
+    {
+        $out = [];
+        foreach ([
+            'UploadService.php' => '/src/Services/UploadService.php',
+            'FileService.php' => '/src/Services/FileService.php',
+            'index.php' => '/public/index.php',
+            'app.js' => '/public/assets/js/app.js',
+        ] as $label => $relative) {
+            $file = $this->projectDir.$relative;
+            $hash = is_file($file) ? @hash_file('sha256', $file) : false;
+            $out[$label] = $hash === false ? null : substr((string)$hash, 0, 12);
+        }
+        return $out;
     }
 
     /** Bytes for a php.ini shorthand size such as "8M" or "512K". */

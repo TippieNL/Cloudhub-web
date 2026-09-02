@@ -100,6 +100,56 @@ $checks['an uncreated staging directory is not a false alarm'] =
     ($notYet['finishing']['sameFilesystem'] ?? null) === true
     && ($notYet['finishing']['stagingExists'] ?? true) === false;
 
+// --- a directory the application makes for itself is not a fault ---------
+
+// The staging directory is created on first upload, so an install that has
+// never uploaded anything reported "upload staging is not a directory PHP can
+// see" as a problem. That is a false alarm of exactly the kind this tool is
+// supposed to end, and it appeared in the first real run on the device.
+$fresh = $base.'/fresh';
+mkdir($fresh.'/files', 0775, true);
+$freshReport = (new StorageDiagnostics([
+    'root_dir' => $fresh.'/files', 'upload_staging_dir' => '', 'upload_chunk_mb' => 8,
+], $fresh))->report();
+
+$stagingRow = null;
+foreach ($freshReport['paths'] as $row) if ($row['label'] === 'upload staging') $stagingRow = $row;
+$checks['an uncreated staging directory is described, not condemned'] =
+    $stagingRow !== null && ($stagingRow['createdOnDemand'] ?? false) === true;
+$checks['and it is not counted as a problem'] =
+    !in_array('upload staging is not a directory PHP can see.', $freshReport['problems'], true)
+    && implode(' ', $freshReport['problems']) === implode(' ', array_filter(
+        $freshReport['problems'], static fn(string $p): bool => !str_contains($p, 'upload staging')));
+$checks['it does report whether it will be creatable'] = ($stagingRow['parentWritable'] ?? null) === true;
+
+// A directory the application does not create for itself is still a fault.
+$missingRoot = (new StorageDiagnostics([
+    'root_dir' => $base.'/nowhere', 'upload_staging_dir' => '', 'upload_chunk_mb' => 8,
+], $base))->report();
+$checks['a missing ROOT_DIR is still a problem'] =
+    (bool)array_filter($missingRoot['problems'], static fn(string $p): bool => str_contains($p, 'ROOT_DIR'));
+
+// --- knowing what is deployed without git --------------------------------
+
+// commit is null whenever the install is a copy rather than a checkout, which
+// is how this is deployed on the phone -- and then "is that fix running" has
+// no answer. Hashing the files themselves gives it one.
+$fingerprints = $measured['runtime']['sources'] ?? [];
+$checks['the report fingerprints the files these questions concern'] =
+    array_keys($fingerprints) === ['UploadService.php', 'FileService.php', 'index.php', 'app.js'];
+$checks['a fingerprint is a short hash or null'] = (function () use ($fingerprints): bool {
+    foreach ($fingerprints as $hash) {
+        if ($hash !== null && !preg_match('/^[0-9a-f]{12}$/', (string)$hash)) return false;
+    }
+    return true;
+})();
+// Against the real project, they resolve and match the files on disk.
+$real = (new StorageDiagnostics(['root_dir' => $base.'/files', 'upload_staging_dir' => '', 'upload_chunk_mb' => 8],
+    dirname(__DIR__)))->report();
+$checks['fingerprints match the deployed files'] =
+    ($real['runtime']['sources']['UploadService.php'] ?? '')
+        === substr(hash_file('sha256', dirname(__DIR__).'/src/Services/UploadService.php'), 0, 12);
+
 // --- the request-size warning --------------------------------------------
 
 $checks['a request limit at or below the chunk size is flagged'] =
