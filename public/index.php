@@ -913,6 +913,12 @@ if ($path === '/api/uploads/status' && $method === 'GET') api_try(function() {
     return uploads()->status((string)($_GET['id']??''));
 });
 if ($path === '/api/uploads/chunk' && $method === 'PUT') api_try(function() {
+    // The one upload route that still held the session lock. Nothing below
+    // writes to $_SESSION, and a chunk holds this for as long as the transfer
+    // and the disk write take -- so every other request the browser made during
+    // an upload, thumbnails and status polls included, queued behind it.
+    release_session_lock();
+
     $id = (string)($_GET['id']??''); $offset = (int)($_SERVER['HTTP_X_UPLOAD_OFFSET']??-1);
     return uploads()->append($id, $offset, 'php://input');
 });

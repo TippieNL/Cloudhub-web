@@ -137,6 +137,7 @@ final class UploadService
      */
     public function append(string $id, int $offset, string $input): array
     {
+        $startedAt = microtime(true);
         $this->files->writable();
         $meta = $this->readMeta($id);
         $this->assertOwner($meta);
@@ -170,7 +171,7 @@ final class UploadService
          * the window between the check and the write.
          */
         $written = 0;
-        $locked = $this->lockForWriting($out, $part);
+        $locked = $this->lockForWriting($out, $part, $offset === 0);
         clearstatcache(true, $part);
         $current = (int)(fstat($out)['size'] ?? 0);
         if ($offset !== $current) {
@@ -217,9 +218,27 @@ final class UploadService
             fclose($in);
         }
         clearstatcache(true, $part);
-        $meta['updatedAt'] = time();
-        $this->writeMeta($id, $meta);
-        return $this->statusPayload($id, $meta);
+
+        /*
+         * The session directory is touched rather than the metadata rewritten.
+         *
+         * This used to set $meta['updatedAt'] and call writeMeta() on every
+         * chunk -- a json_encode, a temporary file and a rename, three
+         * filesystem operations each time, on FUSE. Nothing reads updatedAt:
+         * statusPayload() takes the resume offset from filesize() on the part
+         * file. What the rewrite actually achieved was bumping the session
+         * directory's mtime, which is what cleanupAbandoned() reads for the
+         * abandon TTL -- a side effect of the write rather than its purpose.
+         * Writing data.part does not bump the directory, so the touch is still
+         * needed; it just says what it is for and costs one syscall.
+         */
+        @touch($this->sessionDir($id));
+
+        $payload = $this->statusPayload($id, $meta);
+        // So a client can say how much of an upload was the server and how much
+        // was the network, instead of the two being argued about.
+        $payload['serverMs'] = (int)round((microtime(true) - $startedAt) * 1000);
+        return $payload;
     }
 
     /**
@@ -257,20 +276,27 @@ final class UploadService
      * flock() semantics, and requiring the lock made every chunk return 500 on
      * exactly the platform this application is built for.
      *
-     * Non-blocking with a short bounded wait, because the other failure mode is
-     * a flock() that never returns rather than one that returns false: a
-     * blocking call there would hold the request open until the browser gave
-     * up. Real contention is one other tab, which clears well inside this.
+     * One attempt, never a retry. This used to try twenty times with a 50 ms
+     * sleep between attempts, which was reasoning about the wrong failure: that
+     * loop waits out *contention*, but where there is no advisory locking at
+     * all flock() fails instantly and identically every time, so every chunk
+     * slept a full second for something that could never succeed -- around 78
+     * seconds of a 605 MB upload, measured.
+     *
+     * Waiting even briefly would only narrow the window between the size check
+     * and the write, and 6ed82d4 established that window is already harmless:
+     * two writers at one offset leave the file correct precisely because the
+     * write is positioned rather than appended. There is nothing here worth a
+     * second of anybody's upload.
      *
      * @param resource $out
      */
-    private function lockForWriting($out, string $part): bool
+    private function lockForWriting($out, string $part, bool $report): bool
     {
-        for ($attempt = 0; $attempt < 20; $attempt++) {
-            if (@flock($out, LOCK_EX | LOCK_NB)) return true;
-            usleep(50000);   // 20 x 50ms = 1s
-        }
-        error_log('[upload] no advisory lock available for '.$part.'; continuing with a positioned write');
+        if (@flock($out, LOCK_EX | LOCK_NB)) return true;
+        // Once per upload rather than once per chunk: seventy-six identical
+        // lines say nothing the first one did not.
+        if ($report) error_log('[upload] no advisory lock available for '.$part.'; continuing with a positioned write');
         return false;
     }
 

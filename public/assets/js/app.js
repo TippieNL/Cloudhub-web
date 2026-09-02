@@ -1373,6 +1373,7 @@ async function uploadOneFile(file, fileIndex, fileCount, totalBefore, totalBytes
                         row.querySelector('.queue-status').textContent = `Uploading · ${fp}%`;
                     }
                 });
+                uploadTiming.serverMs += Number(state.serverMs) || 0;
                 offset = state.received;
                 break;
             } catch (err) {
@@ -1403,10 +1404,32 @@ async function uploadOneFile(file, fileIndex, fileCount, totalBefore, totalBytes
     return done;
 }
 
+/*
+ * How much of an upload was the server and how much was the network.
+ *
+ * Every chunk reply carries the milliseconds PHP spent on it, so the two can be
+ * reported side by side instead of argued about. A transfer that is mostly wall
+ * clock and barely any server time is transport-bound, and no amount of work on
+ * this end will change it.
+ */
+const uploadTiming = { serverMs: 0, startedAt: 0 };
+
+function describeUploadTiming(bytes) {
+    const wallMs = Date.now() - uploadTiming.startedAt;
+    if (wallMs <= 0) return '';
+    const secs = ms => ms >= 60000
+        ? `${Math.floor(ms / 60000)}m${String(Math.round((ms % 60000) / 1000)).padStart(2, '0')}s`
+        : `${(ms / 1000).toFixed(1)}s`;
+    const rate = bytes / (wallMs / 1000);
+    return `${fmt(bytes)} in ${secs(wallMs)} (${fmt(rate)}/s) · ${secs(uploadTiming.serverMs)} in the server, ${secs(Math.max(0, wallMs - uploadTiming.serverMs))} in transfer`;
+}
+
 async function uploadFilesResumable(files) {
     const totalBytes = files.reduce((n, f) => n + f.size, 0);
     let completedBytes = 0;
     const results = [];
+    uploadTiming.serverMs = 0;
+    uploadTiming.startedAt = Date.now();
     for (let i = 0; i < files.length; i++) {
         const result = await uploadOneFile(files[i], i, files.length, completedBytes, totalBytes);
         const row = uploadUI.queue.querySelector(`[data-q="${i}"]`);
@@ -1417,6 +1440,7 @@ async function uploadFilesResumable(files) {
         completedBytes += files[i].size;
         results.push(result);
     }
+    uploadUI.bytes.textContent = describeUploadTiming(totalBytes);
     return results;
 }
 
