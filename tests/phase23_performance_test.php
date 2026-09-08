@@ -110,11 +110,17 @@ $checks['the temporary archive is unlinked on every exit path'] =
 // --- the session file is not rewritten on every request -----------------
 
 $authSrc = (string)file_get_contents($root.'/src/Services/Auth.php');
+// Now guarded by $idle>0 as well: with automatic sign-out disabled nothing
+// reads last_seen_at, so it is not written at all. phase34 exercises both
+// halves of that against real sessions; this keeps the write-throttling the
+// lazy_write work introduced.
 $checks['last_seen_at only moves once it has aged'] =
-    str_contains($authSrc, "if(\$now-(int)(\$_SESSION['last_seen_at']??0)>=60)\$_SESSION['last_seen_at']=\$now;")
+    str_contains($authSrc, "\$now-(int)(\$_SESSION['last_seen_at']??0)>=60)\$_SESSION['last_seen_at']=\$now;")
     // The old per-request form, which changed $_SESSION every time and so
     // defeated session.lazy_write.
     && !str_contains($authSrc, "\$_SESSION['created_at']??=\$now;\$_SESSION['last_seen_at']=\$now;");
+$checks['and not at all when nothing reads it'] =
+    str_contains($authSrc, "if(\$idle>0&&\$now-(int)(\$_SESSION['last_seen_at']??0)>=60)");
 // A session that was just destroyed and restarted still stamps the clock
 // unconditionally -- it has no previous value to age from.
 $checks['a reset session still stamps the clock'] =

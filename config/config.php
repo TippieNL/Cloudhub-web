@@ -21,7 +21,11 @@ return [
  'usage_cache_seconds'=>(int)env('USAGE_CACHE_SECONDS',300),
  'https_enabled'=>env_bool('HTTPS_ENABLED'), 'require_https'=>env_bool('REQUIRE_HTTPS',false),
  'trust_proxy'=>env_bool('TRUST_PROXY',false), 'hsts_enabled'=>env_bool('HSTS_ENABLED',false), 'hsts_max_age'=>(int)env('HSTS_MAX_AGE',31536000),
- 'session_idle_seconds'=>(int)env('SESSION_IDLE_SECONDS',3600), 'session_absolute_seconds'=>(int)env('SESSION_ABSOLUTE_SECONDS',43200),
+ // 0 disables the timeout. The window below then governs how long a session
+ // may live: it bounds both the cookie and PHP's session garbage collector, so
+ // that "never expire" does not mean session files accumulate for ever.
+ 'session_idle_seconds'=>(int)env('SESSION_IDLE_SECONDS',0), 'session_absolute_seconds'=>(int)env('SESSION_ABSOLUTE_SECONDS',0),
+ 'session_lifetime_days'=>(int)env('SESSION_LIFETIME_DAYS',30),
  'session_samesite'=>(string)env('SESSION_SAMESITE','Lax'), 'session_rotate_seconds'=>(int)env('SESSION_ROTATE_SECONDS',900),
  'login_rate_window_seconds'=>(int)env('LOGIN_RATE_WINDOW_SECONDS',900), 'login_rate_user_attempts'=>(int)env('LOGIN_RATE_USER_ATTEMPTS',5),
  'login_rate_ip_attempts'=>(int)env('LOGIN_RATE_IP_ATTEMPTS',20), 'login_rate_retention_seconds'=>(int)env('LOGIN_RATE_RETENTION_SECONDS',86400),

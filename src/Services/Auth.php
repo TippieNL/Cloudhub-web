@@ -27,29 +27,70 @@ final class Auth {
         ini_set('session.use_strict_mode','1');
         ini_set('session.use_trans_sid','0');
 
+        /*
+         * How long a signed-in session is meant to survive.
+         *
+         * Zero disables an expiry, and is read before the floors below, because
+         * max(300, 0) is 300 -- a floor applied first would turn "never expire"
+         * into a five-minute timeout, which is the opposite of what it was
+         * asked for. A positive value keeps its floor and behaves as it always
+         * did, so the capability is switched off rather than removed.
+         */
+        $idle=(int)($config['session_idle_seconds']??0);
+        $absolute=(int)($config['session_absolute_seconds']??0);
+        $idle=$idle>0?max(300,$idle):0;
+        $absolute=$absolute>0?max($idle,$absolute):0;
+
+        /*
+         * The window the session may live in when nothing expires it.
+         *
+         * "Never" still needs a number here. gc_maxlifetime governs when PHP
+         * deletes the session file, and it was never set -- so the default,
+         * commonly twenty-four minutes, reaped sessions long before any of the
+         * checks below had an opinion. Removing those checks alone would have
+         * changed nothing anyone could notice.
+         */
+        $window=$absolute>0?$absolute:max(3600,(int)($config['session_lifetime_days']??30)*86400);
+        ini_set('session.gc_maxlifetime',(string)$window);
+
         // Do not force session.save_path into Android shared storage.
         // PHP's files session handler performs UID ownership checks there and
         // can reject its own session files ("not created by your uid").
         // Use PHP's configured session handler/path instead.
         session_name('cloudhub_session');
-        session_set_cookie_params(['lifetime'=>0,'path'=>'/','secure'=>$secure,'httponly'=>true,'samesite'=>(string)($config['session_samesite']??'Lax')]);
+        /*
+         * A real cookie lifetime, not 0.
+         *
+         * 0 makes a browser-session cookie, which is discarded when the browser
+         * closes -- and Android closes browsers on its own schedule, so that
+         * alone signed people out repeatedly however long the server was
+         * willing to keep the session. session_regenerate_id() reissues the
+         * cookie from these parameters, so a rotated session keeps the lifetime
+         * rather than reverting to a session cookie.
+         */
+        session_set_cookie_params(['lifetime'=>$window,'path'=>'/','secure'=>$secure,'httponly'=>true,'samesite'=>(string)($config['session_samesite']??'Lax')]);
         session_start();
 
-        $now=time();$idle=max(300,(int)($config['session_idle_seconds']??3600));$absolute=max($idle,(int)($config['session_absolute_seconds']??43200));
-        if((isset($_SESSION['created_at'])&&$now-(int)$_SESSION['created_at']>$absolute)||(isset($_SESSION['last_seen_at'])&&$now-(int)$_SESSION['last_seen_at']>$idle)){
+        $now=time();
+        $expired=($absolute>0&&isset($_SESSION['created_at'])&&$now-(int)$_SESSION['created_at']>$absolute)
+            ||($idle>0&&isset($_SESSION['last_seen_at'])&&$now-(int)$_SESSION['last_seen_at']>$idle);
+        if($expired){
             self::destroySession();session_start();
         }
         $_SESSION['created_at']??=$now;$_SESSION['csrf']??=bin2hex(random_bytes(32));
         /*
-         * Only move last_seen_at when it has actually aged.
+         * Only move last_seen_at when it has actually aged, and not at all when
+         * nothing reads it.
          *
          * session.lazy_write (on by default) skips writing the session file
          * when nothing in $_SESSION changed -- but stamping the clock on every
          * request changed it every time, so a gallery load's ~240 requests
          * meant ~240 session writes to Android flash. A minute of granularity
-         * is invisible to the idle check above, whose floor is 300 seconds.
+         * is invisible to the idle check above, whose floor is 300 seconds; and
+         * with that check disabled the value has no reader at all, so writing
+         * it would be a session write per minute for nothing.
          */
-        if($now-(int)($_SESSION['last_seen_at']??0)>=60)$_SESSION['last_seen_at']=$now;
+        if($idle>0&&$now-(int)($_SESSION['last_seen_at']??0)>=60)$_SESSION['last_seen_at']=$now;
         // A session carried forward from a rotation is only valid for the short
         // grace window below; once it lapses the successor ID is the only one
         // accepted. Requests still holding the old ID are shown the door here
