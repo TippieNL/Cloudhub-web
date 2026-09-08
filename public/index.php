@@ -26,7 +26,10 @@ $frontController = ($basePath === '' ? '/' : $basePath.'/');
  * server for each visit, so these routes run session-less. They authenticate
  * on the token alone and never read $_SESSION.
  */
-$isPublicShare = (bool)preg_match('#^/share/[A-Za-z0-9_-]{20,128}(?:/(?:raw|download))?$#', $path);
+// The optional suffixes are the file extension a share URL now carries. They
+// are bounded deliberately: this decides which URLs run with no session and no
+// authentication at all, so it must widen by exactly that and nothing else.
+$isPublicShare = (bool)preg_match('#^/share/[A-Za-z0-9_-]{20,128}(?:\.[A-Za-z0-9]{1,10})?(?:/(?:raw|download)(?:\.[A-Za-z0-9]{1,10})?)?$#', $path);
 if (!$isPublicShare) Auth::startSession($config);
 Security::applyHeaders($config);
 Security::assertProductionConfig($config);
@@ -412,9 +415,28 @@ function public_origin(array $config): string {
     return $scheme.'://'.$host;
 }
 
-/** Public URL of a share token, e.g. https://host/base/share/TOKEN. */
-function share_url(array $config, string $basePath, string $token): string {
-    return public_origin($config).$basePath.'/share/'.$token;
+/**
+ * Public URL of a share token, e.g. https://host/base/share/TOKEN.png.
+ *
+ * The extension is decoration: it makes a link readable as what it points at,
+ * and nothing on the way back in consults it. Only a plausible one is appended
+ * -- lowercase alphanumeric, at most ten characters -- so a filename carrying
+ * dots, spaces or control characters contributes nothing rather than something
+ * surprising in a URL other people are going to paste. A file without an
+ * extension simply gets none.
+ */
+function share_url(array $config, string $basePath, string $token, string $file = ''): string {
+    return public_origin($config).$basePath.'/share/'.$token.share_url_suffix($file);
+}
+
+/** The ".ext" part of a share URL, or '' when the name does not offer a safe one. */
+function share_url_suffix(string $file): string {
+    $base = basename($file);
+    // A dotfile's leading dot starts its name rather than an extension, so
+    // ".hidden" would otherwise put ".hidden" on the URL as though it were one.
+    if (str_starts_with($base, '.') && !str_contains(substr($base, 1), '.')) return '';
+    $ext = strtolower((string)pathinfo($base, PATHINFO_EXTENSION));
+    return preg_match('/^[a-z0-9]{1,10}$/', $ext) === 1 ? '.'.$ext : '';
 }
 
 /**
@@ -1179,7 +1201,7 @@ if ($path === '/api/files/upload' && $method === 'POST') api_try(function()use($
         }
 
         return ['token' => $r['token'],
-            'url' => share_url($config, $basePath, (string)$r['token']),
+            'url' => share_url($config, $basePath, (string)$r['token'], $rel),
             'name' => basename($f),
             'kind' => share_media_kind($f),
             'expiresAt' => $r['expires_at']?gmdate('c', strtotime((string)$r['expires_at'])):null];
@@ -1194,7 +1216,7 @@ if ($path === '/api/files/upload' && $method === 'POST') api_try(function()use($
             'token' => $x['token'],
             'filePath' => $x['file_path'],
             'name' => basename((string)$x['file_path']),
-            'url' => share_url($config, $basePath, (string)$x['token']),
+            'url' => share_url($config, $basePath, (string)$x['token'], (string)$x['file_path']),
             'createdAt' => gmdate('c', strtotime((string)$x['created_at'])),
             'expiresAt' => $x['expires_at']?gmdate('c', strtotime((string)$x['expires_at'])):null,
         ], $rows);
@@ -1219,7 +1241,12 @@ if ($path === '/api/files/upload' && $method === 'POST') api_try(function()use($
      *   /share/{token}/raw       the bytes, inline and range-capable
      *   /share/{token}/download  the bytes, as an attachment
      */
-    if (preg_match('#^/share/([A-Za-z0-9_-]{20,128})(?:/(raw|download))?$#', $path, $m) && ($method === 'GET' || $method === 'HEAD')) api_try(function()use($m, $fs, $config, $basePath, $assetBase, $method) {
+    // The extension sits outside the capture group, so $m[1] is the bare token
+    // and share_resolve() is handed exactly what it always was. Nothing below
+    // reads the suffix: what is served is decided from the stored file, because
+    // a URL that could steer its own Content-Type is the thing this route
+    // exists to prevent.
+    if (preg_match('#^/share/([A-Za-z0-9_-]{20,128})(?:\.[A-Za-z0-9]{1,10})?(?:/(raw|download)(?:\.[A-Za-z0-9]{1,10})?)?$#', $path, $m) && ($method === 'GET' || $method === 'HEAD')) api_try(function()use($m, $fs, $config, $basePath, $assetBase, $method) {
         [$share, $file] = share_resolve($fs, $m[1]);
         $variant = $m[2]??'';
         $kind = share_media_kind($file);
@@ -1230,14 +1257,21 @@ if ($path === '/api/files/upload' && $method === 'POST') api_try(function()use($
         if ($variant === '' && $kind !== 'other') {
             // Viewer page. Rendered from our own origin, so it gets the normal
             // application CSP rather than the sandbox applied to the bytes.
+            // All three are absolute and share one origin: og:image and
+            // og:video are required to be, chat clients being the whole point
+            // of them, and a page reached through the origin public_origin()
+            // reports can be served from it too.
+            $pageUrl = share_url($config, $basePath, (string)$share['token'], $file);
+            $bytesUrl = public_origin($config).$basePath.'/share/'.$share['token'];
+            $suffix = share_url_suffix($file);
             $shareFile = [
                 'name' => basename($file),
                 'kind' => $kind,
                 'size' => filesize($file)?:0,
                 'mime' => media_mime_type($file),
-                'rawUrl' => $basePath.'/share/'.$share['token'].'/raw',
-                'downloadUrl' => $basePath.'/share/'.$share['token'].'/download',
-                'pageUrl' => share_url($config, $basePath, (string)$share['token']),
+                'rawUrl' => $bytesUrl.'/raw'.$suffix,
+                'downloadUrl' => $bytesUrl.'/download'.$suffix,
+                'pageUrl' => $pageUrl,
                 'expiresAt' => $share['expires_at']?gmdate('c', strtotime((string)$share['expires_at'])):null,
             ];
             header('Cache-Control: private,no-store');

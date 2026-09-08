@@ -26,8 +26,11 @@ $checks = [];
 $checks['share routes are outside the authenticated guard'] =
     str_contains($index, "\$isProtectedApi = (str_starts_with(\$path, '/api/')&&!\$isAuthEndpoint) || str_starts_with(\$path, '/webdav')")
     && !str_contains($index, "str_starts_with(\$path, '/share')&&\$isProtectedApi");
+// The token is captured and the two byte variants are optional. Pinned to
+// that shape rather than to the exact pattern text, which also carries the
+// optional cosmetic file extension phase35 covers in full.
 $checks['viewer, raw and download variants are routed'] =
-    (bool)preg_match('#\^/share/\(\[A-Za-z0-9_-\]\{20,128\}\)\(\?:/\(raw\|download\)\)\?\$#', $index);
+    (bool)preg_match('#\^/share/\(\[A-Za-z0-9_-\]\{20,128\}\).*\(raw\|download\).*\$#', $index);
 $checks['anonymous viewers get no session'] =
     str_contains($index, '$isPublicShare') && str_contains($index, 'if (!$isPublicShare) Auth::startSession($config);');
 

@@ -7,6 +7,7 @@
  * it needs arrives in $shareFile; the bytes come from the separate /raw route.
  *
  * @var array  $shareFile  name, kind, size, mime, rawUrl, downloadUrl, pageUrl, expiresAt
+ *                        (the three URLs are absolute and share one origin)
  * @var array  $config
  * @var string $basePath
  * @var string $assetBase
@@ -43,16 +44,20 @@ if (!empty($shareFile['expiresAt'])) {
     <link rel="icon" href="<?= $assets ?>/favicon.png">
     <link rel="stylesheet" href="<?= $assets ?>/assets/css/share.css?v=<?= (int)@filemtime(dirname(__DIR__, 2).'/public/assets/css/share.css') ?>">
 
-    <!-- Link previews in chat clients. Only the file name is exposed. -->
+    <!-- Link previews in chat clients. Only the file name is exposed.
+         The media URL comes from the payload rather than being re-derived by
+         appending /raw to the page URL: the page URL may now carry a cosmetic
+         extension, and that would spell one address two ways. Both are
+         absolute, which og:image and og:video require. -->
     <meta property="og:title" content="<?= $name ?>">
     <meta property="og:type" content="<?= $kind === 'video' ? 'video.other' : 'website' ?>">
     <meta property="og:url" content="<?= $pageUrl ?>">
     <meta property="og:site_name" content="Cloud File Hub">
     <?php if ($kind === 'image'): ?>
-    <meta property="og:image" content="<?= $pageUrl ?>/raw">
+    <meta property="og:image" content="<?= $rawUrl ?>">
     <meta name="twitter:card" content="summary_large_image">
     <?php elseif ($kind === 'video'): ?>
-    <meta property="og:video" content="<?= $pageUrl ?>/raw">
+    <meta property="og:video" content="<?= $rawUrl ?>">
     <meta property="og:video:type" content="<?= $mime ?>">
     <meta name="twitter:card" content="player">
     <?php else: ?>
