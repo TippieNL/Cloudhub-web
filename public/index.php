@@ -1021,7 +1021,27 @@ if ($path === '/api/files/upload' && $method === 'POST') api_try(function()use($
         $names = [$names]; $tmp = [$tmp]; $errs = [$errs]; $sizes = [$sizes];
     }
     if (!$names) throw new RuntimeException('No files were selected', 400);
-    if (count($names) > $config['max_upload_files']) throw new RuntimeException('Maximum '.$config['max_upload_files'].' files can be uploaded at once', 400);
+
+    $appMax = (int)$config['max_upload_files'];
+    if ($appMax > 0 && count($names) > $appMax) throw new RuntimeException('Maximum '.$appMax.' files can be uploaded at once', 400);
+
+    /*
+     * PHP's own ceiling, which is the one that actually binds here.
+     *
+     * max_file_uploads defaults to 20, and a request carrying more is truncated
+     * without telling anyone -- $_FILES simply arrives short. What reaches this
+     * line is already truncated, so a count that has reached the ceiling cannot
+     * be told apart from one that was cut down to it, and the alternative to
+     * refusing is answering "20 file(s) uploaded successfully" to a client that
+     * sent thirty. The false positive at exactly max_file_uploads is the safe
+     * direction, and the message says what to do about it.
+     *
+     * This bound used to be invisible because the application cap happened to
+     * equal it. It no longer does.
+     */
+    $phpMax = max(1, (int)ini_get('max_file_uploads'));
+    if (count($names) >= $phpMax) throw new RuntimeException('This request may exceed the server max_file_uploads limit of '.$phpMax.
+        '. Send fewer files per request, raise max_file_uploads, or use the resumable upload API.', 400);
 
     $maxBytes = max(1, (int)$config['max_upload_mb'])*1024*1024;
     $saved = [];

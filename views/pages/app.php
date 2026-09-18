@@ -1,3 +1,23 @@
+<?php
+/**
+ * The authenticated application shell.
+ *
+ * @var array  $config
+ * @var string $basePath
+ * @var string $assetBase
+ */
+// Built here rather than inline in the markup because the file cap is
+// switchable: MAX_UPLOAD_FILES=0 means no limit, and "Select up to 0 files"
+// is the sentence that phrasing produces if it is not handled.
+$maxUploadFiles = (int)$config['max_upload_files'];
+$uploadCountHelp = $maxUploadFiles > 0
+    ? 'Select up to '.$maxUploadFiles.' file'.($maxUploadFiles === 1 ? '' : 's').'.'
+    : 'Select any number of files.';
+$maxUploadMb = (int)$config['max_upload_mb'];
+$uploadSizeHelp = $maxUploadMb >= 1024
+    ? number_format($maxUploadMb / 1024, 0).' GB'
+    : $maxUploadMb.' MB';
+?>
 <!doctype html>
 <html lang="en">
 <head>
@@ -91,7 +111,7 @@
                 </div>
                 <label id="upload-dropzone" class="file-picker upload-dropzone" for="upload-input">
                     <span class="file-picker-title">Drop files here or choose files</span>
-                    <span class="file-picker-help">Select up to <?= (int)$config['max_upload_files'] ?> files. Maximum <?= (int)$config['max_upload_mb'] >= 1024 ? number_format($config['max_upload_mb']/1024, 0).' GB' : (int)$config['max_upload_mb'].' MB' ?> per file. Large files are uploaded in resumable chunks.</span>
+                    <span class="file-picker-help"><?= htmlspecialchars($uploadCountHelp, ENT_QUOTES) ?> Maximum <?= htmlspecialchars($uploadSizeHelp, ENT_QUOTES) ?> per file. Large files are uploaded in resumable chunks.</span>
                     <input id="upload-input" name="files[]" type="file" multiple>
                 </label>
                 <div id="upload-selection" class="upload-selection" aria-live="polite">No files selected.</div>

@@ -1238,7 +1238,7 @@ const uploadUI = {
     queue: $('#upload-queue'),
     files: [],
     limits: window.CLOUDHUB_UPLOAD_LIMITS || {
-        maxFiles: 20, maxMb: 2048, chunkMb: 8, retryCount: 3, conflict: 'rename'
+        maxFiles: 150, maxMb: 5120, chunkMb: 8, retryCount: 3, conflict: 'rename'
     },
     xhr: null,
     cancelled: false,
@@ -1298,7 +1298,11 @@ function uploadStatus(type, message) {
 
 function validateUploadFiles(files) {
     if (!files.length) return 'Choose at least one file.';
-    if (files.length > uploadUI.limits.maxFiles) return `You can upload at most ${uploadUI.limits.maxFiles} files at once.`;
+    // 0 -- and anything unparseable -- means no limit. Files go up one at a
+    // time through the resumable protocol, so a long queue costs patience
+    // rather than server load, and the cap is policy an admin chooses.
+    const maxFiles = Number(uploadUI.limits.maxFiles) || 0;
+    if (maxFiles > 0 && files.length > maxFiles) return `You can upload at most ${maxFiles} file${maxFiles === 1 ? '' : 's'} at once.`;
     const max = uploadUI.limits.maxMb * 1024 * 1024;
     const large = files.find(f => f.size > max);
     return large ? `${large.name} exceeds the ${fmt(max)} per-file limit.` : '';

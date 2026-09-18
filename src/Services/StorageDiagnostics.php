@@ -150,6 +150,23 @@ final class StorageDiagnostics
                     .$this->config['upload_chunk_mb'].' MB chunk size; lower UPLOAD_CHUNK_MB or raise it.';
             }
         }
+        /*
+         * A 32-bit build cannot address past 2 GB.
+         *
+         * filesize(), fseek() and the offsets the chunk protocol writes at all
+         * go through PHP's signed integer, so on a 32-bit runtime a file beyond
+         * 2^31 bytes is accepted at init() and then mis-handled on the way to
+         * disk. At the old default of 2048 MB the question never arose -- that
+         * is exactly the boundary -- so it was documented as a recommendation.
+         * Above it, it is a requirement, and this is the only place that can
+         * tell the operator whether their build actually meets it.
+         */
+        if (PHP_INT_SIZE < 8 && (int)$this->config['max_upload_mb'] > 2047) {
+            $warnings[] = 'MAX_UPLOAD_MB is '.(int)$this->config['max_upload_mb']
+                .' MB but this is a 32-bit PHP build, which cannot address files beyond 2 GB; '
+                .'lower MAX_UPLOAD_MB to 2047 or install a 64-bit runtime.';
+        }
+
         foreach ($warnings as $warning) $problems[] = $warning;
 
         return [

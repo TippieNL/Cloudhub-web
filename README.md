@@ -18,7 +18,7 @@ For Android/KSWEB video thumbnails, no FFmpeg installation is required; compatib
    administrator with `php tools/create-admin.php admin` — the schema seeds no
    account (see **Login**).
 4. Ensure the PHP/web-server user can read/write `storage/` and `storage/.thumbnails/`.
-5. Large uploads use the resumable chunk API, so `upload_max_filesize` and `post_max_size` only need to exceed `UPLOAD_CHUNK_MB` (8 MB by default). A practical PHP configuration is `upload_max_filesize=16M` and `post_max_size=20M`. The application-level per-file limit defaults to 2 GB.
+5. Large uploads use the resumable chunk API, so `upload_max_filesize` and `post_max_size` only need to exceed `UPLOAD_CHUNK_MB` (8 MB by default). A practical PHP configuration is `upload_max_filesize=16M` and `post_max_size=20M`. The application-level per-file limit defaults to 5 GB.
 6. Development: `php -S 127.0.0.1:8000 -t public`.
 
 ## Public share links
@@ -509,8 +509,10 @@ group.
 ## Resumable large-file uploads
 
 Cloud File Hub now uploads files in configurable chunks rather than one large
-`multipart/form-data` request. The default application limit is **2 GB per
-file** (`MAX_UPLOAD_MB=2048`) and the default chunk size is 8 MB.
+`multipart/form-data` request. The default application limits are **5 GB per
+file** (`MAX_UPLOAD_MB=5120`) and **150 files per batch**
+(`MAX_UPLOAD_FILES=150`, where `0` means no limit); the default chunk size is
+8 MB.
 
 The protocol is:
 
@@ -543,19 +545,32 @@ request or CLI maintenance task can invoke cleanup periodically.
 ### Relevant environment settings
 
 ```ini
-MAX_UPLOAD_MB=2048
-MAX_UPLOAD_FILES=20
+MAX_UPLOAD_MB=5120
+MAX_UPLOAD_FILES=150
 UPLOAD_CHUNK_MB=8
 UPLOAD_RETRY_COUNT=3
 UPLOAD_ABANDON_HOURS=24
 UPLOAD_CONFLICT=rename
 ```
 
-`MAX_UPLOAD_MB=2048` is an application policy limit, not a requirement to allow
-2 GB PHP request bodies. Keep PHP request limits modestly above the configured
-chunk size. The destination filesystem and PHP build must support files larger
-than 2 GB; a 64-bit PHP runtime and a large-file-capable filesystem are
-recommended.
+`MAX_UPLOAD_MB=5120` is an application policy limit, not a requirement to allow
+5 GB PHP request bodies. Keep PHP request limits modestly above the configured
+chunk size.
+
+At the default of 5120 MB a **64-bit PHP build is required**, not merely
+recommended: `filesize()`, `fseek()` and the offsets the chunk protocol writes
+at all go through PHP's signed integer, so a 32-bit runtime accepts a file past
+2 GB and then mis-handles it. `tools/storage-check.php` (and
+`GET /api/storage/check`) reports this as a warning when the build cannot meet
+the configured limit. The destination filesystem must also support files that
+large -- FAT32, which some removable cards still use, caps a single file at 4 GB.
+
+`MAX_UPLOAD_FILES` bounds how many files may be queued in one batch; `0` removes
+the bound. It applies to the browser's resumable uploads. The legacy
+`POST /api/files/upload` multipart route is separately bound by PHP's own
+`max_file_uploads` (20 by default), which silently truncates `$_FILES` past that
+count -- so that route refuses a request reaching the ceiling rather than
+reporting success for the files that survived.
 
 
 ## v10.1 upload staging repair
