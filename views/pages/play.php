@@ -121,13 +121,23 @@ $assets = htmlspecialchars($assetBase, ENT_QUOTES, 'UTF-8');
         window.CLOUDHUB_BASE = <?= json_encode($basePath, JSON_UNESCAPED_SLASHES) ?>;
         window.CLOUDHUB_FRONT = <?= json_encode($frontController, JSON_UNESCAPED_SLASHES) ?>;
         window.CLOUDHUB_ROUTE = <?= json_encode($path, JSON_UNESCAPED_SLASHES) ?>;
-        <?php /* So a failure can name the codec and offer a way out of it. */ ?>
+        <?php
+        /*
+         * So a failure can name the codec and offer a way out of it, and so the
+         * subtitle menu is right the first time it is opened.
+         *
+         * JSON_HEX_TAG matters here: both the file's name and the subtitle
+         * labels built from filenames end up in this block, and a file named to
+         * contain "</script>" would otherwise end it early.
+         */
+        ?>
         window.CLOUDHUB_MEDIA = <?= json_encode([
             'codec' => $mediaFile['codec'] ?? null,
             'codecWidelySupported' => $mediaFile['codecWidelySupported'] ?? null,
             'downloadUrl' => $mediaFile['download_url'] ?? null,
             'name' => $mediaFile['name'] ?? null,
-        ], JSON_UNESCAPED_SLASHES) ?>;
+        ], JSON_UNESCAPED_SLASHES | JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) ?>;
+        window.CLOUDHUB_SUBTITLES = <?= json_encode($mediaFile['subtitles'] ?? [], JSON_UNESCAPED_SLASHES | JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) ?>;
     </script>
 </body>
 </html>
