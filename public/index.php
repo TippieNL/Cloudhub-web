@@ -11,6 +11,7 @@ use CloudHub\Services\UploadService;
 use CloudHub\Services\Security;
 use CloudHub\Services\LoginRateLimiter;
 use CloudHub\Services\Authorization;
+use CloudHub\Services\SubtitleService;
 use CloudHub\Services\DuplicateFinder;
 use CloudHub\Services\StorageDiagnostics;
 use CloudHub\Services\MediaProbe;
@@ -313,6 +314,28 @@ function duplicates(): DuplicateFinder {
     return $finder ??= new DuplicateFinder($config, $fs);
 }
 /**
+* Sidecar subtitles, found and converted on demand.
+*/
+function subtitles(): SubtitleService {
+    static $service; global $fs;
+    return $service ??= new SubtitleService($fs);
+}
+/**
+* The tracks for one video, each with the URL the client fetches it from.
+*
+* The URL is built here rather than in the service, because the service knows
+* about files and nothing about how this installation is addressed.
+*/
+function subtitle_tracks(string $frontController, string $relativeVideoPath): array {
+    $tracks = [];
+    foreach (subtitles()->tracksFor($relativeVideoPath) as $track) {
+        $tracks[] = $track + [
+            'url' => $frontController.'?route=%2Fapi%2Ffiles%2Fsubtitle&path='.urlencode($track['path']),
+        ];
+    }
+    return $tracks;
+}
+/**
 * The upload ledger, sharing the request's database connection.
 */
 function ledger(): StorageLedger {
@@ -613,6 +636,38 @@ if (($path === '/api/files/preview') && ($method === 'GET' || $method === 'HEAD'
     if (!$inline)throw new RuntimeException('This file type does not support inline preview', 415);
 
     serve_file_range($f, $mime, 'inline', $method, ['Cache-Control: private,max-age=300']);
+});
+/**
+* Subtitle tracks that belong to one video.
+*
+* Listing is separate from playing them because the two have different callers:
+* the web player is handed the list with the page it is already loading, while
+* the Android app has only a path and asks. Both end up at the same discovery
+* rules, and both fetch the track itself from the route below.
+*/
+if ($path === '/api/files/subtitles' && $method === 'GET') api_try(function()use($frontController) {
+    release_session_lock();
+    $relative = (string)($_GET['path']??'');
+    return ['path' => $relative, 'tracks' => subtitle_tracks($frontController, $relative)];
+});
+/**
+* One subtitle track, always as WebVTT.
+*
+* The conversion happens here rather than on disk: an .srt beside a video is
+* the user's own file and playing it is no reason to rewrite it. Only .srt and
+* .vtt are served, so this cannot be used to read an arbitrary file as text.
+*/
+if ($path === '/api/files/subtitle' && ($method === 'GET' || $method === 'HEAD')) api_try(function()use($method) {
+    release_session_lock();
+    $vtt = subtitles()->webVtt((string)($_GET['path']??''));
+
+    header('Content-Type: text/vtt; charset=utf-8');
+    header('Content-Length: '.strlen($vtt));
+    header('Content-Disposition: inline');
+    header('X-Content-Type-Options: nosniff');
+    header('Cache-Control: private,max-age=300');
+    if ($method !== 'HEAD')echo $vtt;
+    exit;
 });
 if ($path === '/api/files/mkdir' && $method === 'POST') api_try(function()use($fs) {
     global $config; $fs->writable(); $b = Http::body(); $p = $fs->destination((string)($b['path']??'')); if (file_exists($p))throw new RuntimeException('Directory already exists', 409); if (!mkdir($p, 0775, true)&&!is_dir($p))throw new RuntimeException('Unable to create directory', 500); return ['success' => true,
@@ -1631,7 +1686,11 @@ if ($path === '/play' && $method === 'GET') {
                         'download_url' => $frontController . '?route=%2Fapi%2Ffiles%2Fdownload&path=' . urlencode($relPath),
                         'codec' => $codec['name'],
                         'codecWidelySupported' => $codec['widelySupported'],
-                        'sprite_url' => ''
+                        'sprite_url' => '',
+                        // Found with the page rather than fetched after it: the
+                        // subtitle menu is then right the first time it is
+                        // opened, instead of empty until a request comes back.
+                        'subtitles' => subtitle_tracks($frontController, $relPath)
                     ];
                 }
             }

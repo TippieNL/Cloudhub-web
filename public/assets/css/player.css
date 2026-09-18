@@ -321,6 +321,23 @@
     font-weight: 600;
 }
 
+/* A folder can hold a dozen subtitle tracks; the menu scrolls rather than
+   growing past the top of the player. */
+.cfh-menu-list {
+    max-height: 45vh;
+    overflow-y: auto;
+}
+
+/* Says at a glance that subtitles are on, without opening the menu. */
+.cfh-btn.cfh-btn-on {
+    color: var(--cfh-primary-hover);
+}
+
+/*
+ * Subtitles sit above the control bar, and drop to the bottom of the frame
+ * once the controls auto-hide -- otherwise a film watched without touching
+ * anything shows its subtitles in a gap of empty picture.
+ */
 .cfh-subtitle-display {
     position: absolute;
     bottom: 80px;
@@ -329,10 +346,22 @@
     text-align: center;
     pointer-events: none;
     z-index: 5;
+    transition: bottom 0.25s ease;
+}
+
+.cfh-player-container.cfh-autohide .cfh-subtitle-display {
+    bottom: 32px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .cfh-subtitle-display { transition: none; }
 }
 
 .cfh-subtitle-cue {
-    display: inline-block;
+    display: block;
+    width: fit-content;
+    max-width: 100%;
+    margin: 0 auto 2px;
     background: rgba(0, 0, 0, 0.75);
     color: #ffffff;
     padding: 4px 12px;

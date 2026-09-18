@@ -119,6 +119,76 @@ export class PlayerUI {
             'Subtitles',
             () => new SubtitleManager(this.video, display, this.settings)
         );
+        if (!this.subtitleManager) return;
+
+        // Rendered into the page by /play, which already had to open the folder
+        // the video is in. Asking for the list separately would leave the menu
+        // wrong for as long as that request took.
+        const tracks = Array.isArray(window.CLOUDHUB_SUBTITLES) ? window.CLOUDHUB_SUBTITLES : [];
+
+        this.subtitleManager.onChange(() => this.updateSubtitleMenu());
+        this.subtitleManager.setTracks(tracks);
+        this.buildSubtitleMenu();
+    }
+
+    /**
+     * The subtitle menu -- or nothing at all.
+     *
+     * A video with no subtitle beside it leaves the list empty, and
+     * initOptionalControls() then hides the button entirely: an empty menu
+     * reads as a broken player, where a missing button reads as "there are no
+     * subtitles for this one".
+     */
+    buildSubtitleMenu() {
+        const list = this.container.querySelector('#cfh-subtitles-list');
+        if (!list || !this.subtitleManager) return;
+
+        // The manager's own list, not the page's: it has dropped anything
+        // malformed, so the menu cannot offer a track that will not load.
+        const tracks = this.subtitleManager.tracks;
+
+        list.replaceChildren();
+        if (!tracks.length) return;
+
+        const select = (id) => {
+            this.subtitleManager.select(id);
+            this.hideAllMenus();
+            this.overlay?.showControlsTemporarily();
+        };
+
+        list.appendChild(this.menuItem('Off', { track: '' }, () => select('')));
+        tracks.forEach((track) => {
+            list.appendChild(this.menuItem(track.label, { track: track.id }, () => select(track.id)));
+        });
+
+        this.updateSubtitleMenu();
+    }
+
+    updateSubtitleMenu() {
+        const list = this.container.querySelector('#cfh-subtitles-list');
+        const trigger = this.container.querySelector('[data-menu="subtitles"]');
+        const active = this.subtitleManager?.activeId ?? '';
+
+        list?.querySelectorAll('[data-track]').forEach((item) => {
+            const current = item.dataset.track === active;
+            item.classList.toggle('cfh-active', current);
+            item.setAttribute('aria-checked', String(current));
+        });
+
+        if (trigger) {
+            trigger.classList.toggle('cfh-btn-on', active !== '');
+            const track = this.subtitleManager?.activeTrack;
+            trigger.setAttribute('aria-label', track ? `Subtitles: ${track.label}` : 'Subtitles off');
+        }
+    }
+
+    /** The subtitle button and the C key do the same thing. */
+    toggleSubtitles() {
+        if (!this.subtitleManager?.tracks.length) return;
+
+        const track = this.subtitleManager.toggle();
+        this.showFeedback(track ? `Subtitles: ${track.label}` : 'Subtitles off');
+        this.overlay?.showControlsTemporarily();
     }
 
     initThumbnail() {
@@ -180,33 +250,45 @@ export class PlayerUI {
         list.replaceChildren();
 
         this.speedManager.allowedSpeeds.forEach((speed) => {
-            const item = document.createElement('li');
-            item.className = 'cfh-menu-item';
-            item.dataset.speed = String(speed);
-            item.setAttribute('role', 'menuitemradio');
-            item.setAttribute('aria-checked', String(speed === this.speedManager.currentSpeed));
-            item.tabIndex = 0;
-            item.textContent = `${speed}×`;
-
-            const select = () => {
+            list.appendChild(this.menuItem(`${speed}×`, { speed: String(speed) }, () => {
                 this.speedManager.setSpeed(speed);
                 this.updateSpeedMenu();
                 this.hideAllMenus();
                 this.overlay?.showControlsTemporarily();
-            };
-
-            item.addEventListener('click', select);
-            item.addEventListener('keydown', (event) => {
-                if (event.key === 'Enter' || event.key === ' ') {
-                    event.preventDefault();
-                    select();
-                }
-            });
-
-            list.appendChild(item);
+            }));
         });
 
         this.updateSpeedMenu();
+    }
+
+    /**
+     * One row of a dropdown menu.
+     *
+     * Shared by the speed and subtitle menus so that both answer Enter and
+     * Space, and so a third menu cannot quietly arrive without doing so: these
+     * are list items, which get none of a button's keyboard behaviour for free.
+     */
+    menuItem(label, dataset, onSelect) {
+        const item = document.createElement('li');
+        item.className = 'cfh-menu-item';
+        item.setAttribute('role', 'menuitemradio');
+        item.setAttribute('aria-checked', 'false');
+        item.tabIndex = 0;
+        item.textContent = label;
+
+        Object.entries(dataset).forEach(([key, value]) => {
+            item.dataset[key] = value;
+        });
+
+        item.addEventListener('click', onSelect);
+        item.addEventListener('keydown', (event) => {
+            if (event.key === 'Enter' || event.key === ' ') {
+                event.preventDefault();
+                onSelect();
+            }
+        });
+
+        return item;
     }
 
     updateSpeedMenu() {
@@ -427,6 +509,10 @@ export class PlayerUI {
 
         if (shouldOpen && menuName === 'speed') {
             this.updateSpeedMenu();
+        }
+
+        if (shouldOpen && menuName === 'subtitles') {
+            this.updateSubtitleMenu();
         }
     }
 

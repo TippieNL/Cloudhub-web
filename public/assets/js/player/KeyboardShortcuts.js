@@ -76,6 +76,15 @@ export class KeyboardShortcuts {
                 event.preventDefault();
                 this.playerUI.volumeManager?.toggleMute();
                 break;
+            case 'c':
+            case 'C':
+                // Only when there is something to turn on: otherwise C is a
+                // key that appears to do nothing, which reads as a bug.
+                if (this.playerUI.subtitleManager?.tracks.length) {
+                    event.preventDefault();
+                    this.playerUI.toggleSubtitles();
+                }
+                break;
             case 'p':
             case 'P':
                 if (!this.playerUI.pipManager?.btnPip.hidden) {
