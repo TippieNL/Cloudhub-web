@@ -279,6 +279,51 @@ const THUMBNAIL_VIDEO_EXTENSIONS = ['mp4', 'webm', 'ogv', 'ogg', 'mov', 'm4v', '
 const THUMBNAIL_IMAGE_EXTENSIONS = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp'];
 
 /**
+ * The most pixels a thumbnail will decode.
+ *
+ * GD holds a decoded image at up to four bytes a pixel whatever the file's
+ * size, so a 285 KB PNG declaring 10000x10000 pixels took one thumbnail
+ * request to 704 MB -- measured -- and nothing caches the failure, so every
+ * listing of that folder asked again. memory_limit is no defence: Debian and
+ * Ubuntu build PHP against the system libgd, whose allocations PHP never
+ * counts, and `php -S` runs with no limit at all. 50 megapixels still covers
+ * a phone's full-resolution photo.
+ */
+const THUMBNAIL_MAX_SOURCE_PIXELS = 50_000_000;
+
+/** Whether an image of these dimensions may be decoded for a thumbnail. */
+function thumbnail_source_fits(int $w, int $h): bool {
+    if ($w < 1 || $h < 1 || $w * $h > THUMBNAIL_MAX_SOURCE_PIXELS) return false;
+    // Where GD's memory is PHP's own (the bundled build), stay inside the
+    // limit rather than die at it with a fatal error no handler can answer.
+    $limit = (int)ini_parse_quantity((string)ini_get('memory_limit'));
+    if (defined('GD_BUNDLED') && GD_BUNDLED && $limit > 0) {
+        return $w * $h * 5 < $limit - memory_get_usage(true);
+    }
+    return true;
+}
+
+/**
+ * Turn a thumbnail the way its photo's EXIF orientation says (1-8).
+ *
+ * Phones store a photo as the sensor saw it and record how it was held;
+ * browsers apply that to the original, but GD does not and the WebP written
+ * here carries no EXIF, so portrait photos lay on their side in the grid while
+ * opening upright. Applied to the small thumbnail, not the full photo, so the
+ * turn costs nothing worth measuring.
+ */
+function thumbnail_orient(\GdImage $im, int $orientation): \GdImage {
+    if (in_array($orientation, [2, 4, 5, 7], true)) imageflip($im, IMG_FLIP_HORIZONTAL);
+    // imagerotate() turns anticlockwise.
+    $angle = match ($orientation) { 3, 4 => 180, 5, 8 => 90, 6, 7 => -90, default => 0 };
+    if ($angle === 0) return $im;
+    $turned = imagerotate($im, $angle, 0);
+    if ($turned === false) return $im;
+    imagedestroy($im);
+    return $turned;
+}
+
+/**
  * Send a cached thumbnail, answering conditional requests with 304.
  *
  * The URL carries the file's modification time, so a cached entry is
@@ -1498,6 +1543,14 @@ if ($path === '/api/files/upload' && $method === 'POST') api_try(function()use($
             throw new RuntimeException('GD extension is required for image thumbnails', 503);
         }
 
+        // Measured from the header before anything is decoded: see
+        // THUMBNAIL_MAX_SOURCE_PIXELS.
+        $dimensions = @getimagesize($f);
+        if ($dimensions === false)throw new RuntimeException('This file is not a readable image', 415);
+        if (!thumbnail_source_fits((int)$dimensions[0], (int)$dimensions[1])) {
+            throw new RuntimeException('This image is too large to make a thumbnail of', 422);
+        }
+
         $create = match($ext) {
             'jpg', 'jpeg' => @imagecreatefromjpeg($f),
             'png' => @imagecreatefrompng($f),
@@ -1508,8 +1561,7 @@ if ($path === '/api/files/upload' && $method === 'POST') api_try(function()use($
         };
         if (!$create)throw new RuntimeException('Failed to generate thumbnail', 500);
 
-        // Dimensions come from the decoded image rather than a second
-        // getimagesize() read of the file.
+        // Dimensions come from the decoded image, which is the one resampled.
         $w = imagesx($create);
         $h = imagesy($create);
         if (!$w || !$h) {
@@ -1530,6 +1582,9 @@ if ($path === '/api/files/upload' && $method === 'POST') api_try(function()use($
         imagesavealpha($im, true);
         imagefill($im, 0, 0, imagecolorallocatealpha($im, 0, 0, 0, 127));
         imagecopyresampled($im, $create, 0, 0, 0, 0, $nw, $nh, $w, $h);
+        if (($ext === 'jpg' || $ext === 'jpeg') && function_exists('exif_read_data')) {
+            $im = thumbnail_orient($im, (int)(@exif_read_data($f)['Orientation'] ?? 1));
+        }
 
         // Write through a temporary file: two browsers asking for the same new
         // thumbnail at once must not read a half-written one.
