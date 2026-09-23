@@ -17,7 +17,7 @@ $c=[
  // Scoped to the preview gate rather than the whole file. A file-wide search
  // for "=== 'text/html'" can no longer tell an allowlist entry from a denial:
  // mime_renders_markup() names text/html precisely in order to refuse it.
- 'HTML not inline preview'=>!preg_match('/\$inline = \(.*\$mime\s*===\s*\'text\/html\'.*\);/',$i),
+ 'HTML not inline preview'=>!preg_match('/\$inline = \([^;]*\$mime\s*===\s*\'text\/html\'[^;]*;/',$i),
  'inline preview is an allowlist'=>str_contains($i,'$inline = (str_starts_with($mime,')&&str_contains($i,"\$mime === 'text/plain'"),
  'inline preview also denies markup'=>str_contains($i,'&& !mime_renders_markup($mime);'),
  'share sandbox CSP'=>str_contains($i,"sandbox; img-src"),

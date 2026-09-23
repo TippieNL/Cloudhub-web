@@ -80,6 +80,20 @@ function media_mime_type(string $f): string {
 }
 
 /**
+ * The most one range request will serve.
+ *
+ * A player asks for "bytes=0-" and, given the chance, holds one request open
+ * for the length of the film. That is fine on a server with a worker per
+ * request and fatal on one without: PHP's built-in server -- what `php -S`
+ * gives you, and what many small installations run -- serves one request at a
+ * time, so a single large video blocks *everything else*, the player's own
+ * next request included. Answering a shorter range than was asked for is
+ * exactly what HTTP allows and what every media client already handles, so the
+ * player simply asks for the next piece and between pieces the server is free.
+ */
+const MEDIA_RANGE_CHUNK_BYTES = 8 * 1024 * 1024;
+
+/**
  * Stream a file to the browser, honouring a single HTTP byte range.
  *
  * Media players request ranges to read metadata, start playback quickly and
@@ -130,6 +144,23 @@ function serve_file_range(string $file, string $mime, string $disposition, strin
         // with "Content-Range: bytes 0--1/0", which is not a range.
         if ($start >= $size || $start > $end)$unsatisfiable();
         $status = 206;
+
+        /*
+         * Serve at most one chunk per request. A download that asked for no
+         * range is untouched -- a 200 promises the whole file and must keep
+         * that promise -- so this only shortens an answer to a client that
+         * already knows how to ask for the rest, which is what stops one large
+         * video holding the single-worker built-in server against every other
+         * request.
+         *
+         * Inline only. A media player asks for the rest; a download manager
+         * resuming an attachment with "bytes=N-" -- curl -C, a browser picking
+         * up an interrupted download -- takes the answer as the remainder of
+         * the file and saves it truncated.
+         */
+        if ($disposition === 'inline' && $end - $start + 1 > MEDIA_RANGE_CHUNK_BYTES) {
+            $end = $start + MEDIA_RANGE_CHUNK_BYTES - 1;
+        }
     }
 
     $length = $size === 0?0:($end-$start+1);
@@ -426,7 +457,9 @@ function public_origin(array $config): string {
  * extension simply gets none.
  */
 function share_url(array $config, string $basePath, string $token, string $file = ''): string {
-    return public_origin($config).$basePath.'/share/'.$token.share_url_suffix($file);
+    // Encoded: an install in a folder called "Cloud File Hub" otherwise hands
+    // out links with real spaces in them, which chat clients cut short.
+    return public_origin($config).Http::encodePath($basePath).'/share/'.$token.share_url_suffix($file);
 }
 
 /** The ".ext" part of a share URL, or '' when the name does not offer a safe one. */
@@ -457,12 +490,43 @@ function share_resolve(FileService $fs, string $token): array {
 }
 
 /**
- * How a shared file should be presented to a logged-out visitor.
+ * Keep share links pointed at the file they were made for.
  *
- * Only these kinds render inline. Anything else -- documents, archives, and in
- * particular script-capable text such as HTML or SVG -- is downloaded instead,
- * so a share link can never execute markup on this origin.
+ * A link is stored against a path. Without these, deleting a file left its
+ * link alive, and whatever was later saved under the same name was served to
+ * anyone holding the old link -- a file nobody chose to share -- while
+ * renaming or moving a shared file silently broke its link.
+ *
+ * mb_strlen() for the prefix because MySQL's SUBSTR() counts characters on a
+ * utf8mb4 column. Failures are logged rather than thrown: the file operation
+ * has already happened and must still report its own outcome.
  */
+function shares_forget(string $relative): void {
+    try {
+        $prefix = rtrim($relative, '/').'/';
+        $stmt = db()->prepare('DELETE FROM share_links WHERE file_path = ? OR SUBSTR(file_path, 1, ?) = ?');
+        $stmt->execute([$relative, mb_strlen($prefix), $prefix]);
+    } catch (Throwable $e) {
+        error_log('['.Http::requestId().'] share cleanup failed: '.$e->getMessage());
+    }
+}
+
+function shares_relocate(string $from, string $to): void {
+    try {
+        $pdo = db();
+        $pdo->prepare('UPDATE share_links SET file_path = ? WHERE file_path = ?')->execute([$to, $from]);
+        $prefix = rtrim($from, '/').'/';
+        $rows = $pdo->prepare('SELECT token, file_path FROM share_links WHERE SUBSTR(file_path, 1, ?) = ?');
+        $rows->execute([mb_strlen($prefix), $prefix]);
+        $update = $pdo->prepare('UPDATE share_links SET file_path = ? WHERE token = ?');
+        foreach ($rows->fetchAll(PDO::FETCH_ASSOC) ?: [] as $row) {
+            $update->execute([rtrim($to, '/').'/'.substr((string)$row['file_path'], strlen($prefix)), (string)$row['token']]);
+        }
+    } catch (Throwable $e) {
+        error_log('['.Http::requestId().'] share relocation failed: '.$e->getMessage());
+    }
+}
+
 function mime_renders_markup(string $mime): bool {
     // SVG is the one that hides inside an image/* prefix check: it is a
     // document that can carry <script>, so serving it inline puts attacker
@@ -474,6 +538,34 @@ function mime_renders_markup(string $mime): bool {
         || $mime === 'application/xml';
 }
 
+/**
+ * Whether the preview dialog should be handed this file as plain text.
+ *
+ * The dialog shows source files -- JSON, XML, HTML, scripts, configuration --
+ * as escaped text, but libmagic names most of them something other than
+ * text/plain, so the route refused them with a 415 the UI reported as
+ * "Preview failed". They are served as text/plain instead: with nosniff a
+ * browser never renders that as markup, so an HTML or SVG file previews as its
+ * source and cannot execute on this origin.
+ */
+function preview_is_text(string $mime): bool {
+    if (str_starts_with($mime, 'text/')) return true;
+    return in_array($mime, [
+        'application/json', 'application/javascript', 'application/x-javascript',
+        'application/xml', 'application/xhtml+xml', 'image/svg+xml',
+        'application/x-sh', 'application/x-shellscript', 'application/x-httpd-php', 'application/x-php',
+        'application/sql', 'application/x-sql', 'application/yaml', 'application/x-yaml', 'application/toml',
+        'application/x-empty', 'inode/x-empty',
+    ], true);
+}
+
+/**
+ * How a shared file should be presented to a logged-out visitor.
+ *
+ * Only these kinds render inline. Anything else -- documents, archives, and in
+ * particular script-capable text such as HTML or SVG -- is downloaded instead,
+ * so a share link can never execute markup on this origin.
+ */
 function share_media_kind(string $file): string {
     $mime = media_mime_type($file);
     if (mime_renders_markup($mime))return 'other';
@@ -528,7 +620,17 @@ if ($isProtectedApi && $method !== 'OPTIONS') {
      * viewer can see what a scan found without being able to start one.
      */
     $writeExemptPost = ['/api/files/download-zip', '/api/thumbnail/video', '/api/users/me/password'];
-    if (in_array($method, ['POST', 'PUT', 'PATCH', 'DELETE'], true)) {
+    /*
+     * Everything that is not a read is a write -- by default, not by list.
+     *
+     * This used to name POST, PUT, PATCH and DELETE, so WebDAV's own verbs
+     * walked straight past it with nothing but a session: a viewer could MKCOL
+     * folders and MOVE any file over any other, which deletes the one it lands
+     * on, permanently. PROPFIND is WebDAV's directory listing and the only
+     * extension method that reads; anything else, including a verb nobody
+     * handles, has to clear CSRF and the write capability first.
+     */
+    if (!in_array($method, ['GET', 'HEAD', 'OPTIONS', 'PROPFIND'], true)) {
         Auth::verifyCsrf();
         if (str_starts_with($path, '/api/servers'))Authorization::requireAdmin();
         elseif (!in_array($path, $writeExemptPost, true))Authorization::requireWrite();
@@ -608,6 +710,12 @@ if (($path === '/api/files/preview') && ($method === 'GET' || $method === 'HEAD'
     if (!is_file($f))throw new RuntimeException('File not found', 404);
 
     $mime = mime_type($f);
+    // Textual files go to the dialog as plain text, which cannot render.
+    if (preview_is_text($mime)) {
+        serve_file_range($f, 'text/plain; charset=utf-8', 'inline', $method, ['Cache-Control: private,max-age=300']);
+    }
+    // Markup types are excluded even though SVG matches image/*: served inline
+    // from this origin they execute script under the viewer's session.
     $inline = (str_starts_with($mime, 'image/') || str_starts_with($mime, 'audio/') || $mime === 'application/pdf' || $mime === 'text/plain')
         && !mime_renders_markup($mime);
     if (!$inline)throw new RuntimeException('This file type does not support inline preview', 415);
@@ -632,11 +740,13 @@ if ($path === '/api/files/delete' && $method === 'DELETE') api_try(function()use
         $rel = $fs->relative($p);
         $fs->deleteTree($p);
         ledger()->forget($rel);
+        shares_forget($rel);
         AuditLog::write(db(), 'file.delete', 'success', ['path' => $rel]);
         return ['success' => true, 'trashed' => false, 'message' => 'Deleted permanently'];
     }
     $meta = $fs->trash($p, Auth::user()['username'] ?? null);
     ledger()->forget($meta['originalPath']);
+    shares_forget($meta['originalPath']);
     purge_expired_trash_occasionally($fs, (int)$config['trash_retention_days']);
     AuditLog::write(db(), 'file.trash', 'success', ['path' => $meta['originalPath'], 'id' => $meta['id']]);
     return ['success' => true, 'trashed' => true, 'id' => $meta['id'], 'message' => 'Moved to trash'];
@@ -683,6 +793,7 @@ $relocate = function(callable $apply, string $verb)use($fs, $config): array {
             // avoided by uploading one file and copying it a hundred times.
             if ($verb === 'move') {
                 ledger()->relocate($fs->relative($source), $fs->relative($target));
+                shares_relocate($fs->relative($source), $fs->relative($target));
             } else {
                 foreach ($fs->copiedFiles($target) as $copied) {
                     ledger()->record($fs->relative($copied), basename($copied),
@@ -929,7 +1040,10 @@ if ($path === '/api/files/rename' && $method === 'POST') api_try(function()use($
      * opposite decision under the very same flag, picking a free name, so the
      * two disagreed about the same situation. This follows move/copy.
      */
-    if (file_exists($z)) {
+    // The file's own name is not a collision: renaming to the current name,
+    // or changing only its case on case-insensitive storage, finds the source
+    // itself "already there" -- which picked "name (2)" instead.
+    if (file_exists($z) && !$fs->isSameFile($a, $z)) {
         if (!$config['allow_overwrite'])throw new RuntimeException('Destination already exists', 409);
         $z = $fs->freeName($z);
     }
@@ -937,6 +1051,8 @@ if ($path === '/api/files/rename' && $method === 'POST') api_try(function()use($
     if (!rename($a, $z))throw new RuntimeException('Rename failed', 500);
     $to = $fs->relative($z);
     ledger()->relocate($from, $to);
+    // A shared file keeps its link when it is renamed.
+    shares_relocate($from, $to);
     return ['success' => true, 'path' => $to, 'name' => basename($z),
         'message' => basename($z) === basename((string)($b['newPath']??''))
             ? 'Renamed successfully'
@@ -1282,7 +1398,7 @@ if ($path === '/api/files/upload' && $method === 'POST') api_try(function()use($
             // of them, and a page reached through the origin public_origin()
             // reports can be served from it too.
             $pageUrl = share_url($config, $basePath, (string)$share['token'], $file);
-            $bytesUrl = public_origin($config).$basePath.'/share/'.$share['token'];
+            $bytesUrl = public_origin($config).Http::encodePath($basePath).'/share/'.$share['token'];
             $suffix = share_url_suffix($file);
             $shareFile = [
                 'name' => basename($file),
@@ -1589,7 +1705,22 @@ if ($path === '/api/files/upload' && $method === 'POST') api_try(function()use($
     });
 
     if (str_starts_with($path, '/webdav')) {
-        require dirname(__DIR__).'/src/Services/WebDav.php'; \CloudHub\Services\handle_webdav($fs, $config, $path, $method); exit;
+        require dirname(__DIR__).'/src/Services/WebDav.php';
+        // The same bookkeeping the API routes do, so a change made over
+        // WebDAV does not leave the ledger, share links or audit trail behind.
+        \CloudHub\Services\handle_webdav($fs, $config, $path, $method, [
+            'removed' => function(string $rel): void {
+                ledger()->forget($rel);
+                shares_forget($rel);
+                AuditLog::write(db(), 'file.webdav.delete', 'success', ['path' => $rel]);
+            },
+            'moved' => function(string $from, string $to): void {
+                ledger()->relocate($from, $to);
+                shares_relocate($from, $to);
+                AuditLog::write(db(), 'file.webdav.move', 'success', ['from' => $from, 'to' => $to]);
+            },
+        ]);
+        exit;
     }
     if (str_starts_with($path, '/api/') && $method === 'OPTIONS') {
         http_response_code(204); header('Allow: GET, POST, PUT, PATCH, DELETE, OPTIONS'); exit;

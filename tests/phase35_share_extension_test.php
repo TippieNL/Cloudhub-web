@@ -39,6 +39,7 @@ function extract_function35(string $source, string $name): string {
 // the shipped code without booting the front controller, which would need a
 // database and a session.
 require_once $root.'/src/Services/Security.php';
+require_once $root.'/src/Helpers/Http.php';
 $lifted = '';
 foreach (['mime_type', 'media_mime_type', 'mime_renders_markup', 'share_media_kind',
           'public_origin', 'share_url', 'share_url_suffix'] as $name) {
@@ -46,7 +47,7 @@ foreach (['mime_type', 'media_mime_type', 'mime_renders_markup', 'share_media_ki
     $checks["$name() could be lifted from index.php"] = $fn !== '';
     $lifted .= $fn."\n";
 }
-eval('use CloudHub\Services\Security;'."\n".$lifted);
+eval('use CloudHub\Services\Security; use CloudHub\Helpers\Http;'."\n".$lifted);
 
 // --- the suffix a filename may contribute --------------------------------
 
@@ -86,9 +87,11 @@ $checks['only a plausible extension reaches the URL'] = $suffixOk;
 $_SERVER['HTTP_HOST'] = 'files.example';
 unset($_SERVER['HTTPS']);
 $token = str_repeat('A', 43);
+// Deliberately updated when the base path started being encoded: a link with
+// real spaces in it is cut short by the chat clients it is pasted into.
 $checks['a share URL carries the extension'] =
     share_url([], '/Cloud File Hub', $token, '/photos/holiday.png')
-        === 'http://files.example/Cloud File Hub/share/'.$token.'.png';
+        === 'http://files.example/Cloud%20File%20Hub/share/'.$token.'.png';
 $checks['a file without one still gets a working URL'] =
     share_url([], '', $token, '/notes/README') === 'http://files.example/share/'.$token;
 $checks['the file is optional, as older callers left it'] =
@@ -213,7 +216,7 @@ $checks['the payload builds raw and download with the same suffix'] =
 // were absolute by borrowing the page URL. Taking them from the payload instead
 // only works if the payload's URLs are absolute too.
 $checks['the media URLs in the payload are absolute'] =
-    str_contains($index, "\$bytesUrl = public_origin(\$config).\$basePath.'/share/'.\$share['token'];");
+    str_contains($index, "\$bytesUrl = public_origin(\$config).Http::encodePath(\$basePath).'/share/'.\$share['token'];");
 // The three places that hand a URL to a person all pass the file, so a link is
 // the same wherever it is copied from.
 $checks['every caller of share_url passes the file'] =

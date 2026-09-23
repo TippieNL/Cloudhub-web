@@ -85,6 +85,20 @@ $checks['dialog opens without imposing a lifetime'] =
 $checks['confirmation sits above other modals'] =
     str_contains((string)file_get_contents($root.'/public/assets/css/app.css'), '#confirm-overlay,#input-overlay{z-index:40}');
 
+// A link belongs to its file, not to a path: deleting the file revokes it (so a
+// later file saved under that name is never served to an old link), and a
+// move or rename carries it along.
+$checks['deleting a file revokes its links'] =
+    substr_count($index, 'shares_forget(') >= 3
+    && str_contains($index, "shares_forget(\$meta['originalPath']);");
+$checks['moving or renaming a file carries its links'] =
+    str_contains($index, 'shares_relocate($from, $to);')
+    && str_contains($index, 'shares_relocate($fs->relative($source), $fs->relative($target));');
+// MySQL's SUBSTR() counts characters on utf8mb4, so a byte length would miss
+// every link beneath an accented or emoji folder.
+$checks['link cleanup is prefix-matched by characters'] =
+    substr_count($index, 'mb_strlen($prefix), $prefix]);') >= 2;
+
 $bad = false;
 foreach ($checks as $name => $ok) {
     echo ($ok ? '[PASS] ' : '[FAIL] ').$name.PHP_EOL;
