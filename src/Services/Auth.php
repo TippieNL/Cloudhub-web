@@ -190,7 +190,11 @@ final class Auth {
             $stmt->execute([$username]);
         }
         $user=$stmt->fetch(PDO::FETCH_ASSOC);
-        if(!$user||!(bool)$user['is_active']||!password_verify($password,(string)$user['password_hash']))return false;
+        // An unknown username costs one hash with the algorithm real accounts
+        // use, as their password_verify() does. Answering it with no hash work
+        // at all told a stopwatch which usernames exist.
+        if(!$user){self::hashPassword($password);return false;}
+        if(!(bool)$user['is_active']||!password_verify($password,(string)$user['password_hash']))return false;
         session_regenerate_id(true);$now=time();$_SESSION['user_id']=(int)$user['id'];$_SESSION['username']=(string)$user['username'];$_SESSION['role']=(string)($user['role']??'viewer');$_SESSION['created_at']=$now;$_SESSION['last_seen_at']=$now;$_SESSION['rotated_at']=$now;$_SESSION['account_checked_at']=$now;$_SESSION['csrf']=bin2hex(random_bytes(32));
         if(password_needs_rehash((string)$user['password_hash'],self::passwordAlgorithm())){
             $hash=self::hashPassword($password);$q=$pdo->prepare('UPDATE users SET password_hash = ? WHERE id = ?');$q->execute([$hash,(int)$user['id']]);
