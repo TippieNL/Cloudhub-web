@@ -91,8 +91,10 @@ $checks['rows from elsewhere are never re-recorded'] = (function () use ($ledger
 // --- the routes: every way in is checked, charged, and kept -----------------
 $index = (string)file_get_contents($root.'/public/index.php');
 $dav = (string)file_get_contents($root.'/src/Services/WebDav.php');
+// The trash entry keeps the favorites of what was deleted too, beside these.
 $checks['a delete keeps the rows with the trash entry'] =
-    str_contains($index, "\$fs->trash(\$p, Auth::user()['username'] ?? null, ledger()->rowsUnder(\$fs->relative(\$p)));");
+    str_contains($index, "\$trashed = \$fs->relative(\$p);")
+    && str_contains($index, "\$fs->trash(\$p, Auth::user()['username'] ?? null, ledger()->rowsUnder(\$trashed), favorites()->rowsUnder(\$trashed));");
 $checks['a restore hands them back'] =
     str_contains($index, "ledger()->reattribute(\$restored['attribution'], \$restored['originalPath'], \$restored['path']);");
 $checks['a copy has to fit before it is made'] =

@@ -157,6 +157,9 @@ final class FileService {
   */
  public function childPaths(string $dir): array { return $this->children($dir); }
 
+ /** The listing row for one item that exists, for a caller holding a path rather than a folder. */
+ public function describe(string $requested): array {return $this->entry($this->existing($requested));}
+
  /** One listing row. Shared so search results and folder listings never drift apart. */
  private function entry(string $full): array {
   $name=basename($full);$isDir=is_dir($full);
@@ -373,9 +376,10 @@ final class FileService {
   *
   * $attribution is the ledger's rows for the item (StorageLedger::rowsUnder()),
   * kept beside meta.json so restore() can hand the bytes back to whoever
-  * uploaded them.
+  * uploaded them. $favorites is the same for the accounts that had starred it
+  * (FavoriteRepository::rowsUnder()), so a restore brings those back too.
   */
- public function trash(string $realPath,?string $actor=null,array $attribution=[]): array {
+ public function trash(string $realPath,?string $actor=null,array $attribution=[],array $favorites=[]): array {
   $realPath=str_replace('\\','/',$realPath);$this->assertContained($realPath);
   if(rtrim($realPath,'/')===$this->root)throw new RuntimeException('Storage root cannot be deleted',403);
   if(str_starts_with($realPath.'/',$this->trashRoot().'/'))throw new RuntimeException('That item is already in the trash',400);
@@ -427,6 +431,10 @@ final class FileService {
   // Best effort -- without it a restore is merely unattributed, as before.
   if($attribution&&@file_put_contents($entry.'/attribution.json',json_encode(array_values($attribution),JSON_UNESCAPED_SLASHES|JSON_UNESCAPED_UNICODE))===false)
    error_log('[trash] could not keep the attribution of '.$original);
+  // Beside it, and best effort, for the same reasons: which accounts starred
+  // this is theirs alone, and losing it costs a favorite, never the file.
+  if($favorites&&@file_put_contents($entry.'/favorites.json',json_encode(array_values($favorites),JSON_UNESCAPED_SLASHES|JSON_UNESCAPED_UNICODE))===false)
+   error_log('[trash] could not keep the favorites of '.$original);
   return $meta;
  }
 
@@ -463,9 +471,11 @@ final class FileService {
 
   if(!rename($payload,$target))throw new RuntimeException('Unable to restore '.$meta['name'],500);
   $attribution=json_decode((string)@file_get_contents($this->trashRoot().'/'.$id.'/attribution.json'),true);
+  $favorites=json_decode((string)@file_get_contents($this->trashRoot().'/'.$id.'/favorites.json'),true);
   $this->deleteTree($this->trashRoot().'/'.$id);
   return ['path'=>$this->relative($target),'renamed'=>basename($target)!==$meta['name'],
-   'originalPath'=>(string)$meta['originalPath'],'attribution'=>is_array($attribution)?$attribution:[]];
+   'originalPath'=>(string)$meta['originalPath'],'attribution'=>is_array($attribution)?$attribution:[],
+   'favorites'=>is_array($favorites)?$favorites:[]];
  }
 
  /** Permanently remove one trash entry, or every entry when $id is null. */

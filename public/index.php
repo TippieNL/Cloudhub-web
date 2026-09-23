@@ -6,6 +6,7 @@ use CloudHub\Services\FileService;
 use CloudHub\Repositories\ServerRepository;
 use CloudHub\Repositories\UserRepository;
 use CloudHub\Repositories\StorageLedger;
+use CloudHub\Repositories\FavoriteRepository;
 use CloudHub\Services\Auth;
 use CloudHub\Services\UploadService;
 use CloudHub\Services\Security;
@@ -275,6 +276,25 @@ function thumbnail_cache_path(string $file): ?string {
     return $dir.'/'.md5($file.':'.$mtime).'.webp';
 }
 
+/**
+ * Flag a video row that already has a cached frame.
+ *
+ * Without this the browser had to ask for every video thumbnail and treat the
+ * failure as "not cached yet", which logged a failed request and a console
+ * error for each one, and wasted a round trip. One is_file() per video here
+ * replaces all of that. Shared by every route that hands out listing rows, so
+ * a video opened from Favorites is not decoded again when the folder already
+ * had its frame.
+ */
+function flag_video_thumbnail(array $entry, string $root): array {
+    if (!empty($entry['isDirectory'])) return $entry;
+    $ext = strtolower((string)pathinfo((string)$entry['name'], PATHINFO_EXTENSION));
+    if (!in_array($ext, THUMBNAIL_VIDEO_EXTENSIONS, true)) return $entry;
+    $cache = thumbnail_cache_path($root.$entry['path']);
+    $entry['hasThumbnail'] = $cache !== null && is_file($cache);
+    return $entry;
+}
+
 const THUMBNAIL_VIDEO_EXTENSIONS = ['mp4', 'webm', 'ogv', 'ogg', 'mov', 'm4v', 'avi', 'mkv', 'mpeg', 'mpg', '3gp', '3g2', 'ts', 'm2ts', 'mts'];
 const THUMBNAIL_IMAGE_EXTENSIONS = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp'];
 
@@ -403,6 +423,13 @@ function duplicates(): DuplicateFinder {
 /**
 * The upload ledger, sharing the request's database connection.
 */
+/**
+* Every account's favorites, sharing the request's database connection.
+*/
+function favorites(): FavoriteRepository {
+    static $favorites = null;
+    return $favorites ??= new FavoriteRepository(db());
+}
 function ledger(): StorageLedger {
     static $ledger = null;
     return $ledger ??= new StorageLedger(db());
@@ -668,6 +695,8 @@ if ($isProtectedApi && $method !== 'OPTIONS') {
      *   users/me/password  changes the caller's own password, proven by
      *                    supplying the current one -- a viewer must be able to
      *                    rotate their own credentials
+     *   favorites        stars and unstars a file for the caller alone (POST
+     *                    and DELETE); a preference, never a change to a file
      *
      * POST /api/duplicates/scan is deliberately NOT on this list, though it
      * writes nothing to the file store either. Starting a scan walks the whole
@@ -676,7 +705,7 @@ if ($isProtectedApi && $method !== 'OPTIONS') {
      * ?refresh. Reading the last result is a GET and needs only read, so a
      * viewer can see what a scan found without being able to start one.
      */
-    $writeExemptPost = ['/api/files/download-zip', '/api/thumbnail/video', '/api/users/me/password'];
+    $writeExemptPost = ['/api/files/download-zip', '/api/thumbnail/video', '/api/users/me/password', '/api/favorites'];
     /*
      * Everything that is not a read is a write -- by default, not by list.
      *
@@ -709,27 +738,10 @@ if ($path === '/api/files/config') Http::json([
 ]);
 if ($path === '/api/files/list' && $method === 'GET') api_try(function()use($fs) {
     release_session_lock();
-    $entries = $fs->list((string)($_GET['path']??'/'));
-
-    /*
-     * Flag videos that already have a cached frame.
-     *
-     * Without this the browser had to ask for every video thumbnail and treat
-     * the failure as "not cached yet", which logged a failed request and a
-     * console error for each one, and wasted a round trip. One is_file() per
-     * video here replaces all of that.
-     */
     $root = $fs->root();
-    foreach ($entries as &$entry) {
-        if (!empty($entry['isDirectory']))continue;
-        $ext = strtolower((string)pathinfo((string)$entry['name'], PATHINFO_EXTENSION));
-        if (!in_array($ext, THUMBNAIL_VIDEO_EXTENSIONS, true))continue;
-        $cache = thumbnail_cache_path($root.$entry['path']);
-        $entry['hasThumbnail'] = $cache !== null && is_file($cache);
-    }
-    unset($entry);
-
-    return $entries;
+    // Videos say whether a frame is cached; see flag_video_thumbnail().
+    return array_map(fn(array $entry): array => flag_video_thumbnail($entry, $root),
+        $fs->list((string)($_GET['path']??'/')));
 });
 // HEAD says whether a download will work without sending it: the web client
 // asks first, then hands the URL to the browser's own download manager, which
@@ -801,14 +813,19 @@ if ($path === '/api/files/delete' && $method === 'DELETE') api_try(function()use
         $fs->deleteTree($p);
         ledger()->forget($rel);
         shares_forget($rel);
+        favorites()->forget($rel);
         AuditLog::write(db(), 'file.delete', 'success', ['path' => $rel]);
         return ['success' => true, 'trashed' => false, 'message' => 'Deleted permanently'];
     }
     // The ledger rows go with the trash entry, so a restore gives the bytes
-    // back to whoever uploaded them rather than to nobody.
-    $meta = $fs->trash($p, Auth::user()['username'] ?? null, ledger()->rowsUnder($fs->relative($p)));
+    // back to whoever uploaded them rather than to nobody -- and so do the
+    // favorites, so a restore is a real undo. Share links do not: a link is a
+    // grant to someone else, and a delete is the moment to withdraw it.
+    $trashed = $fs->relative($p);
+    $meta = $fs->trash($p, Auth::user()['username'] ?? null, ledger()->rowsUnder($trashed), favorites()->rowsUnder($trashed));
     ledger()->forget($meta['originalPath']);
     shares_forget($meta['originalPath']);
+    favorites()->forget($meta['originalPath']);
     purge_expired_trash_occasionally($fs, (int)$config['trash_retention_days']);
     AuditLog::write(db(), 'file.trash', 'success', ['path' => $meta['originalPath'], 'id' => $meta['id']]);
     return ['success' => true, 'trashed' => true, 'id' => $meta['id'], 'message' => 'Moved to trash'];
@@ -861,6 +878,7 @@ $relocate = function(callable $apply, string $verb)use($fs, $config): array {
             if ($verb === 'move') {
                 ledger()->relocate($fs->relative($source), $fs->relative($target));
                 shares_relocate($fs->relative($source), $fs->relative($target));
+                favorites()->relocate($fs->relative($source), $fs->relative($target));
             } else {
                 foreach ($fs->copiedFiles($target) as $copied) {
                     ledger()->record($fs->relative($copied), basename($copied),
@@ -912,6 +930,77 @@ if ($path === '/api/files/search' && $method === 'GET') api_try(function()use($f
 
     $found = $fs->search((string)($_GET['path']??'/'), $q, $limit);
     return ['query' => $q, 'results' => $found['results'], 'truncated' => $found['truncated'], 'scanned' => $found['scanned']];
+});
+/**
+* Favorites: the files an account has starred, for its Favorites screen.
+*
+* The same contract as Cloudhub-2's, which the Android app speaks. A favorite
+* is the caller's own preference rather than a change to the file store, which
+* is why a viewer may keep them, why read-only mode does not stop them, and why
+* the route is on the write guard's exempt list -- CSRF is still checked for
+* both writes.
+*
+* The folder listing deliberately does not say which of its files are
+* favorites. It touches no database, and a gallery fires it beside forty
+* thumbnail requests; one query per folder opened to decorate it would change
+* that for every visit. Clients read this list once and keep it in step with
+* what they star.
+*
+* Files only. A folder is a place, and the file browser is where places are.
+*/
+if ($path === '/api/favorites' && $method === 'GET') api_try(function()use($fs) {
+    release_session_lock();
+    $user = (int)Auth::user()['id'];
+    $root = $fs->root();
+    $entries = [];
+    $gone = [];
+    foreach (favorites()->list($user) as $row) {
+        try {
+            $entry = $fs->describe($row['path']);
+        } catch (RuntimeException $e) {
+            // Only a 404 means the file is gone -- by a route CloudHub does not
+            // see, such as a change made on the disk itself. Anything else is
+            // no evidence of that, so the favorite is kept and merely not shown.
+            if ($e->getCode() === 404) $gone[] = $row['path'];
+            continue;
+        }
+        if ($entry['isDirectory']) { $gone[] = $row['path']; continue; }
+        $entries[] = flag_video_thumbnail($entry, $root)
+            + ['favoritedAt' => gmdate('c', (int)strtotime($row['createdAt']))];
+    }
+    // Forgotten rather than hidden, so a file saved later under the same name
+    // does not arrive already starred.
+    if ($gone) favorites()->removeMany($user, $gone);
+    return ['favorites' => $entries, 'limit' => FavoriteRepository::MAX_PER_USER];
+});
+if ($path === '/api/favorites' && $method === 'POST') api_try(function()use($fs) {
+    release_session_lock();
+    $b = Http::body(16384);
+    $f = $fs->existing(Http::string($b, 'path', 1, 4096));
+    if (!is_file($f)) throw new RuntimeException('Only files can be favorites', 400);
+    // The canonical path, as share links store it: the spelling that rename,
+    // move and delete look for when they bring favorites along.
+    $rel = $fs->relative($f);
+    $added = favorites()->add((int)Auth::user()['id'], $rel);
+    return ['success' => true, 'favorite' => true, 'added' => $added, 'path' => $rel,
+        'message' => 'Added to favorites'];
+});
+if ($path === '/api/favorites' && $method === 'DELETE') api_try(function()use($fs) {
+    release_session_lock();
+    $b = Http::body(16384);
+    $asked = Http::string($b, 'path', 1, 4096);
+    // Unstarring has to work for a file that is no longer there, which
+    // existing() refuses; the path is then cleaned the same way it was when
+    // it was stored.
+    try {
+        $rel = $fs->relative($fs->existing($asked));
+    } catch (RuntimeException $e) {
+        if ($e->getCode() !== 404) throw $e;
+        $rel = $fs->relative($fs->sanitize($asked));
+    }
+    $removed = favorites()->remove((int)Auth::user()['id'], $rel);
+    return ['success' => true, 'favorite' => false, 'removed' => $removed, 'path' => $rel,
+        'message' => 'Removed from favorites'];
 });
 /**
 * Trash.
@@ -1082,6 +1171,7 @@ if ($path === '/api/trash/restore' && $method === 'POST') api_try(function()use(
     // restore stepped round any quota. The sweep leaves the rest consistent.
     ledger()->reattribute($restored['attribution'], $restored['originalPath'], $restored['path']);
     ledger()->sweep($fs);
+    favorites()->reinstate($restored['favorites'], $restored['originalPath'], $restored['path']);
     AuditLog::write(db(), 'file.restore', 'success', ['path' => $restored['path']]);
     return ['success' => true, 'path' => $restored['path'],
         'message' => $restored['renamed']
@@ -1120,8 +1210,9 @@ if ($path === '/api/files/rename' && $method === 'POST') api_try(function()use($
     if (!rename($a, $z))throw new RuntimeException('Rename failed', 500);
     $to = $fs->relative($z);
     ledger()->relocate($from, $to);
-    // A shared file keeps its link when it is renamed.
+    // A shared file keeps its link when it is renamed, and a starred one its star.
     shares_relocate($from, $to);
+    favorites()->relocate($from, $to);
     return ['success' => true, 'path' => $to, 'name' => basename($z),
         'message' => basename($z) === basename((string)($b['newPath']??''))
             ? 'Renamed successfully'
@@ -1739,6 +1830,10 @@ if ($path === '/api/files/upload' && $method === 'POST') api_try(function()use($
                 throw new RuntimeException('This is the last administrator; promote another account first', 409);
             }
             $users->delete($id);
+            // Their favorites go with them. InnoDB can hand a deleted account's
+            // id out again after a restart on older MySQL, and a new account
+            // must not start life with someone else's stars.
+            favorites()->forgetUser($id);
             AuditLog::write(db(), 'user.delete', 'success', ['username' => $target['username']]);
             return ['success' => true, 'message' => 'Account deleted'];
         }
@@ -1805,6 +1900,7 @@ if ($path === '/api/files/upload' && $method === 'POST') api_try(function()use($
         // WebDAV does not leave the ledger, share links or audit trail behind.
         \CloudHub\Services\handle_webdav($fs, $config, $path, $method, [
             'attribution' => fn(string $rel): array => ledger()->rowsUnder($rel),
+            'favorites' => fn(string $rel): array => favorites()->rowsUnder($rel),
             'fits' => function(int $bytes) use ($fs, $config): void { assert_upload_fits($fs, $config, $bytes); },
             'stored' => function(string $rel, int $bytes): void {
                 ledger()->record($rel, basename($rel), $bytes, null, Auth::user()['id'] ?? null);
@@ -1813,11 +1909,13 @@ if ($path === '/api/files/upload' && $method === 'POST') api_try(function()use($
             'removed' => function(string $rel): void {
                 ledger()->forget($rel);
                 shares_forget($rel);
+                favorites()->forget($rel);
                 AuditLog::write(db(), 'file.webdav.delete', 'success', ['path' => $rel]);
             },
             'moved' => function(string $from, string $to): void {
                 ledger()->relocate($from, $to);
                 shares_relocate($from, $to);
+                favorites()->relocate($from, $to);
                 AuditLog::write(db(), 'file.webdav.move', 'success', ['from' => $from, 'to' => $to]);
             },
         ]);

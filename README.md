@@ -221,6 +221,43 @@ which walks the tree below the folder you are in. That walk is bounded twice
 over — by the number of results and by the number of entries examined — and
 says so when it stops early, rather than silently returning a short list.
 
+## Favorites
+
+Accounts can star files and find them again in one place. This server provides
+the API; the Cloud File Hub Android app puts the star in a file's action sheet
+and on the photo viewer's and the player's bar, marks starred files with a gold
+badge, and lists them on its Favorites screen (All, Photos, Videos, Other). The
+contract is the same as Cloudhub-2's, so the app works against either server.
+
+Favorites belong to the account. Nobody else sees them, and a **viewer** can
+keep them as freely as an editor: starring is a preference, not a change to a
+file, so it is exempt from the write capability (never from CSRF) and works in
+read-only mode. Only files can be starred; one account can keep up to 5,000.
+
+A favorite stays pointed at its file. Renaming or moving the file — or a
+folder above it, through the API or WebDAV — carries the star along. Deleting
+it to the trash keeps the stars with the trash entry (`favorites.json`, beside
+the metadata and never listed), so a restore gives them back with their
+original dates; deleting permanently, or emptying that entry, drops them, and
+a file saved later under the same name does not arrive starred. Deleting an
+account deletes its favorites. A file removed behind CloudHub's back, straight
+from the disk, is dropped from the list the next time it is read.
+
+| Route | Purpose |
+|---|---|
+| `GET /api/favorites` | This account's favorites, as listing rows plus `favoritedAt`, newest first, and `limit` |
+| `POST /api/favorites` `{"path": …}` | Star a file; starring it again is not an error |
+| `DELETE /api/favorites` `{"path": …}` | Unstar it; unstarring what is not starred is not an error |
+
+The folder listing does not say which of its files are starred, on purpose:
+`/api/files/list` touches no database, and a gallery fires it beside dozens of
+thumbnail requests. Clients read `/api/favorites` once and keep their stars in
+step with what they change.
+
+An existing installation needs `php database/migrate.php` to create the
+`favorites` table. Until then everything else works as before and
+`/api/favorites` answers with an error.
+
 ## Trash
 
 Deleting moves an item to a trash inside the storage root; the **Trash**
