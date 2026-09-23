@@ -44,6 +44,17 @@ default for new links. Revoking takes effect immediately. Administrators can lis
 every live link with `GET /api/shares/list`; creating and revoking a link is
 recorded in the audit trail, readable through `GET /api/security/events`.
 
+**A link belongs to its file, not to its path.** Deleting a file — to the
+trash or for good, through the API or over WebDAV — revokes its links, so a
+file later saved under the same name is never served to someone holding an old
+link; moving or renaming the file, or a folder above it, carries its links
+along.
+
+A share URL ends in the file's extension, so `.htaccess`, `router.php` and
+`deploy/nginx-security.conf.example` route `/share/` before any deny rule: a
+shared `notes.log`, `dump.sql` or MPEG-TS `clip.ts` used to be refused with a
+403. A deny rule of your own needs the same exemption.
+
 **What a share link does not do.** Only image, video and audio types render
 inline. Everything else — documents, archives, and in particular script-capable
 content such as HTML and SVG — is sent as an attachment, and the bytes always
@@ -83,6 +94,13 @@ Read-only endpoints release the PHP session lock as soon as authorization has
 been decided. Without that, PHP's exclusive per-session file lock serialises
 every request in a gallery no matter how many workers are free — the single
 largest cost in loading a folder of images.
+
+Images whose header declares more than 50 megapixels get no thumbnail (`422`).
+GD holds a decoded image at up to four bytes a pixel whatever the file's size,
+so a 285 KB PNG declaring 10000x10000 pixels took one request to 704 MB — and
+`memory_limit` does not see the system libgd's allocations, so it is no guard.
+JPEG thumbnails are turned by the photo's EXIF orientation, so a portrait phone
+photo stands upright in the grid as it does when opened.
 
 To clear the cache, delete `storage/.thumbnails/images`; it is rebuilt on
 demand.
@@ -188,7 +206,14 @@ route overwrites silently — with `ALLOW_OVERWRITE=false` a name clash is a
 409, otherwise the arriving item is given a `(2)` suffix. A folder cannot be
 moved into itself, and moving an item into the folder it is already in is
 refused; copying into the same folder is allowed, because that is how you
-duplicate something.
+duplicate something. A copy is new bytes, so it has to fit the storage limit
+and the copier's quota before it is made (`507` otherwise, per item).
+
+`POST /api/files/rename` follows the same rule: it never replaces what already
+has the name. With `ALLOW_OVERWRITE=false` a clash is a 409; otherwise the item
+takes a free name and the response's `message` says so. Renaming a file to its
+own name, or changing only its case on case-insensitive storage, is not a
+clash.
 
 The search box has two modes. **This folder** filters the listing already on
 screen, so it stays instant. **All folders** calls `GET /api/files/search`,
@@ -208,7 +233,10 @@ The trash keeps one directory per deletion, holding the item under its own
 name plus a small metadata file recording where it came from, who deleted it
 and when. Restore never overwrites: if something has since taken the original
 name the item is restored beside it with a suffix, and a parent folder that
-was deleted too is recreated.
+was deleted too is recreated. A restored item is charged again to whoever
+uploaded it: the trash entry keeps its ledger rows (`attribution.json`, beside
+the metadata and never listed), where it used to come back attributed to
+nobody — upload, trash, restore stepped round any quota.
 
 The trash lives at `.trash` inside the storage root, so moving a file into it
 is always a same-filesystem rename — instant, and impossible to half-finish.
@@ -233,6 +261,11 @@ which requires their current one.
 The API behind the screen is `/api/users` (administrator-only) plus
 `POST /api/users/me/password` (any signed-in user). Password hashes are never
 returned by any of them.
+
+Every request that is not a read — anything but `GET`, `HEAD`, `OPTIONS` and
+WebDAV's `PROPFIND` — needs the CSRF token and the `editor` role, WebDAV's
+`MKCOL` and `MOVE` included. The guard used to list `POST`, `PUT`, `PATCH` and
+`DELETE`, so a viewer could create folders and move any file over another.
 
 Guards that cannot be bypassed by editing the page: you cannot delete your own
 account, you cannot remove your own administrator access, and the last enabled
@@ -261,8 +294,9 @@ The cache lives outside the storage root, so it is neither listed, searched,
 nor counted in the number it holds. Bounding the walk was rejected — a
 dashboard that stops counting early reports a number that is simply wrong.
 
-Two optional limits, both `0` (unlimited) by default and both checked at
-`POST /api/uploads/init`, before a single byte is staged:
+Two optional limits, both `0` (unlimited) by default, checked on every way
+bytes arrive — `POST /api/uploads/init` before a single byte is staged, and
+likewise a copy, a WebDAV `PUT` and the legacy multipart upload:
 
 | Setting | Caps |
 |---|---|
@@ -282,10 +316,12 @@ by no PHP at all. It is now an upload ledger, with an added nullable
 installation).
 
 It counts **bytes an account uploaded through CloudHub that are still on
-disk**. Moves, renames, copies, deletes, trashing and restores all keep it in
-step. Files that predate the feature, or that arrive by WebDAV or by a change
-made directly on disk, are unattributed: they count towards
-`STORAGE_LIMIT_GB` but towards nobody's personal quota. A periodic sweep drops
+disk**, by any route — the resumable upload, the multipart upload and WebDAV
+`PUT`. Moves, renames, copies, deletes, trashing and restores all keep it in
+step: trashing frees the quota, and a restore charges the uploader again. Files
+that predate the feature, or that arrive by a change made directly on disk, are
+unattributed: they count towards `STORAGE_LIMIT_GB` but towards nobody's
+personal quota. A periodic sweep drops
 rows whose file has since disappeared, so the ledger converges instead of
 requiring every write in the system to remember it.
 
@@ -359,7 +395,9 @@ The Files view now includes an authenticated preview dialog.
 
 Supported inline previews:
 
-- Images: JPEG, PNG, GIF, WebP, BMP, SVG and AVIF where supported by the browser.
+- Images: JPEG, PNG, GIF, WebP, BMP and AVIF where supported by the browser. SVG
+  is fetched as text and drawn through an `<img>` from a Blob, where nothing in
+  it can run.
 - Video: MP4, WebM, OGV, MOV and M4V where the browser has a compatible codec; thumbnails are generated client-side without FFmpeg.
 - Audio: MP3, WAV, OGG, M4A, AAC and FLAC where browser codec support is available.
 - PDF: embedded using the browser PDF viewer.
@@ -367,8 +405,16 @@ Supported inline previews:
 
 The `/api/files/preview` endpoint uses the same authenticated filesystem
 sanitisation as downloads and only permits MIME types suitable for inline
-display. Text previews are escaped before rendering and are capped at 500 KB in
-the UI to avoid locking the browser on unusually large files.
+display. Text and source files — JSON, XML, HTML, SVG, scripts, configuration
+— are served as `text/plain` with `nosniff`, so markup previews as its source
+and can never execute on this origin. The dialog asks for the first 512 KB with
+a `Range` header and says when a file was cut short, rather than downloading a
+multi-gigabyte log to show its start.
+
+Downloads are handed to the browser's own download manager, which streams them
+to disk; the page used to read the whole file into memory first. A `HEAD`
+request goes first, so a missing file is reported rather than saved as a file
+holding an error, and names outside ASCII travel in `filename*`.
 
 Existing image thumbnails continue to use the on-disk thumbnail cache. Full
 media is loaded only after the user requests a preview.
@@ -534,6 +580,10 @@ from the staged offset while the staging session still exists.
 also exposes this choice per upload batch. `rename` is the default and produces
 names such as `video (1).mp4`. `overwrite` still respects `ALLOW_OVERWRITE`.
 
+The legacy multipart `POST /api/files/upload` takes the same rule as a
+`conflict` form field, defaulting to `rename`; it used to move the upload
+straight over an existing file of that name.
+
 ### Abandoned upload cleanup
 
 Incomplete data is stored under the application-owned `storage/uploads` directory by default. Sessions older than
@@ -616,6 +666,12 @@ Supported behaviour includes:
 
 This improves large MP4/video and audio previews while preserving the existing
 authenticated path validation and MIME restrictions.
+
+An open-ended range for inline media is answered with at most 8 MB, which HTTP
+allows and every player handles by asking for the next piece. PHP's built-in
+server serves one request at a time, and one playing film used to hold it
+against every other request. Attachments are never shortened: a download
+manager resuming one reads a short answer as the rest of the file.
 
 
 ## v11 modern file-management UX
@@ -705,5 +761,11 @@ script-capable text types download as attachments; inline preview is restricted
 to media, PDF and plain text. Public share responses add `nosniff` and a
 restrictive sandbox CSP. Apache rules additionally deny common backup, SQL,
 log, INI and development/documentation artefacts.
+
+When the project directory itself is the document root, `.htaccess` and
+`router.php` also refuse every dot-segment — `/.git/config` and `.gitignore`
+used to be served — except `/.well-known/`, which ACME certificate renewal
+answers from, and the Node/React trees this port sits beside (`client/`,
+`server/`, `shared/`, `script/`, `node_modules/`) with their tool configs.
 
 Existing installations pick this up from `php database/migrate.php`.
