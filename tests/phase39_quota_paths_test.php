@@ -107,6 +107,14 @@ $checks['and a PUT applies them'] =
     str_contains($dav, "if(\$fits&&ctype_digit(\$declared)){try{\$fits((int)\$declared);}")
     && str_contains($dav, "if(\$stored)\$stored(\$fs->relative(\$full),\$size);");
 
+// The sweep cursor is how usage stays true. flock() fails outright on the
+// Android shared storage this targets, so a LOCK_EX write never advanced it,
+// the sweep examined one window forever, and usage only ever grew.
+$ledgerSource = (string)file_get_contents($root.'/src/Repositories/StorageLedger.php');
+preg_match('/private function writeSweepCursor\(int \$cursor\): void\s*\{.*?\n    \}/s', $ledgerSource, $cursorFn);
+$checks['the sweep cursor is written without flock'] = isset($cursorFn[0])
+    && str_contains($cursorFn[0], 'file_put_contents($file, ') && !preg_match('/file_put_contents\(\$file,[^;]*LOCK_EX/', $cursorFn[0]);
+
 $rmrf = static function (string $p) use (&$rmrf): void {
     if (is_link($p) || is_file($p)) { @unlink($p); return; }
     if (is_dir($p)) { foreach (scandir($p) ?: [] as $n) if ($n !== '.' && $n !== '..') $rmrf($p.'/'.$n); @rmdir($p); }
