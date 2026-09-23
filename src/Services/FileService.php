@@ -23,6 +23,18 @@ final class FileService {
   */
  public const RESERVED_ROOT_NAMES=['.trash','.thumbnails','.uploads'];
 
+ /**
+  * Whether a top-level name is one of CloudHub's own directories.
+  *
+  * Compared the way the filesystem underneath may compare it. Android's shared
+  * storage, macOS and Windows resolve names case-insensitively, and Windows
+  * also drops trailing dots and spaces -- so ".Trash" or ".trash." opens the
+  * real trash there while an exact comparison waved it through.
+  */
+ public static function isReservedRootName(string $name): bool {
+  return in_array(strtolower(rtrim($name,' .')),self::RESERVED_ROOT_NAMES,true);
+ }
+
  private string $root;
  public function __construct(private array $config) {
   $real=realpath((string)$config['root_dir']);
@@ -33,9 +45,16 @@ final class FileService {
 
  public function sanitize(string $requested): string {
   if(str_contains($requested,"\0"))throw new RuntimeException('Invalid path',400);
-  $decoded=rawurldecode($requested);
-  if(str_contains($decoded,"\0"))throw new RuntimeException('Invalid path',400);
-  $decoded=str_replace('\\','/',$decoded);
+  /*
+   * Not percent-decoded here. Every caller hands over a path that is already
+   * decoded -- PHP decodes $_GET, JSON bodies are never encoded, and the
+   * router decodes the URL path once -- so decoding again only corrupted names
+   * that legitimately contain a percent sign: "Report%202024.pdf", as wget
+   * saves it, was looked up as "Report 2024.pdf" and could be listed but never
+   * opened, renamed or deleted. A literal "%2e%2e" is a name, not "..": the
+   * filesystem does not decode it either, so it cannot climb out of the root.
+   */
+  $decoded=str_replace('\\','/',$requested);
   // Virtual paths may start with one slash, but native absolute/drive/UNC paths are never accepted.
   if(preg_match('/^[A-Za-z]:\//',$decoded)||str_starts_with($decoded,'//'))throw new RuntimeException('Absolute filesystem paths are not allowed',400);
   $parts=explode('/',ltrim($decoded,'/'));$safe=[];
@@ -45,7 +64,7 @@ final class FileService {
    if(preg_match('/[\x00-\x1F\x7F]/u',$part))throw new RuntimeException('Control characters are not allowed in paths',400);
    $safe[]=$part;
   }
-  if($safe&&in_array($safe[0],self::RESERVED_ROOT_NAMES,true))throw new RuntimeException('That path is reserved',403);
+  if($safe&&self::isReservedRootName($safe[0]))throw new RuntimeException('That path is reserved',403);
   $candidate=$this->root.($safe?'/'.implode('/',$safe):'');
   $this->assertNoSymlinkTraversal($candidate);
   return $candidate;
@@ -120,7 +139,7 @@ final class FileService {
   $atRoot=rtrim($dir,'/')===$this->root;$out=[];
   foreach(scandir($dir)?:[] as $name){
    if($name==='.'||$name==='..')continue;
-   if($atRoot&&in_array($name,self::RESERVED_ROOT_NAMES,true))continue;
+   if($atRoot&&self::isReservedRootName($name))continue;
    $full=$dir.'/'.$name;if(is_link($full))continue;
    $out[]=$full;
   }
@@ -480,6 +499,27 @@ final class FileService {
    if(!file_exists($candidate))return $candidate;
   }
   throw new RuntimeException('Too many items with that name',409);
+ }
+
+ /**
+  * Whether two existing paths name one file.
+  *
+  * On case-insensitive storage -- Android's shared storage, macOS, Windows --
+  * "a.txt" and "A.txt" are the same file, so a case-only rename or move finds
+  * its own source already at the destination, and treating that as a
+  * collision either picked "a (2).txt" or displaced the source itself. Linux
+  * realpath() keeps the spelling it was given, so after comparing paths this
+  * compares device and inode. A hard-linked file is never "the same": POSIX
+  * rename() between two links to one inode does nothing and reports success.
+  */
+ public function isSameFile(string $a,string $b): bool {
+  if(!file_exists($a)||!file_exists($b))return false;
+  $ra=realpath($a);$rb=realpath($b);
+  if($ra!==false&&$ra===$rb)return true;
+  $x=@stat($a);$y=@stat($b);
+  if($x===false||$y===false||(int)$x['ino']===0)return false;
+  if($x['dev']!==$y['dev']||$x['ino']!==$y['ino'])return false;
+  return is_dir($a)||(int)$x['nlink']===1;
  }
 
  private function assertContained(string $path): void {

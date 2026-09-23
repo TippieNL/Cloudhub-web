@@ -248,7 +248,14 @@ final class StorageLedger
     {
         $file = $this->sweepCursorFile();
         if (!is_dir(dirname($file)) && !@mkdir(dirname($file), 0775, true) && !is_dir(dirname($file))) return;
-        @file_put_contents($file, (string)max(0, $cursor), LOCK_EX);
+        // No LOCK_EX: the cursor is a single-integer hint, and on the Android
+        // shared storage this app targets flock() is unreliable -- there
+        // file_put_contents() with LOCK_EX can fail outright and never advance
+        // the cursor, freezing the sweep on one window so a user's recorded
+        // usage only grows and a configured quota eventually locks them out. A
+        // one-write torn value just reads back as 0 and re-sweeps from the
+        // start, which is harmless.
+        @file_put_contents($file, (string)max(0, $cursor));
     }
 
     private function defaultServerId(): ?int
