@@ -628,14 +628,19 @@ function renderFiles() {
     updateSelectionUI();
 }
 
+/** Bumped per preview, so a slow response cannot fill a dialog opened after it. */
+let previewRun = 0;
+
 /**
  * Opens the integrated file preview dialog.
  */
 async function openPreview(path) {
+    const run = ++previewRun;
     const name = path.split('/').pop() || path;
     const ext = (name.includes('.') ? name.split('.').pop() : '').toLowerCase();
     const url = appUrl('/api/files/preview?path=' + encodeURIComponent(path));
-    const imageExt = new Set(['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'svg', 'avif']);
+    // SVG is handled separately below: the server returns it as text.
+    const imageExt = new Set(['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'avif']);
     const videoExt = new Set(['mp4', 'webm', 'ogv', 'mov', 'm4v']);
     const audioExt = new Set(['mp3', 'wav', 'ogg', 'oga', 'm4a', 'aac', 'flac']);
     const textExt = new Set([
@@ -645,7 +650,8 @@ async function openPreview(path) {
     ]);
 
     let body = '';
-    if (imageExt.has(ext)) body = `<img class="preview-image" src="${url}" alt="${esc(name)}">`;
+    if (ext === 'svg') body = '<div class="preview-loading">Loading preview…</div>';
+    else if (imageExt.has(ext)) body = `<img class="preview-image" src="${url}" alt="${esc(name)}">`;
     else if (videoExt.has(ext)) body = `<div class="preview-unsupported preview-media-gate"><div class="preview-file-icon">🎬</div><p>Video playback is restricted to the cfh-player.</p><button data-open-player>Play</button><button data-preview-download>Download file</button></div>`;
     else if (audioExt.has(ext)) body = `<div class="preview-audio-wrap"><div class="preview-file-icon">🎵</div><audio class="preview-audio" src="${url}" controls preload="metadata"></audio></div>`;
     else if (ext === 'pdf') body = `<iframe class="preview-frame" src="${url}" title="${esc(name)}"></iframe>`;
@@ -657,15 +663,57 @@ async function openPreview(path) {
 
     showPreviewDialog(name, body);
 
-    if (textExt.has(ext)) {
+    // Where an asynchronous preview may still write: gone if the dialog was
+    // closed, or replaced by a newer preview, while the request was running.
+    const previewTarget = () => (run === previewRun ? $('#preview-body') : null);
+    const previewFailed = error => {
+        const target = previewTarget();
+        if (target) target.innerHTML = `<div class="preview-error"><strong>Preview failed</strong><p>${esc(error.message)}</p></div>`;
+    };
+
+    if (ext === 'svg') {
+        // Served back as plain text: as an image document on this origin an
+        // SVG could run script. Drawn through an <img> from a blob it renders
+        // as a picture and nothing in it can execute.
         try {
-            const response = await api('/api/files/preview?path=' + encodeURIComponent(path));
-            const text = await response.text();
-            const limit = 500000;
-            const shown = text.length > limit ? text.slice(0, limit) : text;
-            $('#preview-body').innerHTML = `<pre class="preview-text">${esc(shown)}${text.length > limit ? '\n\n[Preview truncated at 500 KB]' : ''}</pre>`;
+            const text = await (await api('/api/files/preview?path=' + encodeURIComponent(path))).text();
+            const target = previewTarget();
+            if (target) {
+                const blobUrl = URL.createObjectURL(new Blob([text], { type: 'image/svg+xml' }));
+                const img = Object.assign(document.createElement('img'), { className: 'preview-image', alt: name });
+                const release = () => URL.revokeObjectURL(blobUrl);
+                img.addEventListener('load', release, { once: true });
+                img.addEventListener('error', release, { once: true });
+                img.src = blobUrl;
+                target.replaceChildren(img);
+            }
         } catch (error) {
-            $('#preview-body').innerHTML = `<div class="preview-error"><strong>Preview failed</strong><p>${esc(error.message)}</p></div>`;
+            previewFailed(error);
+        }
+    }
+
+    if (textExt.has(ext)) {
+        // Only the first 512 KB is asked for, because that is all the dialog
+        // shows: fetching a multi-gigabyte log in full just to display its
+        // start froze the tab. Small files are fetched whole, which also keeps
+        // an empty file from being an unsatisfiable range.
+        const limit = 524288;
+        const known = currentEntries().find(f => f.path === path);
+        const ranged = !known || (known.size || 0) > limit;
+        try {
+            const response = await api('/api/files/preview?path=' + encodeURIComponent(path),
+                ranged ? { headers: { Range: `bytes=0-${limit - 1}` } } : {});
+            const text = await response.text();
+            const total = Number((response.headers.get('Content-Range') || '').split('/')[1]) || text.length;
+            const truncated = response.status === 206 && total > limit;
+            const target = previewTarget();
+            if (target) target.innerHTML = `<pre class="preview-text">${esc(text)}${truncated ? '\n\n[Preview truncated at 512 KB]' : ''}</pre>`;
+        } catch (error) {
+            // A ranged request for an empty file is unsatisfiable, not a failure.
+            if (error.status === 416) {
+                const target = previewTarget();
+                if (target) target.innerHTML = '<pre class="preview-text"></pre>';
+            } else previewFailed(error);
         }
     }
 
@@ -708,13 +756,49 @@ function esc(s) {
     return s.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 
-async function download(p) {
-    const r = await api(`/api/files/download?path=${encodeURIComponent(p)}`);
-    const blob = await r.blob(), u = URL.createObjectURL(blob), a = document.createElement('a');
-    a.href = u;
-    a.download = p.split('/').pop();
+/**
+ * Save a file the server sends as an attachment.
+ *
+ * Left to the browser's own download manager, which streams it to disk.
+ * Fetching it into a Blob first held the whole file in the page's memory --
+ * up to the upload limit -- before a byte was saved, which is where a phone
+ * gave up on a large video. A HEAD goes first so a missing file or an expired
+ * session is reported rather than saved as a "file" holding a JSON error. The
+ * session cookie is scoped to "/", so the plain navigation carries it on a
+ * subdirectory install too.
+ */
+async function saveFromServer(url, name) {
+    try {
+        await api(url, { method: 'HEAD' });
+    } catch (error) {
+        // A HEAD answer has no body to carry the server's message.
+        throw error.status === 404 ? Error('That file is no longer there') : error;
+    }
+    clickDownload(appUrl(url), name);
+}
+
+/** Save bytes already in the page, releasing the URL once the save has begun. */
+function saveBlob(blob, name) {
+    const url = URL.createObjectURL(blob);
+    clickDownload(url, name);
+    // Revoked straight after click(), Firefox and Safari could cancel the
+    // download before it had started.
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+}
+
+function clickDownload(href, name) {
+    const a = Object.assign(document.createElement('a'), { href, download: name });
+    document.body.appendChild(a);
     a.click();
-    URL.revokeObjectURL(u);
+    a.remove();
+}
+
+async function download(p) {
+    try {
+        await saveFromServer(`/api/files/download?path=${encodeURIComponent(p)}`, p.split('/').pop());
+    } catch (error) {
+        toast(error.message);
+    }
 }
 
 /**
@@ -1541,15 +1625,13 @@ uploadUI.form.addEventListener('submit', async e => {
 
 async function downloadSelected() {
     if (!S.selected.size) return toast('Select files first');
+    // Still through a Blob: the archive is built by a POST, which the browser
+    // cannot hand to its download manager with the CSRF header attached.
     const r = await api('/api/files/download-zip', {
         method: 'POST',
         body: { files: [...S.selected] }
     });
-    const blob = await r.blob(), u = URL.createObjectURL(blob), a = document.createElement('a');
-    a.href = u;
-    a.download = 'download.zip';
-    a.click();
-    URL.revokeObjectURL(u);
+    saveBlob(await r.blob(), 'download.zip');
 }
 $('#zip').addEventListener('click', downloadSelected);
 $('#selection-download').addEventListener('click', downloadSelected);

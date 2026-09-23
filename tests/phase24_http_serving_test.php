@@ -32,13 +32,24 @@ function extract_function(string $source, string $name): string {
 
 $index = (string)file_get_contents($root.'/public/index.php');
 $fn = extract_function($index, 'serve_file_range');
+// serve_file_range() names the file through this helper.
+$disposition = extract_function($index, 'content_disposition');
 $checks['serve_file_range() could be lifted from index.php'] = $fn !== '' && str_contains($fn, 'Content-Range');
+// The per-range cap is what keeps one large video off the single-worker
+// built-in server's only thread; pin that it is applied to a range answer.
+$checks['a range answer is capped to one chunk'] =
+    str_contains($index, 'const MEDIA_RANGE_CHUNK_BYTES')
+    && str_contains($fn, 'MEDIA_RANGE_CHUNK_BYTES');
 
-// A harness that serves whichever fixture the query string names.
-file_put_contents($tmp.'/harness.php', "<?php\n".$fn."\n".
+// A harness that serves whichever fixture the query string names. The per-range
+// cap is a module const in index.php, so define it here (small, for the tiny
+// fixtures) before the lifted function that reads it.
+file_put_contents($tmp.'/harness.php', "<?php\n".
+    "const MEDIA_RANGE_CHUNK_BYTES = 16;\n".$disposition."\n".$fn."\n".
     '$f = $_GET["f"] ?? "";'."\n".
     '$path = __DIR__."/".basename($f);'."\n".
-    'serve_file_range($path, "application/octet-stream", "inline", $_SERVER["REQUEST_METHOD"]);'."\n");
+    '$d = ($_GET["d"] ?? "") === "attachment" ? "attachment" : "inline";'."\n".
+    'serve_file_range($path, "application/octet-stream", $d, $_SERVER["REQUEST_METHOD"]);'."\n");
 
 file_put_contents($tmp.'/empty.bin', '');
 file_put_contents($tmp.'/data.bin', str_repeat('A', 100));
@@ -91,6 +102,27 @@ $checks['an explicit range still serves that window'] =
 
 $r = fetch($base.'?f=data.bin', ['Range: bytes=200-300']);
 $checks['a range past the end is 416'] = $r['status'] === 416;
+
+// An open-ended range is shortened to one chunk (16 bytes in this harness),
+// so a single large video cannot hold the single-worker server open. The
+// client is answered with what it can ask more of, not the whole file.
+$r = fetch($base.'?f=data.bin', ['Range: bytes=0-']);
+$checks['an open-ended range is capped to one chunk'] =
+    $r['status'] === 206 && strlen($r['body']) === 16 && str_contains($r['headers'], 'Content-Range: bytes 0-15/100');
+
+// Only inline media is chunked. A download manager resuming an attachment
+// with "bytes=N-" takes the answer as the rest of the file, so a short one
+// would be saved as a truncated download.
+$r = fetch($base.'?f=data.bin&d=attachment', ['Range: bytes=10-']);
+$checks['a resumed attachment gets the whole remainder'] =
+    $r['status'] === 206 && strlen($r['body']) === 90 && str_contains($r['headers'], 'Content-Range: bytes 10-99/100');
+
+// A name outside ASCII travels in filename*, which is what browsers use now
+// that downloads are saved under the name the server gives.
+file_put_contents($tmp.'/Überweisung 写真.bin', 'x');
+$r = fetch($base.'?f='.rawurlencode('Überweisung 写真.bin').'&d=attachment');
+$checks['a non-ASCII name is sent as filename*'] =
+    str_contains($r['headers'], "filename*=UTF-8''".rawurlencode('Überweisung 写真.bin'));
 
 $r = fetch($base.'?f=data.bin');
 $checks['no range serves the whole file'] =
@@ -153,7 +185,7 @@ if (is_resource($bodyServer)) { proc_terminate($bodyServer); proc_close($bodySer
 // rule is "SVG and friends never render inline", and a source needle cannot
 // tell an allowlist entry from a denylist entry.
 $mimeFns = '';
-foreach (['mime_type', 'media_mime_type', 'mime_renders_markup', 'share_media_kind'] as $needed) {
+foreach (['mime_type', 'media_mime_type', 'mime_renders_markup', 'preview_is_text', 'share_media_kind'] as $needed) {
     $lifted = extract_function($index, $needed);
     if ($lifted === '') { $mimeFns = ''; break; }
     $mimeFns .= $lifted."\n";
@@ -173,7 +205,7 @@ file_put_contents($probe, "<?php\n".$mimeFns."\n".
     'foreach (glob(__DIR__."/mime/*") as $f) {'."\n".
     '  $m = mime_type($f);'."\n".
     '  $inline = (str_starts_with($m, "image/") || str_starts_with($m, "audio/") || $m === "application/pdf" || $m === "text/plain") && !mime_renders_markup($m);'."\n".
-    '  $out[basename($f)] = ["mime" => $m, "inline" => $inline, "shareKind" => share_media_kind($f)];'."\n".
+    '  $out[basename($f)] = ["mime" => $m, "inline" => $inline, "text" => preview_is_text($m), "shareKind" => share_media_kind($f)];'."\n".
     '}'."\n".
     'echo json_encode($out);'."\n");
 
@@ -187,6 +219,14 @@ $checks['an HTML file is not inline media on the share path'] = ($verdicts['x.ht
 $checks['a PNG still previews inline'] = ($verdicts['x.png']['inline'] ?? false) === true;
 $checks['a PNG is still inline media on the share path'] = ($verdicts['x.png']['shareKind'] ?? '') === 'image';
 $checks['plain text still previews inline'] = ($verdicts['x.txt']['inline'] ?? false) === true;
+// Source files preview as text/plain, which a browser never renders as
+// markup -- so an HTML or SVG file shows its source instead of a 415.
+$checks['an HTML file previews as plain text'] = ($verdicts['x.html']['text'] ?? false) === true;
+$checks['an SVG previews as plain text'] = ($verdicts['x.svg']['text'] ?? false) === true;
+$checks['a PNG is not turned into text'] = ($verdicts['x.png']['text'] ?? true) === false;
+$checks['the preview route sends text as text/plain'] =
+    str_contains($index, "if (preview_is_text(\$mime)) {")
+    && str_contains($index, "serve_file_range(\$f, 'text/plain; charset=utf-8', 'inline'");
 
 foreach (glob($fixtures.'/*') ?: [] as $f) @unlink($f);
 @rmdir($fixtures);

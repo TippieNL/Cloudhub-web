@@ -1,11 +1,21 @@
 DirectoryIndex index.php
 RewriteEngine On
 
-# Never expose application internals.
-RewriteRule ^(?:config|src|views|database|storage|logs|tests|tools|deploy)(?:/|$) - [F,L,NC]
+# Public share links, before the deny rules. A share URL ends in the shared
+# file's extension, and the rules below refuse .log, .sql, .ts and friends --
+# a shared notes.log or clip.ts would otherwise be a 403. /share/... never
+# names a file under the project root, so those rules have nothing to protect.
+RewriteRule ^share/[A-Za-z0-9_-]{20,128}(?:[./]|$) index.php [QSA,L]
+
+# Never expose application internals, nor the Node/React source and build
+# trees this PHP port sits beside.
+RewriteRule ^(?:config|src|views|database|storage|logs|tests|tools|deploy|client|server|shared|script|node_modules|attached_assets)(?:/|$) - [F,L,NC]
 RewriteRule ^\.env(?:\..*)?$ - [F,L,NC]
-RewriteRule ^(?:composer\.(?:json|lock)|phpunit\.xml|README\.md|SECURITY\.md)$ - [F,L,NC]
-RewriteRule .*\.(?:bak|old|orig|save|sql|log|ini|dist)$ - [F,L,NC]
+RewriteRule ^(?:composer\.(?:json|lock)|phpunit\.xml|README\.md|SECURITY\.md|PROJECT_CONTEXT\.md|replit\.md|package(?:-lock)?\.json|drizzle\.config\.ts|components\.json|skills-lock\.json|tsconfig\.json|vite\.config\.ts|tailwind\.config\.ts|postcss\.config\.js)$ - [F,L,NC]
+RewriteRule .*\.(?:bak|old|orig|save|sql|log|ini|dist|ts|tsx)$ - [F,L,NC]
+# Any dot-segment: /.git/config, /.gitignore, /.agents, editor droppings.
+# /.well-known/ stays reachable: ACME HTTP-01 certificate renewal answers from it.
+RewriteRule (?:^|/)\.(?!well-known(?:/|$)) - [F,L]
 
 # Public static files.
 RewriteRule ^favicon\.png$ public/favicon.png [L]

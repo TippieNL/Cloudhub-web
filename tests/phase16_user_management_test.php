@@ -41,9 +41,11 @@ $checks['changing your own password needs only a session'] = (function () use ($
     return $at !== false && str_contains(substr($index, $at, 200), 'Authorization::requireRead()');
 })();
 // A viewer must be able to rotate their own password; the blanket write check
-// on POST refused it until this route was exempted.
+// on POST refused it until this route was exempted. The list is pinned whole so
+// nothing joins it unnoticed: favorites did, deliberately, because starring a
+// file is the caller's own preference and a viewer has to be able to do it.
 $checks['self-service password is exempt from the write check'] =
-    str_contains($index, "\$writeExemptPost = ['/api/files/download-zip', '/api/thumbnail/video', '/api/users/me/password'];");
+    str_contains($index, "\$writeExemptPost = ['/api/files/download-zip', '/api/thumbnail/video', '/api/users/me/password', '/api/favorites'];");
 $checks['the exempt list still verifies CSRF'] =
     (bool)preg_match('/Auth::verifyCsrf\(\);.*?\$writeExemptPost/s', $index);
 

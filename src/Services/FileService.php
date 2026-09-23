@@ -23,6 +23,18 @@ final class FileService {
   */
  public const RESERVED_ROOT_NAMES=['.trash','.thumbnails','.uploads'];
 
+ /**
+  * Whether a top-level name is one of CloudHub's own directories.
+  *
+  * Compared the way the filesystem underneath may compare it. Android's shared
+  * storage, macOS and Windows resolve names case-insensitively, and Windows
+  * also drops trailing dots and spaces -- so ".Trash" or ".trash." opens the
+  * real trash there while an exact comparison waved it through.
+  */
+ public static function isReservedRootName(string $name): bool {
+  return in_array(strtolower(rtrim($name,' .')),self::RESERVED_ROOT_NAMES,true);
+ }
+
  private string $root;
  public function __construct(private array $config) {
   $real=realpath((string)$config['root_dir']);
@@ -33,9 +45,16 @@ final class FileService {
 
  public function sanitize(string $requested): string {
   if(str_contains($requested,"\0"))throw new RuntimeException('Invalid path',400);
-  $decoded=rawurldecode($requested);
-  if(str_contains($decoded,"\0"))throw new RuntimeException('Invalid path',400);
-  $decoded=str_replace('\\','/',$decoded);
+  /*
+   * Not percent-decoded here. Every caller hands over a path that is already
+   * decoded -- PHP decodes $_GET, JSON bodies are never encoded, and the
+   * router decodes the URL path once -- so decoding again only corrupted names
+   * that legitimately contain a percent sign: "Report%202024.pdf", as wget
+   * saves it, was looked up as "Report 2024.pdf" and could be listed but never
+   * opened, renamed or deleted. A literal "%2e%2e" is a name, not "..": the
+   * filesystem does not decode it either, so it cannot climb out of the root.
+   */
+  $decoded=str_replace('\\','/',$requested);
   // Virtual paths may start with one slash, but native absolute/drive/UNC paths are never accepted.
   if(preg_match('/^[A-Za-z]:\//',$decoded)||str_starts_with($decoded,'//'))throw new RuntimeException('Absolute filesystem paths are not allowed',400);
   $parts=explode('/',ltrim($decoded,'/'));$safe=[];
@@ -45,7 +64,7 @@ final class FileService {
    if(preg_match('/[\x00-\x1F\x7F]/u',$part))throw new RuntimeException('Control characters are not allowed in paths',400);
    $safe[]=$part;
   }
-  if($safe&&in_array($safe[0],self::RESERVED_ROOT_NAMES,true))throw new RuntimeException('That path is reserved',403);
+  if($safe&&self::isReservedRootName($safe[0]))throw new RuntimeException('That path is reserved',403);
   $candidate=$this->root.($safe?'/'.implode('/',$safe):'');
   $this->assertNoSymlinkTraversal($candidate);
   return $candidate;
@@ -120,7 +139,7 @@ final class FileService {
   $atRoot=rtrim($dir,'/')===$this->root;$out=[];
   foreach(scandir($dir)?:[] as $name){
    if($name==='.'||$name==='..')continue;
-   if($atRoot&&in_array($name,self::RESERVED_ROOT_NAMES,true))continue;
+   if($atRoot&&self::isReservedRootName($name))continue;
    $full=$dir.'/'.$name;if(is_link($full))continue;
    $out[]=$full;
   }
@@ -137,6 +156,9 @@ final class FileService {
   * @return list<string>
   */
  public function childPaths(string $dir): array { return $this->children($dir); }
+
+ /** The listing row for one item that exists, for a caller holding a path rather than a folder. */
+ public function describe(string $requested): array {return $this->entry($this->existing($requested));}
 
  /** One listing row. Shared so search results and folder listings never drift apart. */
  private function entry(string $full): array {
@@ -349,8 +371,15 @@ final class FileService {
 
  public function trashRoot(): string {return $this->root.'/.trash';}
 
- /** Move an item into the trash and return its recorded metadata. */
- public function trash(string $realPath,?string $actor=null): array {
+ /**
+  * Move an item into the trash and return its recorded metadata.
+  *
+  * $attribution is the ledger's rows for the item (StorageLedger::rowsUnder()),
+  * kept beside meta.json so restore() can hand the bytes back to whoever
+  * uploaded them. $favorites is the same for the accounts that had starred it
+  * (FavoriteRepository::rowsUnder()), so a restore brings those back too.
+  */
+ public function trash(string $realPath,?string $actor=null,array $attribution=[],array $favorites=[]): array {
   $realPath=str_replace('\\','/',$realPath);$this->assertContained($realPath);
   if(rtrim($realPath,'/')===$this->root)throw new RuntimeException('Storage root cannot be deleted',403);
   if(str_starts_with($realPath.'/',$this->trashRoot().'/'))throw new RuntimeException('That item is already in the trash',400);
@@ -397,6 +426,15 @@ final class FileService {
    $this->deleteTree($entry);
    throw new RuntimeException('Unable to record the deletion of '.$name.'; it was left where it was',500);
   }
+  // Beside meta.json rather than in it: trashList() reads every meta.json and
+  // hands it to the client, and per-account rows are nobody else's business.
+  // Best effort -- without it a restore is merely unattributed, as before.
+  if($attribution&&@file_put_contents($entry.'/attribution.json',json_encode(array_values($attribution),JSON_UNESCAPED_SLASHES|JSON_UNESCAPED_UNICODE))===false)
+   error_log('[trash] could not keep the attribution of '.$original);
+  // Beside it, and best effort, for the same reasons: which accounts starred
+  // this is theirs alone, and losing it costs a favorite, never the file.
+  if($favorites&&@file_put_contents($entry.'/favorites.json',json_encode(array_values($favorites),JSON_UNESCAPED_SLASHES|JSON_UNESCAPED_UNICODE))===false)
+   error_log('[trash] could not keep the favorites of '.$original);
   return $meta;
  }
 
@@ -432,8 +470,12 @@ final class FileService {
   $target=$this->freeName($target);
 
   if(!rename($payload,$target))throw new RuntimeException('Unable to restore '.$meta['name'],500);
+  $attribution=json_decode((string)@file_get_contents($this->trashRoot().'/'.$id.'/attribution.json'),true);
+  $favorites=json_decode((string)@file_get_contents($this->trashRoot().'/'.$id.'/favorites.json'),true);
   $this->deleteTree($this->trashRoot().'/'.$id);
-  return ['path'=>$this->relative($target),'renamed'=>basename($target)!==$meta['name']];
+  return ['path'=>$this->relative($target),'renamed'=>basename($target)!==$meta['name'],
+   'originalPath'=>(string)$meta['originalPath'],'attribution'=>is_array($attribution)?$attribution:[],
+   'favorites'=>is_array($favorites)?$favorites:[]];
  }
 
  /** Permanently remove one trash entry, or every entry when $id is null. */
@@ -480,6 +522,27 @@ final class FileService {
    if(!file_exists($candidate))return $candidate;
   }
   throw new RuntimeException('Too many items with that name',409);
+ }
+
+ /**
+  * Whether two existing paths name one file.
+  *
+  * On case-insensitive storage -- Android's shared storage, macOS, Windows --
+  * "a.txt" and "A.txt" are the same file, so a case-only rename or move finds
+  * its own source already at the destination, and treating that as a
+  * collision either picked "a (2).txt" or displaced the source itself. Linux
+  * realpath() keeps the spelling it was given, so after comparing paths this
+  * compares device and inode. A hard-linked file is never "the same": POSIX
+  * rename() between two links to one inode does nothing and reports success.
+  */
+ public function isSameFile(string $a,string $b): bool {
+  if(!file_exists($a)||!file_exists($b))return false;
+  $ra=realpath($a);$rb=realpath($b);
+  if($ra!==false&&$ra===$rb)return true;
+  $x=@stat($a);$y=@stat($b);
+  if($x===false||$y===false||(int)$x['ino']===0)return false;
+  if($x['dev']!==$y['dev']||$x['ino']!==$y['ino'])return false;
+  return is_dir($a)||(int)$x['nlink']===1;
  }
 
  private function assertContained(string $path): void {

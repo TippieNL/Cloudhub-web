@@ -100,6 +100,20 @@ $pdo->exec("CREATE TABLE IF NOT EXISTS security_events (
  INDEX idx_security_events_type(event_type,created_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
 
+// Favorites. /api/favorites reads and writes this, and every rename, move and
+// delete keeps it in step -- quietly, so an installation that has not run this
+// yet loses nothing but the Favorites feature.
+$pdo->exec("CREATE TABLE IF NOT EXISTS favorites (
+ id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+ user_id INT UNSIGNED NOT NULL,
+ file_path TEXT NOT NULL,
+ path_hash CHAR(64) NOT NULL,
+ created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+ UNIQUE KEY uq_favorite_user_path(user_id, path_hash),
+ INDEX idx_favorite_user(user_id, created_at),
+ INDEX idx_favorite_path(file_path(190))
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
+
 // Upgrade legacy tables in place. No existing columns or rows are removed.
 addColumn($pdo, 'users', 'is_active', 'TINYINT(1) NOT NULL DEFAULT 1');
 addColumn($pdo, 'users', 'created_at', 'TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP');

@@ -71,6 +71,21 @@ CREATE TABLE IF NOT EXISTS share_links (
  INDEX idx_share_expires(expires_at), INDEX idx_share_path(file_path(190))
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+-- Files each account has starred. path_hash is SHA-256 of file_path: TEXT
+-- cannot carry a whole-value unique key, and a prefix one would treat two long
+-- paths sharing their first 190 characters as the same file.
+CREATE TABLE IF NOT EXISTS favorites (
+ id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+ user_id INT UNSIGNED NOT NULL,
+ file_path TEXT NOT NULL,
+ path_hash CHAR(64) NOT NULL,
+ created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+ UNIQUE KEY uq_favorite_user_path(user_id, path_hash),
+ INDEX idx_favorite_user(user_id, created_at),
+ -- Renames, moves and deletes find the favorites under a path by prefix.
+ INDEX idx_favorite_path(file_path(190))
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 INSERT INTO storage_servers (name,type,is_active,is_default,config)
 SELECT 'Local Storage','local',1,1,JSON_OBJECT('path','storage/files')
 WHERE NOT EXISTS (SELECT 1 FROM storage_servers);
