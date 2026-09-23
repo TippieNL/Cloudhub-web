@@ -164,8 +164,10 @@ preg_match('/\$writeExemptPost = \[(.*?)\];/', $index, $exempt);
 $checks['restore and purge still require the write capability'] =
     isset($exempt[1]) && !str_contains($exempt[1], '/api/trash');
 $checks['the trash listing is a GET'] = str_contains($index, "\$path === '/api/trash' && \$method === 'GET'");
+// Deliberately updated when trashing began keeping the ledger rows with the
+// entry, so a restore hands the bytes back to whoever uploaded them.
 $checks['delete moves to the trash when it is enabled'] =
-    str_contains($index, "\$meta = \$fs->trash(\$p, Auth::user()['username'] ?? null);")
+    str_contains($index, "\$meta = \$fs->trash(\$p, Auth::user()['username'] ?? null, ledger()->rowsUnder(\$fs->relative(\$p)));")
     && str_contains($index, "'trashed' => true");
 $checks['delete still honours an opt-out'] =
     str_contains($index, "if (!\$config['trash_enabled']) {") && str_contains($index, "'message' => 'Deleted permanently'");

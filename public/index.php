@@ -744,7 +744,9 @@ if ($path === '/api/files/delete' && $method === 'DELETE') api_try(function()use
         AuditLog::write(db(), 'file.delete', 'success', ['path' => $rel]);
         return ['success' => true, 'trashed' => false, 'message' => 'Deleted permanently'];
     }
-    $meta = $fs->trash($p, Auth::user()['username'] ?? null);
+    // The ledger rows go with the trash entry, so a restore gives the bytes
+    // back to whoever uploaded them rather than to nobody.
+    $meta = $fs->trash($p, Auth::user()['username'] ?? null, ledger()->rowsUnder($fs->relative($p)));
     ledger()->forget($meta['originalPath']);
     shares_forget($meta['originalPath']);
     purge_expired_trash_occasionally($fs, (int)$config['trash_retention_days']);
@@ -787,6 +789,11 @@ $relocate = function(callable $apply, string $verb)use($fs, $config): array {
                 $target = $fs->freeName($target);
             }
 
+            // A copy is new bytes, so it has to fit the way an upload does. It
+            // was charged to the copier afterwards but never checked first, so
+            // copying one file a hundred times stepped past any quota and
+            // could fill the disk.
+            if ($verb === 'copy') assert_upload_fits($fs, $config, (int)($fs->measure($source)['bytes'] ?? 0));
             $apply($source, $target);
             // A move carries its attribution with it. A copy creates new bytes,
             // so it is charged to whoever made it -- otherwise a quota is
@@ -1010,8 +1017,10 @@ if ($path === '/api/trash/restore' && $method === 'POST') api_try(function()use(
     $fs->writable();
     $b = Http::body();
     $restored = $fs->restore(Http::string($b, 'id', 1, 64));
-    // The file is back on disk but its ledger row went when it was trashed;
-    // the periodic sweep leaves the rest consistent.
+    // The file is back on disk, and its bytes go back to whoever uploaded
+    // them. They used to come back attributed to nobody, so upload, trash,
+    // restore stepped round any quota. The sweep leaves the rest consistent.
+    ledger()->reattribute($restored['attribution'], $restored['originalPath'], $restored['path']);
     ledger()->sweep($fs);
     AuditLog::write(db(), 'file.restore', 'success', ['path' => $restored['path']]);
     return ['success' => true, 'path' => $restored['path'],
@@ -1174,16 +1183,32 @@ if ($path === '/api/files/upload' && $method === 'POST') api_try(function()use($
             };
         };
 
+        /*
+         * The resumable API's conflict rule, and its default of keeping both.
+         * This route used to move the upload straight over whatever held the
+         * name -- no version, no trash -- whenever ALLOW_OVERWRITE was on,
+         * which is its default; and it neither checked a quota nor recorded
+         * who uploaded the file, so it was a way round both.
+         */
+        $conflict = in_array($_POST['conflict'] ?? '', ['rename', 'overwrite', 'reject'], true) ? (string)$_POST['conflict'] : 'rename';
         foreach ($names as $i => $name) {
             $safe = $fs->safeName((string)$name);
             $error = (int)($errs[$i]??UPLOAD_ERR_NO_FILE);
             if ($error !== UPLOAD_ERR_OK) throw new RuntimeException($uploadError($error, $safe), 400);
             if ((int)($sizes[$i]??0) > $maxBytes) throw new RuntimeException($safe.' exceeds the '.$config['max_upload_mb'].' MB per-file limit', 413);
             if (!is_uploaded_file((string)($tmp[$i]??''))) throw new RuntimeException('Invalid upload data received for '.$safe, 400);
+            $size = (int)($sizes[$i]??0);
+            assert_upload_fits($fs, $config, $size);
             $dest = $target.'/'.$safe;
-            if (file_exists($dest)&&!$config['allow_overwrite']) throw new RuntimeException('File already exists: '.$safe, 409);
+            if (file_exists($dest)) {
+                if ($conflict === 'reject' || ($conflict === 'overwrite' && (!$config['allow_overwrite'] || is_dir($dest)))) {
+                    throw new RuntimeException('File already exists: '.$safe, 409);
+                }
+                if ($conflict === 'rename') $dest = $fs->freeName($dest);
+            }
             if (!move_uploaded_file((string)$tmp[$i], $dest)) throw new RuntimeException('Unable to save '.$safe, 500);
-            $saved[] = $safe;
+            ledger()->record($fs->relative($dest), basename($dest), $size, null, Auth::user()['id'] ?? null);
+            $saved[] = basename($dest);
         }
         return ['success' => true,
             'message' => count($saved).' file(s) uploaded successfully',
@@ -1709,6 +1734,12 @@ if ($path === '/api/files/upload' && $method === 'POST') api_try(function()use($
         // The same bookkeeping the API routes do, so a change made over
         // WebDAV does not leave the ledger, share links or audit trail behind.
         \CloudHub\Services\handle_webdav($fs, $config, $path, $method, [
+            'attribution' => fn(string $rel): array => ledger()->rowsUnder($rel),
+            'fits' => function(int $bytes) use ($fs, $config): void { assert_upload_fits($fs, $config, $bytes); },
+            'stored' => function(string $rel, int $bytes): void {
+                ledger()->record($rel, basename($rel), $bytes, null, Auth::user()['id'] ?? null);
+                AuditLog::write(db(), 'file.webdav.put', 'success', ['path' => $rel, 'bytes' => $bytes]);
+            },
             'removed' => function(string $rel): void {
                 ledger()->forget($rel);
                 shares_forget($rel);

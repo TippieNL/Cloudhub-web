@@ -368,8 +368,14 @@ final class FileService {
 
  public function trashRoot(): string {return $this->root.'/.trash';}
 
- /** Move an item into the trash and return its recorded metadata. */
- public function trash(string $realPath,?string $actor=null): array {
+ /**
+  * Move an item into the trash and return its recorded metadata.
+  *
+  * $attribution is the ledger's rows for the item (StorageLedger::rowsUnder()),
+  * kept beside meta.json so restore() can hand the bytes back to whoever
+  * uploaded them.
+  */
+ public function trash(string $realPath,?string $actor=null,array $attribution=[]): array {
   $realPath=str_replace('\\','/',$realPath);$this->assertContained($realPath);
   if(rtrim($realPath,'/')===$this->root)throw new RuntimeException('Storage root cannot be deleted',403);
   if(str_starts_with($realPath.'/',$this->trashRoot().'/'))throw new RuntimeException('That item is already in the trash',400);
@@ -416,6 +422,11 @@ final class FileService {
    $this->deleteTree($entry);
    throw new RuntimeException('Unable to record the deletion of '.$name.'; it was left where it was',500);
   }
+  // Beside meta.json rather than in it: trashList() reads every meta.json and
+  // hands it to the client, and per-account rows are nobody else's business.
+  // Best effort -- without it a restore is merely unattributed, as before.
+  if($attribution&&@file_put_contents($entry.'/attribution.json',json_encode(array_values($attribution),JSON_UNESCAPED_SLASHES|JSON_UNESCAPED_UNICODE))===false)
+   error_log('[trash] could not keep the attribution of '.$original);
   return $meta;
  }
 
@@ -451,8 +462,10 @@ final class FileService {
   $target=$this->freeName($target);
 
   if(!rename($payload,$target))throw new RuntimeException('Unable to restore '.$meta['name'],500);
+  $attribution=json_decode((string)@file_get_contents($this->trashRoot().'/'.$id.'/attribution.json'),true);
   $this->deleteTree($this->trashRoot().'/'.$id);
-  return ['path'=>$this->relative($target),'renamed'=>basename($target)!==$meta['name']];
+  return ['path'=>$this->relative($target),'renamed'=>basename($target)!==$meta['name'],
+   'originalPath'=>(string)$meta['originalPath'],'attribution'=>is_array($attribution)?$attribution:[]];
  }
 
  /** Permanently remove one trash entry, or every entry when $id is null. */

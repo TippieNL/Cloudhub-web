@@ -7,14 +7,18 @@ function xml_escape(string $s): string{return htmlspecialchars($s,ENT_XML1|ENT_Q
  * WebDAV, under the same session, CSRF and role rules as the rest of the API.
  *
  * $hooks keep the front controller's bookkeeping (upload ledger, share links,
- * audit trail) in step with changes made here: removed(string $relative) and
- * moved(string $from, string $to).
+ * audit trail) in step with changes made here: removed(string $relative),
+ * moved(string $from, string $to), attribution(string $relative) for the
+ * ledger rows a trash entry keeps, and for PUT the API's upload rules --
+ * fits(int $bytes) throws when a quota or the store limit would be exceeded,
+ * replacing(string $full) keeps what is about to be overwritten, and
+ * stored(string $relative, int $bytes) records who uploaded it.
  */
 function handle_webdav(FileService $fs,array $config,string $path,string $method,array $hooks=[]): never {
  // The router already percent-decoded the path once; a second decode here
  // broke names that legitimately contain "%".
  $rel=preg_replace('#^/webdav/?#','',$path)??'';
- $removed=$hooks['removed']??null;$moved=$hooks['moved']??null;
+ $removed=$hooks['removed']??null;$moved=$hooks['moved']??null;$attribution=$hooks['attribution']??null;
  // Defence in depth: the front controller already requires CSRF and the write
  // capability for every non-read verb; the handler enforces the role itself.
  if(!in_array($method,['OPTIONS','PROPFIND','GET','HEAD'],true))Authorization::requireWrite();
@@ -53,17 +57,30 @@ function handle_webdav(FileService $fs,array $config,string $path,string $method
  if($method==='PUT'){
   try{$full=file_exists($fs->sanitize($rel))?$fs->existing($rel):$fs->destination($rel);}catch(\RuntimeException $e){http_response_code(in_array($e->getCode(),[403,404],true)?409:400);exit;}
   $exists=file_exists($full);if($exists&&!$config['allow_overwrite']){http_response_code(409);exit;}if($exists&&is_dir($full)){http_response_code(405);exit;}
+  // A PUT is an upload and answers to the same rules; without these it
+  // stepped round the quota and the ledger, and in Cloudhub-2 overwrote a
+  // file without keeping the version every other upload keeps.
+  $fits=$hooks['fits']??null;$replacing=$hooks['replacing']??null;$stored=$hooks['stored']??null;
+  $refuse=static function(\RuntimeException $e):never{http_response_code($e->getCode()===507?507:500);exit;};
+  $declared=(string)($_SERVER['CONTENT_LENGTH']??'');
+  if($fits&&ctype_digit($declared)){try{$fits((int)$declared);}catch(\RuntimeException $e){$refuse($e);}}
   $in=fopen('php://input','rb');$tmp=$full.'.upload-'.bin2hex(random_bytes(6));
   $out=@fopen($tmp,'xb');if(!$in||!$out){if(is_resource($in))fclose($in);http_response_code(500);exit;}
   $ok=stream_copy_to_stream($in,$out)!==false;fclose($out);fclose($in);
-  if(!$ok||!@rename($tmp,$full)){@unlink($tmp);http_response_code(500);exit;}http_response_code($exists?204:201);exit;
+  $size=(int)(@filesize($tmp)?:0);
+  // A chunked body never said how large it was, so it is measured instead.
+  if($ok&&$fits&&!ctype_digit($declared)){try{$fits($size);}catch(\RuntimeException $e){@unlink($tmp);$refuse($e);}}
+  if($ok&&$exists&&$replacing){try{$replacing($full);}catch(\RuntimeException){@unlink($tmp);http_response_code(500);exit;}}
+  if(!$ok||!@rename($tmp,$full)){@unlink($tmp);http_response_code(500);exit;}
+  if($stored)$stored($fs->relative($full),$size);
+  http_response_code($exists?204:201);exit;
  }
  if($method==='DELETE'){
   if(!$config['allow_delete']){http_response_code(403);exit;}
   try{
    $full=$fs->existing($rel);$gone=$fs->relative($full);
    // Same rule as the API's delete: to the trash unless the deployment opted out.
-   if($config['trash_enabled']??false)$fs->trash($full,Auth::user()['username']??null);else $fs->deleteTree($full);
+   if($config['trash_enabled']??false)$fs->trash($full,Auth::user()['username']??null,$attribution?$attribution($gone):[]);else $fs->deleteTree($full);
   }catch(\RuntimeException $e){http_response_code($e->getCode()===404?404:($e->getCode()===500?500:403));exit;}
   if($removed)$removed($gone);
   http_response_code(204);exit;
@@ -92,7 +109,7 @@ function handle_webdav(FileService $fs,array $config,string $path,string $method
   if($exists){
    // An overwrite displaces what was there; like any delete it goes to the
    // trash unless the deployment opted out.
-   try{if($config['trash_enabled']??false)$fs->trash($new,Auth::user()['username']??null);else $fs->deleteTree($new);}catch(\RuntimeException){http_response_code(500);exit;}
+   try{if($config['trash_enabled']??false)$fs->trash($new,Auth::user()['username']??null,$attribution?$attribution($to):[]);else $fs->deleteTree($new);}catch(\RuntimeException){http_response_code(500);exit;}
    if($removed)$removed($to);
   }
   if(!rename($full,$new)){http_response_code(500);exit;}

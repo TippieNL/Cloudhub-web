@@ -147,6 +147,58 @@ final class StorageLedger
         }
     }
 
+    /**
+     * The rows for a path and everything beneath it, for a trash entry to keep.
+     *
+     * Trashing forgets them -- trashed bytes count towards nobody's quota --
+     * and a restore used to bring the file back attributed to nobody, so
+     * upload, trash, restore stepped round a quota. The trash entry keeps
+     * these and reattribute() gives them back.
+     *
+     * @return list<array{path:string,name:string,size:int,mime:?string,userId:?int}>
+     */
+    public function rowsUnder(string $path): array
+    {
+        try {
+            $prefix = rtrim($path, '/').'/';
+            $stmt = $this->db->prepare(
+                'SELECT file_path, original_name, size, mime_type, uploaded_by FROM file_metadata
+                 WHERE file_path = ? OR SUBSTR(file_path, 1, ?) = ?');
+            $stmt->execute([$path, mb_strlen($prefix), $prefix]);
+            return array_map(static fn(array $r): array => [
+                'path' => (string)$r['file_path'],
+                'name' => (string)$r['original_name'],
+                'size' => (int)$r['size'],
+                'mime' => $r['mime_type'] === null ? null : (string)$r['mime_type'],
+                'userId' => $r['uploaded_by'] === null ? null : (int)$r['uploaded_by'],
+            ], $stmt->fetchAll(PDO::FETCH_ASSOC) ?: []);
+        } catch (Throwable $e) {
+            error_log('[ledger] rowsUnder failed: '.$e->getMessage());
+            return [];
+        }
+    }
+
+    /**
+     * Give restored bytes back to whoever uploaded them.
+     *
+     * $rows are what rowsUnder() returned when the item was trashed; $from is
+     * where it was then and $to where it was restored, which differs when the
+     * original name was taken in the meantime. Rows outside $from are ignored.
+     */
+    public function reattribute(array $rows, string $from, string $to): void
+    {
+        $prefix = rtrim($from, '/').'/';
+        foreach ($rows as $row) {
+            $path = is_array($row) ? (string)($row['path'] ?? '') : '';
+            if ($path === $from) $restored = $to;
+            elseif ($path !== '' && str_starts_with($path, $prefix)) $restored = rtrim($to, '/').'/'.substr($path, strlen($prefix));
+            else continue;
+            $this->record($restored, (string)($row['name'] ?? basename($restored)), (int)($row['size'] ?? 0),
+                isset($row['mime']) ? (string)$row['mime'] : null,
+                isset($row['userId']) ? (int)$row['userId'] : null);
+        }
+    }
+
     /** Bytes attributed to one account, or to every account when null. */
     public function usage(?int $userId = null): int
     {
