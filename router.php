@@ -11,12 +11,37 @@ declare(strict_types=1);
 
 $uri = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?: '/';
 
+/*
+ * Public share links, before the deny rules.
+ *
+ * A share URL ends in the shared file's extension, and the rules below refuse
+ * anything ending .log, .sql, .ts and friends -- so a shared notes.log, or an
+ * MPEG-TS clip.ts, would 403 here and under Apache alike. /share/... never
+ * names a file under the project root, so there is nothing here for those
+ * rules to protect.
+ */
+if (preg_match('#^/share/[A-Za-z0-9_-]{20,128}(?:[./]|$)#', $uri)) {
+    require __DIR__ . '/public/index.php';
+    return true;
+}
+
 // The built-in server does not read .htaccess, so mirror its deny rules here.
 // Without this the project root — which is the document root in this layout —
 // hands out .env, the database schema and the PHP sources verbatim.
-$denied = '#^/(?:config|src|views|database|storage|logs|tests|tools|deploy)(?:/|$)'
-    .'|^/\.env|^/(?:README|SECURITY)\.md$'
-    .'|\.(?:bak|old|orig|save|sql|log|ini|dist)$#i';
+//
+// Any dot-segment is refused (/.git/config, /.env, /.agents, editor
+// droppings) except /.well-known/, which ACME certificate renewal answers
+// from, along with the Node/React source and build trees this PHP port sits
+// beside -- client/, server/, shared/, script/, node_modules/ and the tool
+// configs -- none of which PHP serves. The extension list catches loose
+// artefacts; /share/ was exempted above.
+$denied = '#(?:^|/)\.(?!well-known(?:/|$))'
+    .'|^/(?:config|src|views|database|storage|logs|tests|tools|deploy'
+    .'|client|server|shared|script|node_modules|attached_assets|\.agents)(?:/|$)'
+    .'|^/(?:README|SECURITY|PROJECT_CONTEXT|replit)\.md$'
+    .'|^/(?:package(?:-lock)?\.json|drizzle\.config\.ts|components\.json|skills-lock\.json'
+    .'|tsconfig\.json|vite\.config\.ts|tailwind\.config\.ts|postcss\.config\.js)$'
+    .'|\.(?:bak|old|orig|save|sql|log|ini|dist|ts|tsx)$#i';
 if (preg_match($denied, $uri)) {
     http_response_code(403);
     header('Content-Type: text/plain; charset=utf-8');

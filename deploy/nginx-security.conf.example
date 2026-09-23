@@ -29,6 +29,9 @@ server {
         fastcgi_read_timeout 300;      # long enough for large range reads
     }
 
+    # ACME HTTP-01 renewal answers from here; ^~ wins over the regex below.
+    location ^~ /.well-known/acme-challenge/ { try_files $uri =404; }
+
     # Never serve dotfiles (.env, .git, editor droppings).
     location ~ /\. { deny all; return 404; }
 }
@@ -39,7 +42,12 @@ server {
 # so they have to be denied explicitly. Put these BEFORE the generic
 # location / block.
 # ---------------------------------------------------------------------------
-# location ~ ^/(?:config|src|views|database|deploy|tests|tools|logs|storage)(?:/|$) { deny all; return 404; }
+#
+# The share exemption must come first. A share URL ends in the shared file's
+# extension, so a shared notes.log or clip.ts would otherwise be refused by
+# the extension rule; /share/... never names a file on disk here.
+# location ~ ^/share/[A-Za-z0-9_-]{20,128}([./]|$) { try_files /dev/null /index.php$is_args$args; }
+# location ~ ^/(?:config|src|views|database|deploy|tests|tools|logs|storage|client|server|shared|script|node_modules|attached_assets)(?:/|$) { deny all; return 404; }
 # location ~ ^/\.env                                                               { deny all; return 404; }
-# location ~* \.(?:env|ini|log|sql|sqlite|bak|old|orig|save|dist|md)$              { deny all; return 404; }
+# location ~* \.(?:env|ini|log|sql|sqlite|bak|old|orig|save|dist|md|ts|tsx)$  { deny all; return 404; }
 # location ~ ^/(?:index|router)\.php$ { }   # the two entry points stay reachable
