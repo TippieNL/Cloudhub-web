@@ -32,6 +32,8 @@ function extract_function(string $source, string $name): string {
 
 $index = (string)file_get_contents($root.'/public/index.php');
 $fn = extract_function($index, 'serve_file_range');
+// serve_file_range() names the file through this helper.
+$disposition = extract_function($index, 'content_disposition');
 $checks['serve_file_range() could be lifted from index.php'] = $fn !== '' && str_contains($fn, 'Content-Range');
 // The per-range cap is what keeps one large video off the single-worker
 // built-in server's only thread; pin that it is applied to a range answer.
@@ -43,7 +45,7 @@ $checks['a range answer is capped to one chunk'] =
 // cap is a module const in index.php, so define it here (small, for the tiny
 // fixtures) before the lifted function that reads it.
 file_put_contents($tmp.'/harness.php', "<?php\n".
-    "const MEDIA_RANGE_CHUNK_BYTES = 16;\n".$fn."\n".
+    "const MEDIA_RANGE_CHUNK_BYTES = 16;\n".$disposition."\n".$fn."\n".
     '$f = $_GET["f"] ?? "";'."\n".
     '$path = __DIR__."/".basename($f);'."\n".
     '$d = ($_GET["d"] ?? "") === "attachment" ? "attachment" : "inline";'."\n".
@@ -114,6 +116,13 @@ $checks['an open-ended range is capped to one chunk'] =
 $r = fetch($base.'?f=data.bin&d=attachment', ['Range: bytes=10-']);
 $checks['a resumed attachment gets the whole remainder'] =
     $r['status'] === 206 && strlen($r['body']) === 90 && str_contains($r['headers'], 'Content-Range: bytes 10-99/100');
+
+// A name outside ASCII travels in filename*, which is what browsers use now
+// that downloads are saved under the name the server gives.
+file_put_contents($tmp.'/Überweisung 写真.bin', 'x');
+$r = fetch($base.'?f='.rawurlencode('Überweisung 写真.bin').'&d=attachment');
+$checks['a non-ASCII name is sent as filename*'] =
+    str_contains($r['headers'], "filename*=UTF-8''".rawurlencode('Überweisung 写真.bin'));
 
 $r = fetch($base.'?f=data.bin');
 $checks['no range serves the whole file'] =

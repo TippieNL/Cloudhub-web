@@ -31,7 +31,9 @@ foreach (['thumbnail', 'stream', 'preview', 'download', 'list'] as $route) {
             'thumbnail' => "\$path === '/api/thumbnail' && \$method === 'GET'",
             'stream' => "\$path === '/api/files/stream')",
             'preview' => "\$path === '/api/files/preview')",
-            'download' => "\$path === '/api/files/download' && \$method === 'GET'",
+            // HEAD joined GET when the web client began asking before it
+            // hands a download to the browser.
+            'download' => "\$path === '/api/files/download' && (\$method === 'GET' || \$method === 'HEAD')",
             'list' => "\$path === '/api/files/list' && \$method === 'GET'",
         };
         $at = strpos($index, $needle);
