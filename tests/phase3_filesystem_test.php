@@ -34,6 +34,13 @@ check('a missing path is never the same file',fn()=>!$fs->isSameFile($base.'/saf
 if(function_exists('link')&&@link($base.'/safe/a.txt',$base.'/safe/linked.txt')){
  check('a hard link is not treated as the same file',fn()=>!$fs->isSameFile($base.'/safe/linked.txt',$base.'/safe/a.txt'));
 }
+// Reserved top-level names are matched the way case-insensitive storage
+// (Android's shared storage, macOS, Windows) resolves them: ".Trash" or
+// ".trash." opened the real trash there while an exact comparison let it by.
+$reserved=function(string $p)use($fs):bool{try{$fs->sanitize($p);return false;}catch(RuntimeException $e){return $e->getCode()===403;}};
+check('a reserved name in another case is refused',fn()=>$reserved('/.Trash/x')&&$reserved('/.TRASH'));
+check('a reserved name with a trailing dot or space is refused',fn()=>$reserved('/.trash./x')&&$reserved('/.trash /x'));
+check('a reserved name below the root is an ordinary folder',fn()=>$fs->sanitize('/safe/.Trash')===$base.'/safe/.Trash');
 check('drive path rejected',function()use($fs){try{$fs->sanitize('C:\\Windows\\x');return false;}catch(RuntimeException){return true;}});
 check('root delete rejected',function()use($fs,$base){try{$fs->deleteTree(realpath($base));return false;}catch(RuntimeException){return true;}});
 if(function_exists('symlink')&&@symlink($outside,$base.'/escape')){
