@@ -36,6 +36,20 @@ final class Http {
   // The entry point already sits inside public/, so assets are siblings of it.
   return rtrim($dir,'/')===rtrim($public,'/')?$base:$base.'/public';
  }
+ /**
+  * A path made safe to put in a URL, one segment at a time.
+  *
+  * basePath() comes from SCRIPT_NAME, which PHP hands over decoded, so an
+  * install in a folder called "Cloud File Hub" yields a base path with real
+  * spaces in it. Pasted into a chat client or given to curl, a URL with a
+  * space in it is cut short at the space or refused outright -- and a share
+  * link is a URL whose whole job is to be handed to someone else.
+  *
+  * Encoded per segment, so the separating slashes survive.
+  */
+ public static function encodePath(string $path): string {
+  return implode('/',array_map('rawurlencode',explode('/',$path)));
+ }
  public static function requestPath(string $basePath=''): string {
   // CloudHub's browser client uses the portable front-controller form:
   // /Cloud-File-Hub-PHP/?route=/api/files/list&path=...
