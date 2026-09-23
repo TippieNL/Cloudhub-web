@@ -628,14 +628,19 @@ function renderFiles() {
     updateSelectionUI();
 }
 
+/** Bumped per preview, so a slow response cannot fill a dialog opened after it. */
+let previewRun = 0;
+
 /**
  * Opens the integrated file preview dialog.
  */
 async function openPreview(path) {
+    const run = ++previewRun;
     const name = path.split('/').pop() || path;
     const ext = (name.includes('.') ? name.split('.').pop() : '').toLowerCase();
     const url = appUrl('/api/files/preview?path=' + encodeURIComponent(path));
-    const imageExt = new Set(['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'svg', 'avif']);
+    // SVG is handled separately below: the server returns it as text.
+    const imageExt = new Set(['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'avif']);
     const videoExt = new Set(['mp4', 'webm', 'ogv', 'mov', 'm4v']);
     const audioExt = new Set(['mp3', 'wav', 'ogg', 'oga', 'm4a', 'aac', 'flac']);
     const textExt = new Set([
@@ -645,7 +650,8 @@ async function openPreview(path) {
     ]);
 
     let body = '';
-    if (imageExt.has(ext)) body = `<img class="preview-image" src="${url}" alt="${esc(name)}">`;
+    if (ext === 'svg') body = '<div class="preview-loading">Loading preview…</div>';
+    else if (imageExt.has(ext)) body = `<img class="preview-image" src="${url}" alt="${esc(name)}">`;
     else if (videoExt.has(ext)) body = `<div class="preview-unsupported preview-media-gate"><div class="preview-file-icon">🎬</div><p>Video playback is restricted to the cfh-player.</p><button data-open-player>Play</button><button data-preview-download>Download file</button></div>`;
     else if (audioExt.has(ext)) body = `<div class="preview-audio-wrap"><div class="preview-file-icon">🎵</div><audio class="preview-audio" src="${url}" controls preload="metadata"></audio></div>`;
     else if (ext === 'pdf') body = `<iframe class="preview-frame" src="${url}" title="${esc(name)}"></iframe>`;
@@ -657,15 +663,57 @@ async function openPreview(path) {
 
     showPreviewDialog(name, body);
 
-    if (textExt.has(ext)) {
+    // Where an asynchronous preview may still write: gone if the dialog was
+    // closed, or replaced by a newer preview, while the request was running.
+    const previewTarget = () => (run === previewRun ? $('#preview-body') : null);
+    const previewFailed = error => {
+        const target = previewTarget();
+        if (target) target.innerHTML = `<div class="preview-error"><strong>Preview failed</strong><p>${esc(error.message)}</p></div>`;
+    };
+
+    if (ext === 'svg') {
+        // Served back as plain text: as an image document on this origin an
+        // SVG could run script. Drawn through an <img> from a blob it renders
+        // as a picture and nothing in it can execute.
         try {
-            const response = await api('/api/files/preview?path=' + encodeURIComponent(path));
-            const text = await response.text();
-            const limit = 500000;
-            const shown = text.length > limit ? text.slice(0, limit) : text;
-            $('#preview-body').innerHTML = `<pre class="preview-text">${esc(shown)}${text.length > limit ? '\n\n[Preview truncated at 500 KB]' : ''}</pre>`;
+            const text = await (await api('/api/files/preview?path=' + encodeURIComponent(path))).text();
+            const target = previewTarget();
+            if (target) {
+                const blobUrl = URL.createObjectURL(new Blob([text], { type: 'image/svg+xml' }));
+                const img = Object.assign(document.createElement('img'), { className: 'preview-image', alt: name });
+                const release = () => URL.revokeObjectURL(blobUrl);
+                img.addEventListener('load', release, { once: true });
+                img.addEventListener('error', release, { once: true });
+                img.src = blobUrl;
+                target.replaceChildren(img);
+            }
         } catch (error) {
-            $('#preview-body').innerHTML = `<div class="preview-error"><strong>Preview failed</strong><p>${esc(error.message)}</p></div>`;
+            previewFailed(error);
+        }
+    }
+
+    if (textExt.has(ext)) {
+        // Only the first 512 KB is asked for, because that is all the dialog
+        // shows: fetching a multi-gigabyte log in full just to display its
+        // start froze the tab. Small files are fetched whole, which also keeps
+        // an empty file from being an unsatisfiable range.
+        const limit = 524288;
+        const known = currentEntries().find(f => f.path === path);
+        const ranged = !known || (known.size || 0) > limit;
+        try {
+            const response = await api('/api/files/preview?path=' + encodeURIComponent(path),
+                ranged ? { headers: { Range: `bytes=0-${limit - 1}` } } : {});
+            const text = await response.text();
+            const total = Number((response.headers.get('Content-Range') || '').split('/')[1]) || text.length;
+            const truncated = response.status === 206 && total > limit;
+            const target = previewTarget();
+            if (target) target.innerHTML = `<pre class="preview-text">${esc(text)}${truncated ? '\n\n[Preview truncated at 512 KB]' : ''}</pre>`;
+        } catch (error) {
+            // A ranged request for an empty file is unsatisfiable, not a failure.
+            if (error.status === 416) {
+                const target = previewTarget();
+                if (target) target.innerHTML = '<pre class="preview-text"></pre>';
+            } else previewFailed(error);
         }
     }
 
