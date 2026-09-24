@@ -120,14 +120,36 @@ final class StorageDiagnostics
         $runtime = $this->runtime($problems);
         $finishing = $this->finishing();
         $throughput = $measureMb > 0 ? $this->throughput($measureMb) : null;
+        $cache = $this->cache($problems);
 
         return [
             'paths' => $paths,
             'runtime' => $runtime,
             'finishing' => $finishing,
             'throughput' => $throughput,
+            'cache' => $cache,
             'problems' => $problems,
         ];
+    }
+
+    /**
+     * Whether the application cache is on, and actually working.
+     *
+     * A cache that has turned itself off costs speed and nothing else, so no
+     * error would ever say so -- on a phone it just feels slow. The probe is a
+     * real write and read-back, not a guess from the configuration.
+     *
+     * @param list<string> $problems collected by reference
+     */
+    private function cache(array &$problems): array
+    {
+        \CloudHub\Helpers\Cache::configure($this->config, $this->projectDir);
+        $status = \CloudHub\Helpers\Cache::status(true);
+        if ($status['reason'] !== 'disabled by CACHE_DRIVER' && ($status['working'] !== true)) {
+            $problems[] = 'The application cache is not working ('.($status['reason'] ?? 'the probe failed')
+                .'); listings and search run uncached.';
+        }
+        return $status;
     }
 
     /** @param list<string> $problems collected by reference through the return */
@@ -317,6 +339,8 @@ final class StorageDiagnostics
         foreach ([
             'UploadService.php' => '/src/Services/UploadService.php',
             'FileService.php' => '/src/Services/FileService.php',
+            'FileCache.php' => '/src/Services/FileCache.php',
+            'Cache.php' => '/src/Helpers/Cache.php',
             'index.php' => '/public/index.php',
             'app.js' => '/public/assets/js/app.js',
         ] as $label => $relative) {

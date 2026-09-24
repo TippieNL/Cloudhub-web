@@ -216,6 +216,107 @@ final class FileService {
   return ['results'=>$results,'truncated'=>$truncated,'scanned'=>$scanned];
  }
 
+ /** Seconds a directory's time stamps must have stood before they can vouch for it. See dirStamp(). */
+ public const STAMP_SETTLE_SECONDS=3;
+
+ /**
+  * A directory's change stamp, and whether it is settled.
+  *
+  * Adding, removing or renaming an entry moves a directory's mtime and ctime,
+  * so an unchanged stamp proves an unchanged list of entries -- provided the
+  * stamp was already a few seconds old when it was read. Timestamps come in
+  * ticks (a second through PHP, two seconds on FAT), and a change that lands
+  * in the same tick as the one before it leaves the stamp where it was. One
+  * that had stood for longer than a tick cannot be left behind like that.
+  *
+  * Read it before reading the directory: a change in between then shows up
+  * later as a mismatch, never as a match against entries that have moved on.
+  * And read it from the disk, not PHP's stat cache, which may hold one taken
+  * earlier.
+  *
+  * @return array{0:string,1:bool}|null the stamp and whether it is settled; null if it cannot be read
+  */
+ public function dirStamp(string $dir): ?array {
+  clearstatcache();$now=time();$st=@stat($dir);
+  if($st===false)return null;
+  return [$st['mtime'].':'.$st['ctime'],max((int)$st['mtime'],(int)$st['ctime'])<=$now-self::STAMP_SETTLE_SECONDS];
+ }
+
+ /**
+  * search(), answered from a recording of the walk wherever it still holds.
+  *
+  * The walk search() makes depends on the tree alone, never on the needle:
+  * the same directories are read in the same order, and only what is kept
+  * differs. So a recording of it -- each directory read, its entries' names,
+  * and which of those are directories -- replays any later search below the
+  * same folder and reaches the answer search() would, down to `scanned` and
+  * `truncated`. Result rows are still built from the disk, so their sizes
+  * and times are never the recording's.
+  *
+  * Every recorded directory is proven unchanged by its dirStamp() before its
+  * part of the recording is used. From the first that fails, the walk goes
+  * back to the disk and the recording is redone from there on. A recording
+  * that read any directory before its stamp had settled proves nothing, and
+  * is not replayed at all -- the third return value says so. A search that
+  * stops early leaves a recording that ends where it stopped, and the next
+  * one carries on from that point, so recording never costs a walk that
+  * search() itself would not have made.
+  *
+  * A name here is the directory entry itself, as scandir() returned it.
+  * search() matches basename() of the joined path, which is the same string.
+  *
+  * @param array|null $index what an earlier call returned for the same folder and $maxNodes
+  * @return array{0:array{results:list<array>,truncated:bool,scanned:int},1:array,2:bool}
+  *   the answer; the recording as it now stands; and whether that is new and settled, so worth keeping
+  */
+ public function searchWithIndex(string $path,string $needle,int $limit,int $maxNodes,?array $index): array {
+  $start=$this->existing($path);if(!is_dir($start))throw new RuntimeException('Directory not found',404);
+  if(!self::recordingFits($index,$start,$maxNodes)||$index['settled']!==true)
+   $index=['v'=>1,'root'=>$start,'max'=>$maxNodes,'dirs'=>[],'stamps'=>[],'names'=>[],'types'=>[],'settled'=>true];
+  $needle=trim($needle);if($needle==='')return [['results'=>[],'truncated'=>false,'scanned'=>0],$index,false];
+  $results=[];$scanned=0;$truncated=false;$stack=[$start];$changed=false;
+  for($b=0;$stack;$b++){
+   $dir=array_pop($stack);
+   if($b<count($index['dirs'])&&($index['dirs'][$b]!==$dir||($this->dirStamp($dir)[0]??null)!==$index['stamps'][$b])){
+    // From here on the recording describes a tree that is no longer there.
+    foreach(['dirs','stamps','names','types'] as $k)$index[$k]=array_slice($index[$k],0,$b);
+    $changed=true;
+   }
+   if($b===count($index['dirs'])){
+    $stamp=$this->dirStamp($dir);$prefix=strlen($dir)+1;
+    $index['dirs'][]=$dir;$index['stamps'][]=$stamp[0]??'';$index['types'][]='';
+    $index['names'][]=implode("\0",array_map(fn(string $full): string=>substr($full,$prefix),$this->children($dir)));
+    if(!($stamp[1]??false))$index['settled']=false;
+    $changed=true;
+   }
+   $types=$index['types'][$b];$known=strlen($types);
+   foreach($index['names'][$b]===''?[]:explode("\0",$index['names'][$b]) as $i=>$name){
+    if(++$scanned>$maxNodes){$truncated=true;break 2;}
+    $full=$dir.'/'.$name;
+    if(stripos($name,$needle)!==false){
+     if(count($results)>=$limit){$truncated=true;break 2;}
+     $results[]=$full;
+    }
+    // Only the last directory read can be part-classified: a search that
+    // stopped inside it never reached the rest.
+    if($i<$known)$isDir=$types[$i]==='d';
+    else{$isDir=is_dir($full);$index['types'][$b].=$isDir?'d':'f';$changed=true;}
+    if($isDir)$stack[]=$full;
+   }
+  }
+  $rows=array_map(fn(string $full): array=>$this->entry($full),$results);
+  usort($rows,fn($a,$b)=>$a['isDirectory']!==$b['isDirectory']?($a['isDirectory']?-1:1):strcasecmp($a['path'],$b['path']));
+  return [['results'=>$rows,'truncated'=>$truncated,'scanned'=>$scanned],$index,$changed&&$index['settled']];
+ }
+
+ /** Whether a stored recording is one searchWithIndex() made, for this folder and bound. */
+ private static function recordingFits(?array $index,string $start,int $maxNodes): bool {
+  if(!$index||($index['v']??null)!==1||($index['root']??null)!==$start||($index['max']??null)!==$maxNodes)return false;
+  foreach(['dirs','stamps','names','types'] as $k)if(!is_array($index[$k]??null)||!array_is_list($index[$k]))return false;
+  $n=count($index['dirs']);
+  return count($index['stamps'])===$n&&count($index['names'])===$n&&count($index['types'])===$n&&is_bool($index['settled']??null);
+ }
+
  /** Recursive copy that refuses symlinks, mirroring deleteTree's contract. */
  public function copyTree(string $src,string $dst): void {
   $this->assertContained(str_replace('\\','/',$src));$this->assertContained(str_replace('\\','/',$dst));

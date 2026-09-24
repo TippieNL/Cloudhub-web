@@ -47,7 +47,12 @@ $checks['mutating routes keep their session lock'] =
     !preg_match('/api\/files\/(?:delete|rename|mkdir)[^;]{0,200}release_session_lock/s', $index);
 
 // --- 2. cached video thumbnails ------------------------------------------
-$checks['thumbnails share one cache-path helper'] = str_contains($index, 'function thumbnail_cache_path(string $file): ?string');
+$checks['thumbnails share one cache-path helper'] = str_contains($index, 'function thumbnail_cache_path(string $file, ?int $mtime = null): ?string');
+// A listing row already carries the file's time, so flagging a video costs no
+// second stat -- on FUSE storage that is what a cached listing saves.
+$checks['listing rows flag their frame from the time they carry'] =
+    str_contains($index, "\$modified = strtotime((string)(\$entry['modified'] ?? ''));")
+    && str_contains($index, "thumbnail_cache_path(\$root.\$entry['path'], \$modified === false ? null : \$modified)");
 $checks['a cached entry is served whatever produced it'] =
     (bool)preg_match('/if \(is_file\(\$cache\)\)send_thumbnail\(\$cache\);/', $index);
 $checks['browsers can contribute a video frame'] = str_contains($index, "\$path === '/api/thumbnail/video' && \$method === 'POST'");

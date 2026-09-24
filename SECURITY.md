@@ -128,3 +128,24 @@ application internals plus common secret, backup, SQL, log and INI artefacts.
 
 For an internet-facing NAS, keep `storage/files` outside the web document root
 where practical and terminate traffic with HTTPS.
+
+## Application cache (phpFastCache)
+
+phpFastCache reads its entries back with `unserialize()`, which instantiates
+objects, so write access to the cache directory is code execution as the web
+server. `CloudHub\Helpers\Cache` therefore refuses a `CACHE_PATH` inside
+`ROOT_DIR` (where account holders upload) or inside `public/`, resolving
+symlinks and comparing case-insensitively as Android shared storage does; the
+storage report names the refusal. The default, `storage/.cache/phpfastcache`,
+is outside both and is denied over HTTP, as are `vendor/` and
+`composer.json`/`composer.lock`.
+
+phpFastCache's defaults are overridden where they would widen that surface:
+the directory is not named after the `Host` header (which let any client make
+it create directories), there is no fallback to the shared system temp
+directory, directories are created `0775` rather than `0777`, and entries are
+written to a temporary file and renamed into place.
+
+A listing entry holds names, sizes and times, which every signed-in account can
+already list — CloudHub has no per-folder permissions — and a favorites entry is
+keyed to its account. Nothing is cached for public share links.

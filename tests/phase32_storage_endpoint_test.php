@@ -10,6 +10,7 @@ declare(strict_types=1);
  * administrator-only and reports counts rather than names, so both are checked
  * by looking at what the report actually contains.
  */
+require dirname(__DIR__).'/src/Helpers/Cache.php';
 require dirname(__DIR__).'/src/Services/StorageDiagnostics.php';
 
 use CloudHub\Services\StorageDiagnostics;
@@ -136,7 +137,7 @@ $checks['a missing ROOT_DIR is still a problem'] =
 // no answer. Hashing the files themselves gives it one.
 $fingerprints = $measured['runtime']['sources'] ?? [];
 $checks['the report fingerprints the files these questions concern'] =
-    array_keys($fingerprints) === ['UploadService.php', 'FileService.php', 'index.php', 'app.js'];
+    array_keys($fingerprints) === ['UploadService.php', 'FileService.php', 'FileCache.php', 'Cache.php', 'index.php', 'app.js'];
 $checks['a fingerprint is a short hash or null'] = (function () use ($fingerprints): bool {
     foreach ($fingerprints as $hash) {
         if ($hash !== null && !preg_match('/^[0-9a-f]{12}$/', (string)$hash)) return false;
@@ -172,6 +173,21 @@ $checks['the route releases the session lock'] = (static function(string $i): bo
 })($index);
 $checks['measuring is opt-in on the route'] =
     str_contains($index, "empty(\$_GET['measure']) ? 0 : max(1, min(64, (int)(\$_GET['mb'] ?? 16)))");
+
+// --- the application cache ------------------------------------------------
+// A cache that switched itself off only makes things slow, so nothing else
+// would ever say so; the report does, from a real write and read-back.
+$checks['the report says whether the cache works'] =
+    ($report['cache']['driver'] ?? null) === 'files' && ($report['cache']['working'] ?? null) === true
+    && !array_filter($report['problems'], static fn(string $p): bool => str_contains($p, 'cache'));
+$checks['and where it keeps its files'] = ($report['cache']['path'] ?? null) === $base.'/storage/.cache/phpfastcache';
+$inside = (new StorageDiagnostics($config + ['cache_path' => $base.'/files/.cache'], $base))->report();
+$checks['a cache inside ROOT_DIR is refused, and reported'] =
+    $inside['cache']['enabled'] === false && str_contains((string)$inside['cache']['reason'], 'ROOT_DIR')
+    && (bool)array_filter($inside['problems'], static fn(string $p): bool => str_contains($p, 'cache is not working'));
+$off = (new StorageDiagnostics($config + ['cache_driver' => 'none'], $base))->report();
+$checks['a cache turned off on purpose is not a problem'] =
+    $off['cache']['enabled'] === false && !array_filter($off['problems'], static fn(string $p): bool => str_contains($p, 'cache'));
 
 $tool = (string)file_get_contents($root.'/tools/storage-check.php');
 $checks['the tool renders the shared report'] =

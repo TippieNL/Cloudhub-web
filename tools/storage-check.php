@@ -84,6 +84,13 @@ if ($report['throughput'] !== null) {
         .basename(__FILE__).' 32'.PHP_EOL;
 }
 
+$cache = $report['cache'];
+echo PHP_EOL.'Application cache'.PHP_EOL;
+echo '  driver    : '.$cache['driver'].($cache['enabled'] ? '' : ' (off: '.($cache['reason'] ?? 'unknown').')').PHP_EOL;
+echo '  path      : '.$cache['path'].PHP_EOL;
+echo '  working   : '.match ($cache['working']) { true => 'yes', false => 'NO', null => 'n/a' }.PHP_EOL;
+echo '  ttl       : '.$cache['ttlSeconds'].' s; answers under '.$cache['minComputeMs'].' ms are not kept'.PHP_EOL;
+
 echo PHP_EOL.($report['problems'] === []
     ? "Storage looks usable.\n"
     : count($report['problems'])." problem(s) found:\n  - ".implode("\n  - ", $report['problems'])."\n");

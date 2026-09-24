@@ -219,7 +219,9 @@ $checks['a deleted account takes them along'] = str_contains($index, 'favorites(
 // { success, favorite, path, message } in Cloudhub-2's net/Models.kt.
 $checks['the list answers favorites and limit'] =
     str_contains($index, "return ['favorites' => \$entries, 'limit' => FavoriteRepository::MAX_PER_USER];");
-$checks['each favorite is an ordinary listing row'] = str_contains($index, '$entry = $fs->describe($row[\'path\']);');
+$checks['each favorite is an ordinary listing row'] =
+    str_contains($index, "file_cache()->describeMany('favorites_'.\$user, array_column(\$rows, 'path'));")
+    && str_contains((string)file_get_contents($root.'/src/Services/FileCache.php'), '$rows[$i] = $this->files->describe($path);');
 $checks['starring answers success, favorite and the stored path'] =
     str_contains($index, "return ['success' => true, 'favorite' => true, 'added' => \$added, 'path' => \$rel,")
     && str_contains($index, "return ['success' => true, 'favorite' => false, 'removed' => \$removed, 'path' => \$rel,");

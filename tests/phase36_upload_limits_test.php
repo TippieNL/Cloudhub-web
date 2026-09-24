@@ -17,6 +17,7 @@ declare(strict_types=1);
  */
 require dirname(__DIR__).'/src/Services/FileService.php';
 require dirname(__DIR__).'/src/Services/UploadService.php';
+require dirname(__DIR__).'/src/Helpers/Cache.php';
 require dirname(__DIR__).'/src/Services/StorageDiagnostics.php';
 
 use CloudHub\Services\FileService;

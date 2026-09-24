@@ -161,8 +161,15 @@ $sweepDb->exec('CREATE TABLE file_metadata (id INTEGER PRIMARY KEY AUTOINCREMENT
 $sweeper = new StorageLedger($sweepDb);
 $sweeper->record('/notes.txt', 'notes.txt', 50, null, 1);
 $sweeper->record('/gone-by-another-route.txt', 'gone.txt', 999, null, 1);
+// The sweep resumes from a cursor kept in this checkout's storage/.cache. A
+// server run from the same checkout leaves it wherever its own, much larger,
+// ledger stopped -- past both of these ids -- so start from the beginning, as
+// phase22 does.
+$cursor = dirname(__DIR__).'/storage/.cache/sweep-cursor';
+@unlink($cursor);
 $checks['the sweep drops rows whose file has disappeared'] =
     $sweeper->sweep($fs) === 1 && $sweeper->usage(1) === 50;
+@unlink($cursor);
 
 rmrf($base);
 
