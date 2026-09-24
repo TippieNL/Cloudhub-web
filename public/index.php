@@ -1002,11 +1002,17 @@ if ($path === '/api/files/search' && $method === 'GET') api_try(function()use($f
     if (mb_strlen($q) < 2)throw new RuntimeException('Enter at least two characters to search', 400);
     if (mb_strlen($q) > 255)throw new RuntimeException('That search term is too long', 400);
     $limit = max(1, min(500, (int)($_GET['limit']??200)));
+    // How long to walk before answering with what has been found so far. A
+    // client that asks again when the answer says `incomplete` sees results
+    // as they grow; one that does not gets up to twenty seconds, enough for a
+    // phone's whole storage in one answer.
+    $budget = isset($_GET['budget']) ? max(250, min(20000, (int)$_GET['budget'])) : 20000;
 
-    // The same answer as $fs->search(); typing into the search box sends one
-    // query per pause, and after the first they replay a recorded walk.
-    $found = file_cache()->search((string)($_GET['path']??'/'), $q, $limit);
-    return ['query' => $q, 'results' => $found['results'], 'truncated' => $found['truncated'], 'scanned' => $found['scanned']];
+    // The same answer as $fs->search(); after the first, searches replay a
+    // record of the folders walked, re-proving each one against the disk.
+    $found = file_cache()->search((string)($_GET['path']??'/'), $q, $limit, $budget);
+    return ['query' => $q, 'results' => $found['results'], 'truncated' => $found['truncated'],
+        'incomplete' => $found['incomplete'], 'scanned' => $found['scanned']];
 });
 /**
 * Favorites: the files an account has starred, for its Favorites screen.

@@ -218,9 +218,25 @@ clash.
 
 The search box has two modes. **This folder** filters the listing already on
 screen, so it stays instant. **All folders** calls `GET /api/files/search`,
-which walks the tree below the folder you are in. That walk is bounded twice
-over — by the number of results and by the number of entries examined — and
-says so when it stops early, rather than silently returning a short list.
+which walks the tree below the folder you are in, breadth first, so the
+shallowest matches come first. It examines up to 200,000 entries; results stop
+at `limit` (200 by default, at most 500). Either bound, when reached, is
+reported as `truncated` rather than silently returning a short list.
+
+A walk reads each folder once and classifies its entries from the folder's
+link count: once a folder's subfolders have all been found, the rest are files
+and need no further system call. A 6,000-photo camera folder costs one
+directory read. On a 44,000-file phone storage over the worst-case FUSE mount
+described under **Caching**, the whole tree takes 0.8 s; the old walk took
+10 s and stopped after 20,000 entries, which on that storage meant WhatsApp's
+media was never searched at all.
+
+`budget` (milliseconds, 250–20,000, default 20,000) is how long the server may
+walk before answering with what it has found. The answer then says
+`incomplete: true`, and the same request again carries on where it stopped —
+the web app and the Android app do that, showing results as they grow. Without
+the application cache there is nothing to carry on from, so the walk gets the
+full 20 seconds.
 
 ## Favorites
 
@@ -497,26 +513,30 @@ ever tell you.
 
 ## Caching
 
-Opening a folder, searching and loading Favorites each cost one `stat()` per
-entry. On a server disk that is nothing; on Android's FUSE-backed shared
-storage it is most of the response time. CloudHub bundles
+Opening a folder and loading Favorites each cost one `stat()` per entry, as
+searching did until its walk was rewritten (see **Moving, copying and
+searching**). On a server disk that is nothing; on Android's FUSE-backed
+shared storage it is most of the response time. CloudHub bundles
 [phpFastCache](https://www.phpfastcache.com) 9.2 in `vendor/` — nothing to
 install on the phone — and uses it for exactly those three answers, and only
 when producing one was slow.
 
 Measured over HTTP on a FUSE mount with the kernel's attribute cache off (the
-worst case), 13,200 files, OPcache on:
+worst case), OPcache on; the folder and Favorites rows on a 13,200-file tree,
+the search rows on a 44,000-file tree laid out like a phone's shared storage
+(DCIM, WhatsApp's media under `Android/media`, Download, Music, …):
 
 | | before | after, first request | after, repeated |
 |---|---|---|---|
 | open a 3,200-file folder | 1,375 ms | 1,269 ms | 7 ms |
-| search 13,000 files | 1,020 ms | 1,080 ms | 85 ms |
-| type a search, 7 keystrokes | 3,586 ms | 1,475 ms | 523 ms |
+| search a 44,000-file phone storage | 10,228 ms, and only 20,000 entries searched | 811 ms, all of it | 230 ms |
+| type "belasting" into that search, 7 queries | 67,291 ms | 2,164 ms | 1,703 ms |
 | Favorites, 500 of them | 449 ms | 536 ms | 5 ms |
 | `/api/storage/me` | 511 ms | — | 3 ms |
 
 On a local disk the same routes take 2–25 ms, nothing is slow enough to be
-kept, and the timings are unchanged. Without OPcache, loading phpFastCache adds
+kept, and the timings are unchanged — except search, whose new walk covers
+that 44,000-file tree in 33 ms where the old one took 59 ms for 20,000. Without OPcache, loading phpFastCache adds
 about 4 ms to a request that reads an entry — and nothing to one that cannot
 have one.
 
@@ -525,14 +545,16 @@ have one.
 | | checked against | can lag by |
 |---|---|---|
 | folder listing | the folder's mtime and ctime, so a file added, removed or renamed — by anyone — misses at once; the cache *generation*, which every request that may change the store retires as it finishes, so anything done through CloudHub shows at once; `CACHE_TTL_SECONDS` | a file another program rewrites in place keeps its old size and time for up to the TTL |
-| search | a recording of the walk, re-proven folder by folder against the disk on every use; result rows are always read fresh | nothing: the same answer as uncached |
+| search | a record of each folder walked, each re-proven against the disk on every use, so a change costs that folder alone; result rows are always read fresh | nothing: the same answer as uncached |
 | Favorites | the account's stored paths, the generation, the TTL | a favorite deleted by another program is listed for up to the TTL |
 
 A folder's times only vouch for it once they are a few seconds old — a second
 change within the same timestamp tick would not move them — so a folder that
-has only just changed is never cached. Typing into the search box sends one
-query per pause; from the second on, each replays the recording, and a search
-that stopped early leaves a recording the next one carries on from.
+has only just changed is never cached, and read again by a search every time
+until it settles. Typing into the search box sends one query per pause; from
+the second on, each replays the record, which is shared by searches from every
+folder, and a search that stopped early leaves a record the next one carries
+on from.
 
 The storage ledger's backstop sweep, which re-checks up to 500 recorded files,
 now runs at most every 30 seconds from `/api/storage/me` and upload checks

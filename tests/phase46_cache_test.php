@@ -96,7 +96,7 @@ $checks['a read with nothing stored misses'] = Cache::get('list_nothing') === nu
 $checks['and does not load phpFastCache to find that out'] =
     !class_exists(\Phpfastcache\Helper\Psr16Adapter::class, false);
 
-// --- a recorded walk answers exactly as search() does ------------------------
+// --- search: the whole tree, breadth first, exactly as a brute-force walk ----
 
 // Folders for the change checks further down, made now so they settle too.
 mkdir($treeA.'/rows-dir');
@@ -105,57 +105,92 @@ mkdir($treeA.'/rm-dir');
 file_put_contents($treeA.'/rm-dir/needle-removed.txt', 'r');
 mkdir($treeA.'/swap-dir');
 file_put_contents($treeA.'/swap-dir/swap-me', 'f');
+// A folder named like a file, inside another: the link count decides what a
+// folder is, never the name.
+mkdir($treeA.'/Holiday.jpg/Backup.zip', 0775, true);
+file_put_contents($treeA.'/Holiday.jpg/Backup.zip/inside-holiday.txt', 'h');
 
-$needles = ['ph', 'PHOTO', 'o', 'a', 'img', '日本', 'é', '.md', 'zz-none', 'x', '_1', 'a b', 'deep'];
-$bounds = [[1, 20000], [3, 20000], [200, 20000], [200, 5], [2, 17], [500, 60]];
-$starts = ['/', '/'.basename((string)(glob($treeA.'/*', GLOB_ONLYDIR)[0] ?? ''))];
-$equivalent = static function (bool $threaded) use ($fsA, $needles, $bounds, $starts): bool {
-    foreach ($starts as $start) {
-        foreach ($bounds as [$limit, $max]) {
-            $index = null;
-            foreach ($needles as $needle) {
-                // Threaded, as the cache hands each search the last one's
-                // recording: replays, early stops and resumed walks in the mix.
-                [$got, $next] = $fsA->searchWithIndex($start, $needle, $limit, $max, $threaded ? $index : null);
-                $index = $next;
-                if ($got !== $fsA->search($start, $needle, $limit, $max)) return false;
+/**
+ * Every entry lstat()ed, breadth first, symlinks and CloudHub's own folders
+ * left out: the slow, obvious walk, as the oracle for the fast one.
+ */
+$oracle = static function (FileService $fs, string $start, string $needle, int $limit, int $max): array {
+    $root = $fs->root();
+    $queue = [rtrim($root.($start === '/' ? '' : $start), '/')];
+    $hits = []; $scanned = 0; $truncated = false; $needle = trim($needle);
+    for ($h = 0; $h < count($queue); $h++) {
+        $dir = $queue[$h];
+        foreach (scandir($dir) ?: [] as $name) {
+            if ($name === '.' || $name === '..' || ($dir === $root && FileService::isReservedRootName($name))) continue;
+            $mode = lstat($dir.'/'.$name)['mode'] & 0170000;
+            if ($mode === 0120000) continue;
+            if (++$scanned > $max) { $truncated = true; break 2; }
+            if (stripos($name, $needle) !== false) {
+                if (count($hits) >= $limit) { $truncated = true; break 2; }
+                $hits[] = substr($dir.'/'.$name, strlen($root));
             }
+            if ($mode === 0040000) $queue[] = $dir.'/'.$name;
+        }
+    }
+    sort($hits);
+    return ['paths' => $hits, 'truncated' => $truncated, 'scanned' => $scanned];
+};
+$shape = static function (array $answer): array {
+    $paths = array_column($answer['results'], 'path');
+    sort($paths);
+    return ['paths' => $paths, 'truncated' => $answer['truncated'], 'scanned' => $answer['scanned']];
+};
+$needles = ['ph', 'PHOTO', 'o', 'a', 'img', '日本', 'é', '.md', 'zz-none', 'x', '_1', 'a b', 'deep', 'holiday', '.jpg'];
+$bounds = [[1, 200000], [3, 200000], [200, 200000], [200, 5], [2, 17], [500, 60]];
+$starts = ['/', '/'.basename((string)(glob($treeA.'/*', GLOB_ONLYDIR)[0] ?? ''))];
+$agrees = static function (bool $threaded) use ($fsA, $oracle, $shape, $needles, $bounds, $starts): bool {
+    foreach ($bounds as [$limit, $max]) {
+        // One record per storage root, whichever folder a search starts from.
+        $index = null;
+        foreach ($starts as $start) foreach ($needles as $needle) {
+            [$got, $next] = $fsA->searchWithIndex($start, $needle, $limit, $max, $threaded ? $index : null);
+            $index = $next;
+            if ($shape($got) !== $oracle($fsA, $start, $needle, $limit, $max)) return false;
         }
     }
     return true;
 };
-$checks['a fresh recording answers as search() does'] = $equivalent(false);
+$checks['a search answers exactly as a brute-force walk does'] = $agrees(false);
+$checks['a folder named like a file is still searched'] =
+    array_column($fsA->search('/', 'inside-holiday')['results'], 'path') === ['/Holiday.jpg/Backup.zip/inside-holiday.txt'];
 
 // Every stamp here is younger than STAMP_SETTLE_SECONDS. A change in the same
-// tick would not move one, so a recording this new proves nothing: it is not
-// worth keeping, and it is not replayed if it is handed back anyway.
-[$a1, $young, $keep] = $fsA->searchWithIndex('/', 'photo', 200, 20000, null);
-$checks['a walk over just-changed folders is not worth keeping'] = $keep === false && $young['settled'] === false;
+// tick would not move one, so a folder read this early is read again.
+[, $young] = $fsA->searchWithIndex('/', 'photo', 200, 200000, null);
+$checks['a folder read before its stamp settled is marked so'] =
+    ($young['dirs'][$fsA->root().'/rm-dir'][1] ?? null) === false;
 file_put_contents($treeA.'/rm-dir/same-tick.txt', 's');
-[$a2] = $fsA->searchWithIndex('/', 'same-tick', 200, 20000, $young);
-$checks['nor is it replayed'] = count($a2['results']) === 1;
+[$a2] = $fsA->searchWithIndex('/', 'same-tick', 200, 200000, $young);
+$checks['and read again, not trusted'] = count($a2['results']) === 1;
 unlink($treeA.'/rm-dir/same-tick.txt');
 
 // Let every stamp in the tree settle before the checks that need one.
 sleep(FileService::STAMP_SETTLE_SECONDS + 1);
-[, $settledIndex, $keep] = $fsA->searchWithIndex('/', 'zz-none', 200, 20000, null);
-$checks['a walk over settled folders is'] = $keep === true && $settledIndex['settled'] === true;
-$checks['and every replay of one answers as search() does, however it was left'] = $equivalent(true);
+[, $settledIndex, $changed] = $fsA->searchWithIndex('/', 'zz-none', 200, 200000, null);
+$checks['a walk over settled folders records them as such'] = $changed === true
+    && !array_filter($settledIndex['dirs'], static fn(array $d): bool => $d[1] !== true);
+$checks['and every replay of the record answers as the brute-force walk, however it was left'] = $agrees(true);
 
-[$again, $after, $changed] = $fsA->searchWithIndex('/', 'photo', 200, 20000, $settledIndex);
-$checks['a complete recording replays without touching it'] = $after === $settledIndex && $changed === false
-    && $again === $fsA->search('/', 'photo', 200, 20000);
-[, $partial] = $fsA->searchWithIndex('/', 'o', 1, 20000, null);
-[$more, $extended, $changed] = $fsA->searchWithIndex('/', 'zz-none', 200, 20000, $partial);
+[$again, $after, $changed] = $fsA->searchWithIndex('/', 'photo', 200, 200000, $settledIndex);
+$checks['a complete record replays without reading a folder'] = $after === $settledIndex && $changed === false
+    && $shape($again) === $oracle($fsA, '/', 'photo', 200, 200000);
+[, $partial] = $fsA->searchWithIndex('/', 'o', 1, 200000, null);
+[$more, $extended, $changed] = $fsA->searchWithIndex('/', 'zz-none', 200, 200000, $partial);
 $checks['a search that stopped early is carried on by the next'] = $changed === true
-    && count($partial['dirs']) < count($extended['dirs']) && $more === $fsA->search('/', 'zz-none', 200, 20000);
-$checks['nothing the walk may not enter is ever recorded'] = !array_filter($settledIndex['names'],
-    static fn(string $n): bool => (bool)preg_match('/(?:^|\0)(?:photo-loop|photo-link|\.trash|\.uploads)(?:\0|$)/', $n));
-$elsewhere = ['v' => 1, 'root' => '/elsewhere'] + $settledIndex;
-[$r, , $changed] = $fsA->searchWithIndex('/', 'photo', 200, 20000, $elsewhere);
-$checks['a recording of another folder is not used'] = $changed === true && $r === $fsA->search('/', 'photo', 200, 20000);
-[$r] = $fsA->searchWithIndex('/', 'photo', 200, 20000, ['names' => 'garbage'] + $settledIndex);
-$checks['nor is a damaged one'] = $r === $fsA->search('/', 'photo', 200, 20000);
+    && count($partial['dirs']) < count($extended['dirs']) && $shape($more) === $oracle($fsA, '/', 'zz-none', 200, 200000);
+$recordedNames = implode("\0", array_column($settledIndex['dirs'], 2));
+$checks['nothing the walk may not enter is ever recorded'] =
+    !preg_match('/(?:^|\0)(?:photo-loop|photo-link|\.trash|\.uploads)(?:\0|$)/', $recordedNames);
+[$r, , $changed] = $fsA->searchWithIndex('/', 'photo', 200, 200000, ['root' => '/elsewhere'] + $settledIndex);
+$checks['a record of another storage root is not used'] = $changed === true
+    && $shape($r) === $oracle($fsA, '/', 'photo', 200, 200000);
+[$r] = $fsA->searchWithIndex('/', 'photo', 200, 200000, ['dirs' => 'garbage'] + $settledIndex);
+$checks['nor is a damaged one'] = $shape($r) === $oracle($fsA, '/', 'photo', 200, 200000);
 
 // --- and notices every change to what it walked ------------------------------
 
@@ -163,19 +198,21 @@ $checks['nor is a damaged one'] = $r === $fsA->search('/', 'photo', 200, 20000);
 // no folder's stamp, and the rows are read from the disk anyway.
 file_put_contents($treeA.'/rows-dir/readme-grow.md', str_repeat('grown', 100));
 clearstatcache();
-[$r, , $changed] = $fsA->searchWithIndex('/', 'readme-grow', 200, 20000, $settledIndex);
-$checks['result rows come from the disk, never the recording'] = $changed === false
+[$r, , $changed] = $fsA->searchWithIndex('/', 'readme-grow', 200, 200000, $settledIndex);
+$checks['result rows come from the disk, never the record'] = $changed === false
     && ($r['results'][0]['size'] ?? null) === 500;
 
 $deepest = '';
-foreach ($settledIndex['dirs'] as $d) if (substr_count($d, '/') > substr_count($deepest, '/')) $deepest = $d;
+foreach (array_keys($settledIndex['dirs']) as $d) if (substr_count($d, '/') > substr_count($deepest, '/')) $deepest = $d;
 file_put_contents($deepest.'/needle-added.txt', 'n');
-[$r] = $fsA->searchWithIndex('/', 'needle-added', 200, 20000, $settledIndex);
+[$r, $afterAdd] = $fsA->searchWithIndex('/', 'needle-added', 200, 200000, $settledIndex);
 $checks['a file added deep in the tree is found at once'] = count($r['results']) === 1
-    && $r === $fsA->search('/', 'needle-added', 200, 20000);
+    && $shape($r) === $oracle($fsA, '/', 'needle-added', 200, 200000);
+$checks['and only its folder is read again'] = count(array_filter(array_keys($afterAdd['dirs']),
+    static fn(string $d): bool => $afterAdd['dirs'][$d] !== $settledIndex['dirs'][$d])) === 1;
 
 unlink($treeA.'/rm-dir/needle-removed.txt');
-[$r] = $fsA->searchWithIndex('/', 'needle-removed', 200, 20000, $settledIndex);
+[$r] = $fsA->searchWithIndex('/', 'needle-removed', 200, 200000, $settledIndex);
 $checks['and one removed is gone at once'] = $r['results'] === [];
 
 $mtime = (int)filemtime($treeA.'/swap-dir');
@@ -186,9 +223,47 @@ file_put_contents($treeA.'/swap-dir/swap-me/inside-swap', 'i');
 // why the stamp carries both.
 touch($treeA.'/swap-dir', $mtime);
 clearstatcache();
-[$r] = $fsA->searchWithIndex('/', 'inside-swap', 200, 20000, $settledIndex);
+[$r] = $fsA->searchWithIndex('/', 'inside-swap', 200, 200000, $settledIndex);
 $checks['a file replaced by a folder, mtime put back, is still walked into'] = count($r['results']) === 1
     && (int)filemtime($treeA.'/swap-dir') === $mtime;
+
+// --- breadth first, no small cap, and a time limit that can be continued ----
+
+$treeB = $tmp.'/b/files';
+mkdir($treeB.'/a', 0775, true);
+file_put_contents($treeB.'/a/target-shallow.txt', 's');
+mkdir($treeB.'/z/y/x/w', 0775, true);
+file_put_contents($treeB.'/z/y/x/w/target-deep.txt', 'd');
+// The old walk went depth first from the last folder, so it met the deep one first.
+mkdir($treeB.'/many');
+for ($i = 0; $i < 20500; $i++) touch(sprintf('%s/many/IMG_%05d.jpg', $treeB, $i));
+file_put_contents($treeB.'/many/zz-last-of-many.txt', 'l');
+symlink('/etc/hostname', $treeB.'/many/leak-to-outside.jpg');
+symlink(dirname($treeB), $treeB.'/many/escape-to-outside.zip');
+$fsB = new FileService(['root_dir' => $treeB, 'read_only' => false]);
+$checks['a search meets the shallowest match first'] =
+    array_column($fsB->search('/', 'target', 1)['results'], 'path') === ['/a/target-shallow.txt'];
+$checks['it is not stopped at 20,000 entries'] =
+    array_column($fsB->search('/', 'zz-last-of-many')['results'], 'path') === ['/many/zz-last-of-many.txt'];
+$checks['a symlink named like a file is never a result'] = $fsB->search('/', 'to-outside')['results'] === [];
+$checks['nor followed, whatever it points at'] = $fsB->search('/', 'hostname')['results'] === []
+    && $fsB->search('/', 'target-shallow')['results'] !== [] && count($fsB->search('/', 'target-')['results']) === 2;
+$checks['and nothing unchecked takes a place among the results'] =
+    array_column($fsB->search('/', 'outside', 1)['results'], 'path') === [];
+
+// A deadline already past still reads one folder, so a caller that asks again
+// always gets further -- and in the end, to the same answer as one long walk.
+[$slice, $record] = $fsB->searchWithIndex('/', 'target', 200, 200000, null, microtime(true) - 1);
+$checks['a walk out of time says it is incomplete'] = $slice['incomplete'] === true && $slice['truncated'] === true
+    && count($record['dirs']) === 1;
+$rounds = 1;
+while ($slice['incomplete'] && $rounds < 50) {
+    [$slice, $record] = $fsB->searchWithIndex('/', 'target', 200, 200000, $record, microtime(true) - 1);
+    $rounds++;
+}
+$full = $fsB->search('/', 'target');
+$checks['and asking again carries on to the whole answer'] = $slice === $full && $full['incomplete'] === false
+    && $rounds === count($record['dirs']);
 
 // --- listings -------------------------------------------------------------------
 
@@ -216,7 +291,7 @@ $checks['CACHE_TTL_SECONDS=0 keeps no listings'] = !file_exists($tmp.'/ttl0/acti
 Cache::configure($cfg(['root_dir' => $listDir, 'cache_path' => $tmp.'/quick', 'cache_min_compute_ms' => 60000]));
 $quick = new FileCache($fsL);
 $quick->list('/sub');
-$quick->search('/', 'f1', 200);
+$quick->search('/', 'f1', 200, 20000);
 $checks['answers quicker than the threshold are never kept'] = !file_exists($tmp.'/quick/active');
 
 // --- search, through the cache ---------------------------------------------------
@@ -226,16 +301,19 @@ Cache::configure($cfg(['root_dir' => $treeC, 'cache_path' => $tmp.'/search-cache
 $fcC = new FileCache($fsC);
 $through = true;
 foreach (['ph', 'o', 'img', 'zz-none'] as $needle) {
-    $through = $through && $fcC->search('/', $needle, 200) === $fsC->search('/', $needle, 200);
+    $through = $through && $fcC->search('/', $needle, 200, 20000) === $fsC->search('/', $needle, 200);
 }
 $checks['search through the cache answers as search() does'] = $through;
 $stored = glob($tmp.'/search-cache/cloudhub/Files/*/*/*.txt') ?: [];
-$checks['and keeps its recording'] = count($stored) === 1;
-[, $deepC] = $fsC->searchWithIndex('/', 'zz-none', 200, 20000, null);
-$deepestC = end($deepC['dirs']);
+$checks['and keeps one record for the storage root'] = count($stored) === 1;
+$sub = '/'.basename((string)(glob($treeC.'/*', GLOB_ONLYDIR)[0] ?? ''));
+$checks['which a search from any folder shares'] =
+    $fcC->search($sub, 'o', 200, 20000) === $fsC->search($sub, 'o', 200) && count(glob($tmp.'/search-cache/cloudhub/Files/*/*/*.txt') ?: []) === 1;
+[, $deepC] = $fsC->searchWithIndex('/', 'zz-none', 200, 200000, null);
+$deepestC = (string)array_key_last($deepC['dirs']);
 file_put_contents($deepestC.'/cached-needle.txt', 'n');
-$checks['which sees a new file at once, with no TTL involved'] =
-    count($fcC->search('/', 'cached-needle', 200)['results']) === 1;
+$checks['and sees a new file at once, with no TTL involved'] =
+    count($fcC->search('/', 'cached-needle', 200, 20000)['results']) === 1;
 
 // --- favorites -------------------------------------------------------------------
 
@@ -373,7 +451,14 @@ $checks['a dead Redis costs a request one second, not five'] = str_contains($cac
 
 $index = (string)file_get_contents($root.'/public/index.php');
 $checks['listings go through the cache'] = str_contains($index, "file_cache()->list((string)(\$_GET['path']??'/'))");
-$checks['as does search'] = str_contains($index, "file_cache()->search((string)(\$_GET['path']??'/'), \$q, \$limit);");
+$checks['as does search'] = str_contains($index, "file_cache()->search((string)(\$_GET['path']??'/'), \$q, \$limit, \$budget);");
+$app = (string)file_get_contents($root.'/public/assets/js/app.js');
+$checks['the web client asks for slices and carries on while there is more'] =
+    str_contains($app, "&budget=2500`)).json();") && str_contains($app, 'if (!S.results.incomplete) return;')
+    && str_contains($app, 'incomplete: !!d.incomplete && d.scanned > scanned');
+$checks['and never says "anywhere" about a search that stopped short'] =
+    str_contains($app, '? (S.results.truncated') && str_contains($app, 'the search stopped there');
+$checks['whose answer says when it is incomplete'] = str_contains($index, "'incomplete' => \$found['incomplete'], 'scanned' => \$found['scanned']];");
 $checks['the cache is configured on first use only'] = substr_count($index, 'Cache::configure(') === 1
     && str_contains($index, 'if (!$ready) { Cache::configure($config); $ready = true; }');
 $hook = strpos($index, '$cacheNeutralWrites = [');

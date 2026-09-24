@@ -21,9 +21,10 @@ use RuntimeException;
  *              itself changed misses; and CACHE_TTL_SECONDS. What that leaves
  *              is a file rewritten in place by another program, whose size
  *              and time can lag by up to the TTL.
- *   search     every directory the walk passes through, by dirStamp(); the
- *              result rows are built fresh. No TTL is involved: it answers
- *              exactly as FileService::search() would.
+ *   search     each folder the walk passes through, by its own dirStamp(), so
+ *              a change costs that folder alone; result rows are built fresh.
+ *              No TTL is involved: it answers exactly as FileService::search()
+ *              would.
  *   favorites  the account's stored paths and the cache generation, and the
  *              TTL -- a favorite deleted by another program stays listed for
  *              up to that long, and is forgotten once it is noticed.
@@ -35,10 +36,19 @@ use RuntimeException;
 final class FileCache
 {
     /**
-     * How long a search recording is kept. Every use re-proves it against the
-     * disk, so this bounds storage rather than staleness.
+     * How long a search's record of the tree is kept. Every use re-proves each
+     * folder it passes through, so this bounds storage rather than staleness.
      */
-    public const SEARCH_SECONDS = 600;
+    public const SEARCH_SECONDS = Cache::MAX_TTL;
+
+    /** A record larger than this is not kept; the next search starts over. */
+    public const SEARCH_MAX_BYTES = 16 * 1048576;
+
+    /**
+     * How long a search may walk when nothing can keep what it found, and so
+     * asking again would only walk the same ground again.
+     */
+    public const UNCACHED_BUDGET_MS = 20000;
 
     public function __construct(private readonly FileService $files) {}
 
@@ -72,17 +82,35 @@ final class FileCache
         return $rows;
     }
 
-    /** FileService::search(), by way of FileService::searchWithIndex(). */
-    public function search(string $path, string $needle, int $limit, int $maxNodes = 20000): array
+    /**
+     * FileService::search(), by way of FileService::searchWithIndex().
+     *
+     * One record per storage root, whatever folder the search starts from:
+     * the walk below /DCIM passes through the same folders as the walk from /,
+     * and each folder's record is proven on its own.
+     *
+     * $budgetMs is how long to walk before answering with what has been found;
+     * the answer says `incomplete`, and the same request again carries on from
+     * the record. Without a cache there is no record to carry on from, so the
+     * walk gets UNCACHED_BUDGET_MS instead.
+     */
+    public function search(string $path, string $needle, int $limit, int $budgetMs): array
     {
-        if (!Cache::enabled()) return $this->files->search($path, $needle, $limit, $maxNodes);
-
-        $key = 'search_'.sha1($this->files->existing($path)."\0".$maxNodes);
+        if (!Cache::enabled()) {
+            $deadline = microtime(true) + max($budgetMs, self::UNCACHED_BUDGET_MS) / 1000;
+            return $this->files->search($path, $needle, $limit, FileService::SEARCH_MAX_NODES, $deadline);
+        }
+        $deadline = microtime(true) + $budgetMs / 1000;
+        $key = 'tree_'.sha1($this->files->root());
         $started = hrtime(true);
         $stored = Cache::get($key);
-        [$answer, $index, $keep] = $this->files->searchWithIndex($path, $needle, $limit, $maxNodes,
-            is_array($stored) ? $stored : null);
-        if ($keep && Cache::worthKeeping($started)) Cache::set($key, $index, self::SEARCH_SECONDS);
+        [$answer, $index, $changed] = $this->files->searchWithIndex($path, $needle, $limit,
+            FileService::SEARCH_MAX_NODES, is_array($stored) ? $stored : null, $deadline);
+        // A walk cut short is kept whatever it cost: the next request carries on from it.
+        if ($changed && $index['bytes'] <= self::SEARCH_MAX_BYTES
+            && ($answer['incomplete'] || Cache::worthKeeping($started))) {
+            Cache::set($key, $index, self::SEARCH_SECONDS);
+        }
         return $answer;
     }
 
