@@ -34,6 +34,10 @@ $put('docs/.hidden', 'x');
 $put('src/Services/Auth.php', '<?php');
 $put('notes.log', 'log');
 $put('database/schema.sql', 'CREATE');
+$put('vendor/autoload.php', '<?php');
+$put('vendor/phpfastcache/phpfastcache/LICENCE', 'MIT');
+$put('composer.json', '{}');
+$put('composer.lock', '{}');
 
 $index = (string)file_get_contents($root.'/public/index.php');
 $token = str_repeat('A', 43);
@@ -56,7 +60,8 @@ $get = static function (string $path) use ($base): array {
     return [(int)($m[1] ?? 0), (string)$body];
 };
 
-foreach (['/.git/config', '/.env', '/.gitignore', '/docs/.hidden', '/src/Services/Auth.php', '/notes.log', '/database/schema.sql'] as $path) {
+foreach (['/.git/config', '/.env', '/.gitignore', '/docs/.hidden', '/src/Services/Auth.php', '/notes.log', '/database/schema.sql',
+    '/vendor/autoload.php', '/vendor/phpfastcache/phpfastcache/LICENCE', '/composer.json', '/composer.lock'] as $path) {
     [$status] = $get($path);
     $checks["$path is refused"] = $status === 403;
 }
@@ -77,8 +82,11 @@ $rmrf = static function (string $p) use (&$rmrf): void {
 };
 $rmrf($tmp);
 
-// .htaccess cannot run here; pin that it carries the same two exemptions.
+// .htaccess cannot run here; pin that it carries the same two exemptions,
+// and refuses the bundled dependencies as the router does.
 $htaccess = (string)file_get_contents($root.'/.htaccess');
+$checks['.htaccess refuses vendor/'] = (bool)preg_match('~^RewriteRule \^\(\?:[^)]*\|vendor\|[^)]*\)\(\?:/\|\$\) - \[F,L,NC\]$~m', $htaccess);
+$checks['.htaccess refuses composer.json and composer.lock'] = str_contains($htaccess, 'RewriteRule ^(?:composer\.(?:json|lock)|');
 $checks['.htaccess exempts /.well-known/ from the dot rule'] = str_contains($htaccess, 'RewriteRule (?:^|/)\.(?!well-known(?:/|$)) - [F,L]');
 $checks['.htaccess routes share links before any deny rule'] =
     (bool)preg_match('~^RewriteRule \^share/~m', $htaccess)

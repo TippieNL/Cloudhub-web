@@ -33,13 +33,14 @@ if (preg_match('#^/share/[A-Za-z0-9_-]{20,128}(?:[./]|$)#', $uri)) {
 // droppings) except /.well-known/, which ACME certificate renewal answers
 // from, along with the Node/React source and build trees this PHP port sits
 // beside -- client/, server/, shared/, script/, node_modules/ and the tool
-// configs -- none of which PHP serves. The extension list catches loose
-// artefacts; /share/ was exempted above.
+// configs -- none of which PHP serves. vendor/ is the bundled phpFastCache,
+// and composer.json/.lock say which versions of it are here. The extension
+// list catches loose artefacts; /share/ was exempted above.
 $denied = '#(?:^|/)\.(?!well-known(?:/|$))'
-    .'|^/(?:config|src|views|database|storage|logs|tests|tools|deploy'
+    .'|^/(?:config|src|views|database|storage|logs|tests|tools|deploy|vendor'
     .'|client|server|shared|script|node_modules|attached_assets|\.agents)(?:/|$)'
     .'|^/(?:README|SECURITY|PROJECT_CONTEXT|replit)\.md$'
-    .'|^/(?:package(?:-lock)?\.json|drizzle\.config\.ts|components\.json|skills-lock\.json'
+    .'|^/(?:composer\.(?:json|lock)|package(?:-lock)?\.json|drizzle\.config\.ts|components\.json|skills-lock\.json'
     .'|tsconfig\.json|vite\.config\.ts|tailwind\.config\.ts|postcss\.config\.js)$'
     .'|\.(?:bak|old|orig|save|sql|log|ini|dist|ts|tsx)$#i';
 if (preg_match($denied, $uri)) {
