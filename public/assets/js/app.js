@@ -1125,9 +1125,16 @@ function renderSearchStatus() {
     const box = $('#search-status');
     if (!S.results) { box.hidden = true; return; }
     const n = S.results.entries.length;
-    box.textContent = n === 0
-        ? `No matches for "${S.results.query}" anywhere under ${S.path === '/' ? 'Root' : S.path}`
-        : `${n} match${n === 1 ? '' : 'es'} for "${S.results.query}"${S.results.truncated ? ' (showing the first ' + n + '; narrow the search for the rest)' : ''}`;
+    const matches = `${n} match${n === 1 ? '' : 'es'} for "${S.results.query}"`;
+    // "No matches anywhere" is only true when the whole tree was searched: a
+    // search that stopped at a bound, or is still going, says so instead.
+    box.textContent = S.results.incomplete
+        ? `${matches} so far — still searching…`
+        : n === 0
+            ? (S.results.truncated
+                ? `No matches for "${S.results.query}" in the first ${S.results.scanned} items; the search stopped there`
+                : `No matches for "${S.results.query}" anywhere under ${S.path === '/' ? 'Root' : S.path}`)
+            : `${matches}${S.results.truncated ? ' (showing the first ' + n + '; narrow the search for the rest)' : ''}`;
     box.hidden = false;
 }
 
@@ -1142,19 +1149,28 @@ async function runSearch() {
         return;
     }
     const run = ++searchRun;
+    // A large tree is searched in slices: each answer is what has been found so
+    // far, `incomplete` says there is more, and asking again carries on where
+    // the server stopped. Results appear after the first slice rather than when
+    // the whole walk is done. A slice that got no further ends the loop.
+    let scanned = -1;
     try {
-        const d = await (await api(`/api/files/search?q=${encodeURIComponent(q)}&path=${encodeURIComponent(S.path)}`)).json();
-        // A slower earlier request must not overwrite a newer one's results.
-        if (run !== searchRun) return;
-        S.results = { query: d.query, entries: d.results, truncated: d.truncated };
-        S.selected.clear();
+        for (;;) {
+            const d = await (await api(`/api/files/search?q=${encodeURIComponent(q)}&path=${encodeURIComponent(S.path)}&budget=2500`)).json();
+            // A slower earlier request must not overwrite a newer one's results.
+            if (run !== searchRun) return;
+            S.results = { query: d.query, entries: d.results, truncated: d.truncated,
+                incomplete: !!d.incomplete && d.scanned > scanned, scanned: d.scanned };
+            S.selected.clear();
+            renderSearchStatus();
+            renderFiles();
+            if (!S.results.incomplete) return;
+            scanned = d.scanned;
+        }
     } catch (e) {
         if (run !== searchRun) return;
         toast(e.message);
-        return;
     }
-    renderSearchStatus();
-    renderFiles();
 }
 
 function setScope(scope) {

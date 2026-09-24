@@ -2,7 +2,9 @@
 declare(strict_types = 1);
 require dirname(__DIR__).'/config/bootstrap.php';
 use CloudHub\Helpers\Http;
+use CloudHub\Helpers\Cache;
 use CloudHub\Services\FileService;
+use CloudHub\Services\FileCache;
 use CloudHub\Repositories\ServerRepository;
 use CloudHub\Repositories\UserRepository;
 use CloudHub\Repositories\StorageLedger;
@@ -268,8 +270,8 @@ function purge_expired_trash_occasionally(FileService $fs, int $retentionDays): 
  * Keyed by absolute path and modification time, so editing or replacing a
  * file yields a new key and the stale thumbnail is simply never read again.
  */
-function thumbnail_cache_path(string $file): ?string {
-    $mtime = @filemtime($file);
+function thumbnail_cache_path(string $file, ?int $mtime = null): ?string {
+    $mtime ??= @filemtime($file);
     if ($mtime === false)return null;
     $dir = dirname(__DIR__).'/storage/.thumbnails/images';
     if (!is_dir($dir) && !@mkdir($dir, 0775, true) && !is_dir($dir))return null;
@@ -290,7 +292,12 @@ function flag_video_thumbnail(array $entry, string $root): array {
     if (!empty($entry['isDirectory'])) return $entry;
     $ext = strtolower((string)pathinfo((string)$entry['name'], PATHINFO_EXTENSION));
     if (!in_array($ext, THUMBNAIL_VIDEO_EXTENSIONS, true)) return $entry;
-    $cache = thumbnail_cache_path($root.$entry['path']);
+    // The row already says when the file changed. Asking the disk again cost a
+    // stat per video, which on FUSE storage is what a cached listing saves.
+    // (A file stamped exactly 0 reads as "now" in a row, so its frame goes
+    // unflagged and is fetched once more -- a round trip, not a wrong answer.)
+    $modified = strtotime((string)($entry['modified'] ?? ''));
+    $cache = thumbnail_cache_path($root.$entry['path'], $modified === false ? null : $modified);
     $entry['hasThumbnail'] = $cache !== null && is_file($cache);
     return $entry;
 }
@@ -435,6 +442,49 @@ function ledger(): StorageLedger {
     return $ledger ??= new StorageLedger(db());
 }
 /**
+* The cache, configured on first use.
+*
+* Deferred like the services above, so a request that never lists anything --
+* a thumbnail, a stream -- does not load it.
+*/
+function cache_ready(): void {
+    static $ready = false; global $config;
+    if (!$ready) { Cache::configure($config); $ready = true; }
+}
+/**
+* Listings, search and favorites by way of the cache. See FileCache.
+*/
+function file_cache(): FileCache {
+    static $cache = null; global $fs;
+    cache_ready();
+    return $cache ??= new FileCache($fs);
+}
+/**
+* ledger()->sweep(), at most once every LEDGER_SWEEP_SECONDS.
+*
+* Each sweep resolves up to 500 recorded paths, which on Android's FUSE storage
+* measured half a second -- and assert_upload_fits() ran one for every file of
+* a batch upload, so 150 files under a quota spent over a minute re-checking
+* the same rows. The sweep is the backstop for files removed behind CloudHub's
+* back; CloudHub's own deletions leave the ledger straight away. So skipping
+* a repeat within seconds can only leave a vanished file counted a little
+* longer, never let an upload through that should have been refused.
+*
+* Off with the cache (CACHE_DRIVER=none), which restores a sweep every time.
+* The admin dashboard and restore still sweep unconditionally.
+*/
+const LEDGER_SWEEP_SECONDS = 30;
+function sweep_ledger_occasionally(FileService $fs): void {
+    cache_ready();
+    $stamp = dirname(__DIR__).'/storage/.cache/ledger-sweep';
+    if (Cache::enabled()) {
+        $last = @filemtime($stamp);
+        if ($last !== false && time() - $last < LEDGER_SWEEP_SECONDS) return;
+        if (is_dir(dirname($stamp)) || @mkdir(dirname($stamp), 0775, true) || is_dir(dirname($stamp))) @touch($stamp);
+    }
+    ledger()->sweep($fs);
+}
+/**
 * Measured storage use, cached.
 *
 * Measuring means walking the whole store, which is far too expensive to do on
@@ -501,7 +551,7 @@ function assert_upload_fits(FileService $fs, array $config, int $size): void {
     $quota = (int)round((float)$config['user_quota_gb'] * 1073741824);
     $user = Auth::user();
     if ($quota > 0 && $user !== null) {
-        ledger()->sweep($fs);
+        sweep_ledger_occasionally($fs);
         $used = ledger()->usage($user['id']);
         if ($used + $size > $quota) {
             throw new RuntimeException('You have used '.human_bytes($used).
@@ -722,6 +772,30 @@ if ($isProtectedApi && $method !== 'OPTIONS') {
         elseif (!in_array($path, $writeExemptPost, true))Authorization::requireWrite();
     }
 }
+/*
+ * A request that may have changed the file store retires the cache generation
+ * as it finishes, whatever its outcome -- a copy that failed half way changed
+ * the store too -- so no listing or favorite cached before it is believed
+ * after it. See CloudHub\Helpers\Cache::bumpGeneration(). Shutdown functions
+ * run before PHP completes the response (Http::json() sends no length and
+ * flushes nothing early), so no client holds an answer before the bump.
+ *
+ * Registered after the guard, so a request turned away for want of a session,
+ * a CSRF token or the write capability retires nothing. The exempt routes
+ * cannot change a listed file: signing in and out, upload staging (the file
+ * appears only at /complete, which is not exempt), video frames, which are
+ * kept outside the store, bulk download, a password, and the duplicate scan's
+ * own progress. Being wrong in the other direction only costs a cache miss.
+ */
+$cacheNeutralWrites = ['/api/auth/login', '/api/auth/logout', '/api/uploads/init', '/api/uploads/chunk',
+    '/api/uploads/cancel', '/api/uploads/cleanup', '/api/thumbnail/video', '/api/files/download-zip',
+    '/api/users/me/password', '/api/duplicates/scan'];
+if (!in_array($method, ['GET', 'HEAD', 'OPTIONS', 'PROPFIND'], true) && !in_array($path, $cacheNeutralWrites, true)) {
+    register_shutdown_function(static function (): void {
+        cache_ready();
+        Cache::bumpGeneration();
+    });
+}
 if ($path === '/api/files/config') Http::json([
     'readOnly' => $config['read_only'], 'allowDelete' => $config['allow_delete'], 'allowOverwrite' => $config['allow_overwrite'],
     'maxUploadMb' => $config['max_upload_mb'], 'maxUploadFiles' => $config['max_upload_files'],
@@ -739,9 +813,10 @@ if ($path === '/api/files/config') Http::json([
 if ($path === '/api/files/list' && $method === 'GET') api_try(function()use($fs) {
     release_session_lock();
     $root = $fs->root();
-    // Videos say whether a frame is cached; see flag_video_thumbnail().
+    // Videos say whether a frame is cached; see flag_video_thumbnail(). The
+    // flag is added after the cache, as frames come and go on their own.
     return array_map(fn(array $entry): array => flag_video_thumbnail($entry, $root),
-        $fs->list((string)($_GET['path']??'/')));
+        file_cache()->list((string)($_GET['path']??'/')));
 });
 // HEAD says whether a download will work without sending it: the web client
 // asks first, then hands the URL to the browser's own download manager, which
@@ -927,9 +1002,17 @@ if ($path === '/api/files/search' && $method === 'GET') api_try(function()use($f
     if (mb_strlen($q) < 2)throw new RuntimeException('Enter at least two characters to search', 400);
     if (mb_strlen($q) > 255)throw new RuntimeException('That search term is too long', 400);
     $limit = max(1, min(500, (int)($_GET['limit']??200)));
+    // How long to walk before answering with what has been found so far. A
+    // client that asks again when the answer says `incomplete` sees results
+    // as they grow; one that does not gets up to twenty seconds, enough for a
+    // phone's whole storage in one answer.
+    $budget = isset($_GET['budget']) ? max(250, min(20000, (int)$_GET['budget'])) : 20000;
 
-    $found = $fs->search((string)($_GET['path']??'/'), $q, $limit);
-    return ['query' => $q, 'results' => $found['results'], 'truncated' => $found['truncated'], 'scanned' => $found['scanned']];
+    // The same answer as $fs->search(); after the first, searches replay a
+    // record of the folders walked, re-proving each one against the disk.
+    $found = file_cache()->search((string)($_GET['path']??'/'), $q, $limit, $budget);
+    return ['query' => $q, 'results' => $found['results'], 'truncated' => $found['truncated'],
+        'incomplete' => $found['incomplete'], 'scanned' => $found['scanned']];
 });
 /**
 * Favorites: the files an account has starred, for its Favorites screen.
@@ -952,18 +1035,16 @@ if ($path === '/api/favorites' && $method === 'GET') api_try(function()use($fs) 
     release_session_lock();
     $user = (int)Auth::user()['id'];
     $root = $fs->root();
+    $rows = favorites()->list($user);
+    // Only a 404 counts as gone -- removed by a route CloudHub does not see,
+    // such as a change made on the disk itself. Anything else is no evidence
+    // of that, so the favorite is kept and merely not shown. See describeMany().
+    $described = file_cache()->describeMany('favorites_'.$user, array_column($rows, 'path'));
     $entries = [];
-    $gone = [];
-    foreach (favorites()->list($user) as $row) {
-        try {
-            $entry = $fs->describe($row['path']);
-        } catch (RuntimeException $e) {
-            // Only a 404 means the file is gone -- by a route CloudHub does not
-            // see, such as a change made on the disk itself. Anything else is
-            // no evidence of that, so the favorite is kept and merely not shown.
-            if ($e->getCode() === 404) $gone[] = $row['path'];
-            continue;
-        }
+    $gone = $described['gone'];
+    foreach ($rows as $i => $row) {
+        $entry = $described['rows'][$i] ?? null;
+        if ($entry === null) continue;
         if ($entry['isDirectory']) { $gone[] = $row['path']; continue; }
         $entries[] = flag_video_thumbnail($entry, $root)
             + ['favoritedAt' => gmdate('c', (int)strtotime($row['createdAt']))];
@@ -1133,7 +1214,7 @@ if ($path === '/api/storage/me' && $method === 'GET') api_try(function()use($fs,
     // Swept exactly as assert_upload_fits() does, so the figure shown here is
     // the figure that will refuse an upload. A number that disagrees with the
     // error you eventually get is worse than no number.
-    ledger()->sweep($fs);
+    sweep_ledger_occasionally($fs);
 
     $report = storage_report($fs, $config);
     $used = $user === null?0:ledger()->usage((int)$user['id']);

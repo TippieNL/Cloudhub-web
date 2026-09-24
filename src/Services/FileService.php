@@ -187,33 +187,205 @@ final class FileService {
  }
 
 
+ /** The most entries one search examines. Beyond it the answer says `truncated`. */
+ public const SEARCH_MAX_NODES=200000;
+
  /**
-  * Depth-first name search below $path.
+  * Name search below $path, breadth first.
   *
-  * Bounded twice over: $limit caps what comes back and $maxNodes caps what is
-  * examined, so one keystroke cannot turn into an unbounded walk of a deep
-  * tree. `truncated` tells the caller which bound was reached, so the UI can
-  * say "showing the first N" instead of quietly lying about the result count.
+  * Bounded three ways, each reported rather than hidden: $limit caps what comes
+  * back, $maxNodes caps what is examined, and $deadline -- a microtime(true)
+  * value -- caps how long the walk may run, after which `incomplete` says it
+  * stopped for time. searchWithIndex() is the same walk, resumable.
   *
-  * @return array{results:list<array>,truncated:bool,scanned:int}
+  * Breadth first so that a bound, where one is reached, costs the deepest
+  * corners of the tree rather than whole top-level folders. The walk used to
+  * go depth first from the last folder, under a 20,000-entry cap: on a phone
+  * that cap was spent inside whichever folders came first -- on a measured
+  * 44,000-file storage, WhatsApp's media under Android/ was never opened, and
+  * a photo that was there was reported as not found.
+  *
+  * @return array{results:list<array>,truncated:bool,incomplete:bool,scanned:int}
   */
- public function search(string $path,string $needle,int $limit=200,int $maxNodes=20000): array {
+ public function search(string $path,string $needle,int $limit=200,int $maxNodes=self::SEARCH_MAX_NODES,?float $deadline=null): array {
+  return $this->searchWithIndex($path,$needle,$limit,$maxNodes,null,$deadline)[0];
+ }
+
+ /** Seconds a directory's time stamps must have stood before they can vouch for it. See dirStamp(). */
+ public const STAMP_SETTLE_SECONDS=3;
+
+ /**
+  * A directory's change stamp, and whether it is settled.
+  *
+  * Adding, removing or renaming an entry moves a directory's mtime and ctime,
+  * so an unchanged stamp proves an unchanged list of entries -- provided the
+  * stamp was already a few seconds old when it was read. Timestamps come in
+  * ticks (a second through PHP, two seconds on FAT), and a change that lands
+  * in the same tick as the one before it leaves the stamp where it was. One
+  * that had stood for longer than a tick cannot be left behind like that.
+  *
+  * Read it before reading the directory: a change in between then shows up
+  * later as a mismatch, never as a match against entries that have moved on.
+  * And read it from the disk, not PHP's stat cache, which may hold one taken
+  * earlier.
+  *
+  * @return array{0:string,1:bool}|null the stamp and whether it is settled; null if it cannot be read
+  */
+ public function dirStamp(string $dir): ?array {
+  clearstatcache();$now=time();$st=@stat($dir);
+  return $st===false?null:self::stampOf($st,$now);
+ }
+
+ /** @return array{0:string,1:bool} */
+ private static function stampOf(array $st,int $now): array {
+  return [$st['mtime'].':'.$st['ctime'],max((int)$st['mtime'],(int)$st['ctime'])<=$now-self::STAMP_SETTLE_SECONDS];
+ }
+
+ /**
+  * search(), from and extending a record of what each directory held.
+  *
+  * The record maps every directory a walk has read to its dirStamp(), whether
+  * that had settled, and its entries with their types. A directory whose stamp
+  * still matches, and had settled, is not read again; any other is, and only
+  * its own record is replaced -- a new photo in one folder costs that folder,
+  * not the walk. The order of the walk depends on the tree alone, never on the
+  * needle, so every search below any folder of the same storage reaches the
+  * answer search() would, down to `scanned` and `truncated`. Result rows are
+  * read from the disk, never from the record.
+  *
+  * $deadline stops the walk before it reads another directory from the disk,
+  * never part way through one and never before it has read at least one that
+  * was new to the record or had changed, so each call advances the record and
+  * asking again always gets further.
+  *
+  * @param array|null $index what an earlier call returned for this storage root
+  * @return array{0:array{results:list<array>,truncated:bool,incomplete:bool,scanned:int},1:array,2:bool}
+  *   the answer; the record as it now stands; and whether this call changed it
+  */
+ public function searchWithIndex(string $path,string $needle,int $limit,int $maxNodes,?array $index,?float $deadline=null): array {
   $start=$this->existing($path);if(!is_dir($start))throw new RuntimeException('Directory not found',404);
-  $needle=trim($needle);if($needle==='')return ['results'=>[],'truncated'=>false,'scanned'=>0];
-  $results=[];$scanned=0;$truncated=false;$stack=[$start];
-  while($stack){
-   $dir=array_pop($stack);
-   foreach($this->children($dir) as $full){
+  if(!self::recordingFits($index,$this->root))$index=['v'=>2,'root'=>$this->root,'dirs'=>[],'bytes'=>0];
+  $needle=trim($needle);
+  if($needle==='')return [['results'=>[],'truncated'=>false,'incomplete'=>false,'scanned'=>0],$index,false];
+  $results=[];$scanned=0;$truncated=false;$incomplete=false;$changed=false;$read=0;
+  $queue=[$start];
+  for($head=0;$head<count($queue);$head++){
+   $dir=$queue[$head];
+   // Taken before the directory is read, and it carries the link count readDir() needs.
+   clearstatcache();$now=time();$st=@stat($dir);
+   if($st===false)continue;
+   $stamp=self::stampOf($st,$now);
+   $known=$index['dirs'][$dir]??null;
+   if(!is_array($known)||count($known)!==4||$known[1]!==true||$known[0]!==$stamp[0]){
+    // Reading a folder whose record had not settled is not progress: it has to
+    // be read again every time until it settles, and if that could spend the
+    // one read a call is allowed, a tree that has just changed would never get
+    // past it.
+    $progress=!is_array($known)||($known[1]??null)===true;
+    if($progress&&$deadline!==null&&$read>0&&microtime(true)>$deadline){$truncated=$incomplete=true;break;}
+    [$names,$types]=$this->readDir($dir,$st);
+    if($progress)$read++;
+    $joined=implode("\0",$names);
+    $index['bytes']+=strlen($joined)-(is_array($known)?strlen((string)($known[2]??'')):0);
+    $known=$index['dirs'][$dir]=[$stamp[0],$stamp[1],$joined,$types];
+    $changed=true;
+   }
+   foreach($known[2]===''?[]:explode("\0",$known[2]) as $i=>$name){
     if(++$scanned>$maxNodes){$truncated=true;break 2;}
-    if(stripos(basename($full),$needle)!==false){
+    $full=$dir.'/'.$name;$isDir=($known[3][$i]??'f')==='d';
+    // An entry readDir() left unchecked is checked once it matters: a symlink
+    // is never a result, and must not take a place among the first $limit.
+    if(stripos($name,$needle)!==false&&($isDir||!is_link($full))){
      if(count($results)>=$limit){$truncated=true;break 2;}
-     $results[]=$this->entry($full);
+     $results[]=$full;
     }
-    if(is_dir($full))$stack[]=$full;
+    if($isDir)$queue[]=$full;
    }
   }
-  usort($results,fn($a,$b)=>$a['isDirectory']!==$b['isDirectory']?($a['isDirectory']?-1:1):strcasecmp($a['path'],$b['path']));
-  return ['results'=>$results,'truncated'=>$truncated,'scanned'=>$scanned];
+  $rows=[];
+  foreach($results as $full){$row=$this->resultRow($full);if($row!==null)$rows[]=$row;}
+  usort($rows,fn($a,$b)=>$a['isDirectory']!==$b['isDirectory']?($a['isDirectory']?-1:1):strcasecmp($a['path'],$b['path']));
+  return [['results'=>$rows,'truncated'=>$truncated,'incomplete'=>$incomplete,'scanned'=>$scanned],$index,$changed];
+ }
+
+ /**
+  * One directory's entries for a walk -- those children() would give -- and a
+  * type for each, 'd' or 'f', in scandir() order.
+  *
+  * What makes this cheap is the directory's link count. On the filesystems a
+  * phone or a server keeps files on -- ext4 and f2fs, and Android's FUSE over
+  * them -- a directory has two links plus one per subdirectory, so once that
+  * many subdirectories have been found, whatever is left is not one and needs
+  * no lstat(). Names that look like folders are checked first. A camera folder
+  * of six thousand photos and no subfolders therefore costs nothing but its
+  * scandir(), where the old walk made two system calls per photo -- the same
+  * rule GNU find has relied on for decades.
+  *
+  * Where the rule cannot be trusted -- a link count below two, as btrfs and
+  * NTFS report, or more subdirectories found than it allows -- every entry is
+  * checked. An entry left unchecked is never descended into, so it cannot be a
+  * way out of the root even if it were a symlink, and searchWithIndex() checks
+  * one before it can be a result. It still counts towards `scanned`: symlinks
+  * named like files are the one thing that makes that count differ from an
+  * lstat() of everything, and Android's shared storage cannot hold a symlink.
+  *
+  * @param array $st the directory's own stat(), taken before it is read
+  * @return array{0:list<string>,1:string}
+  */
+ private function readDir(string $dir,array $st): array {
+  $atRoot=rtrim($dir,'/')===$this->root;
+  $expected=(int)$st['nlink']>=2?(int)$st['nlink']-2:null;
+  $names=[];
+  foreach(scandir($dir)?:[] as $name){
+   if($name==='.'||$name==='..')continue;
+   if($atRoot&&self::isReservedRootName($name)){
+    // Not listed, but still a subdirectory as far as the link count goes.
+    if($expected!==null&&!is_link($dir.'/'.$name)&&is_dir($dir.'/'.$name))$expected--;
+    continue;
+   }
+   $names[]=$name;
+  }
+  $types=array_fill(0,count($names),'f');$gone=[];$found=0;
+  $first=[];$rest=[];
+  foreach($names as $i=>$name){if(self::looksLikeFile($name))$rest[]=$i;else $first[]=$i;}
+  foreach([$first,$rest] as $pass=>$indices){
+   // More folders than the link count allows: the rule does not hold here.
+   if($pass===1&&$expected!==null&&$found>$expected)$expected=null;
+   foreach($indices as $i){
+    if($pass===1&&$expected!==null&&$found>=$expected)break;
+    $lst=@lstat($dir.'/'.$names[$i]);
+    if($lst===false){$gone[$i]=true;continue;}
+    $kind=$lst['mode']&0170000;
+    if($kind===0120000){$gone[$i]=true;continue;}
+    if($kind===0040000){$types[$i]='d';$found++;}
+   }
+  }
+  $keptNames=[];$keptTypes='';
+  foreach($names as $i=>$name)if(!isset($gone[$i])){$keptNames[]=$name;$keptTypes.=$types[$i];}
+  return [$keptNames,$keptTypes];
+ }
+
+ /**
+  * Whether a name reads as a file ("IMG_0042.jpg") rather than a folder
+  * ("Album 1", "com.whatsapp", ".thumbnails", "v1.2"). It only orders the work
+  * in readDir(); the link count decides what is skipped.
+  */
+ private static function looksLikeFile(string $name): bool {
+  $dot=strrpos($name,'.');
+  if($dot===false||$dot===0)return false;
+  $ext=substr($name,$dot+1);
+  return $ext!==''&&strlen($ext)<=5&&ctype_alnum($ext)&&!ctype_digit($ext);
+ }
+
+ /** A search result's row, or null if it has gone since the walk saw it. */
+ private function resultRow(string $full): ?array {
+  return file_exists($full)?$this->entry($full):null;
+ }
+
+ /** Whether a stored record is one searchWithIndex() made for this storage root. */
+ private static function recordingFits(?array $index,string $root): bool {
+  return $index!==null&&($index['v']??null)===2&&($index['root']??null)===$root
+   &&is_array($index['dirs']??null)&&is_int($index['bytes']??null);
  }
 
  /** Recursive copy that refuses symlinks, mirroring deleteTree's contract. */

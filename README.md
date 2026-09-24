@@ -12,7 +12,8 @@ For Android/KSWEB video thumbnails, no FFmpeg installation is required; compatib
    `src/`, `database/`, `tools/` and `storage/` outside the web root, which is a
    stronger guarantee than any deny rule. If you must serve the project directory
    itself, Apache's bundled `.htaccess` denies those paths — other servers need
-   the equivalent rules configured by hand.
+   the equivalent rules configured by hand. Copy `vendor/` along with the rest:
+   it is the bundled phpFastCache (see **Caching**), so no Composer run is needed.
 2. Copy `.env.example` to `.env` and change the database credentials.
 3. Create/import the database with `database/schema.sql`, then create the first
    administrator with `php tools/create-admin.php admin` — the schema seeds no
@@ -118,7 +119,7 @@ than connecting, so no MySQL server is required.
 
 ## Required PHP extensions
 
-`pdo`, `pdo_mysql`, `fileinfo`, `json`, `mbstring`; `zip` for multi-file ZIP downloads; `gd` for image thumbnails. OpenSSL is recommended. Remote storage protocols may additionally require `ftp`, `ssh2`, cURL, or an OS SMB client when those adapters are enabled.
+`pdo`, `pdo_mysql`, `fileinfo`, `json`, `mbstring`; `zip` for multi-file ZIP downloads; `gd` for image thumbnails; `apcu` or `redis` only for those cache drivers. OPcache is strongly recommended. OpenSSL is recommended. Remote storage protocols may additionally require `ftp`, `ssh2`, cURL, or an OS SMB client when those adapters are enabled.
 
 ## Migration map
 
@@ -217,9 +218,25 @@ clash.
 
 The search box has two modes. **This folder** filters the listing already on
 screen, so it stays instant. **All folders** calls `GET /api/files/search`,
-which walks the tree below the folder you are in. That walk is bounded twice
-over — by the number of results and by the number of entries examined — and
-says so when it stops early, rather than silently returning a short list.
+which walks the tree below the folder you are in, breadth first, so the
+shallowest matches come first. It examines up to 200,000 entries; results stop
+at `limit` (200 by default, at most 500). Either bound, when reached, is
+reported as `truncated` rather than silently returning a short list.
+
+A walk reads each folder once and classifies its entries from the folder's
+link count: once a folder's subfolders have all been found, the rest are files
+and need no further system call. A 6,000-photo camera folder costs one
+directory read. On a 44,000-file phone storage over the worst-case FUSE mount
+described under **Caching**, the whole tree takes 0.8 s; the old walk took
+10 s and stopped after 20,000 entries, which on that storage meant WhatsApp's
+media was never searched at all.
+
+`budget` (milliseconds, 250–20,000, default 20,000) is how long the server may
+walk before answering with what it has found. The answer then says
+`incomplete: true`, and the same request again carries on where it stopped —
+the web app and the Android app do that, showing results as they grow. Without
+the application cache there is nothing to carry on from, so the walk gets the
+full 20 seconds.
 
 ## Favorites
 
@@ -488,6 +505,91 @@ than the ones actually serving uploads.
 The endpoint is administrator-only and reports directory entry counts, never
 filenames. `?measure=1` writes and reads a probe file, so it is opt-in and `mb`
 is capped; without it the call is cheap.
+
+It also says whether the application cache is on and actually working — by
+writing and reading back a probe entry — and why not, if it is not. A cache
+that has switched itself off only makes things slow, so nothing else would
+ever tell you.
+
+## Caching
+
+Opening a folder and loading Favorites each cost one `stat()` per entry, as
+searching did until its walk was rewritten (see **Moving, copying and
+searching**). On a server disk that is nothing; on Android's FUSE-backed
+shared storage it is most of the response time. CloudHub bundles
+[phpFastCache](https://www.phpfastcache.com) 9.2 in `vendor/` — nothing to
+install on the phone — and uses it for exactly those three answers, and only
+when producing one was slow.
+
+Measured over HTTP on a FUSE mount with the kernel's attribute cache off (the
+worst case), OPcache on; the folder and Favorites rows on a 13,200-file tree,
+the search rows on a 44,000-file tree laid out like a phone's shared storage
+(DCIM, WhatsApp's media under `Android/media`, Download, Music, …):
+
+| | before | after, first request | after, repeated |
+|---|---|---|---|
+| open a 3,200-file folder | 1,375 ms | 1,269 ms | 7 ms |
+| search a 44,000-file phone storage | 10,228 ms, and only 20,000 entries searched | 811 ms, all of it | 230 ms |
+| type "belasting" into that search, 7 queries | 67,291 ms | 2,164 ms | 1,703 ms |
+| Favorites, 500 of them | 449 ms | 536 ms | 5 ms |
+| `/api/storage/me` | 511 ms | — | 3 ms |
+
+On a local disk the same routes take 2–25 ms, nothing is slow enough to be
+kept, and the timings are unchanged — except search, whose new walk covers
+that 44,000-file tree in 33 ms where the old one took 59 ms for 20,000. Without OPcache, loading phpFastCache adds
+about 4 ms to a request that reads an entry — and nothing to one that cannot
+have one.
+
+**What a cached answer is checked against before it is used again:**
+
+| | checked against | can lag by |
+|---|---|---|
+| folder listing | the folder's mtime and ctime, so a file added, removed or renamed — by anyone — misses at once; the cache *generation*, which every request that may change the store retires as it finishes, so anything done through CloudHub shows at once; `CACHE_TTL_SECONDS` | a file another program rewrites in place keeps its old size and time for up to the TTL |
+| search | a record of each folder walked, each re-proven against the disk on every use, so a change costs that folder alone; result rows are always read fresh | nothing: the same answer as uncached |
+| Favorites | the account's stored paths, the generation, the TTL | a favorite deleted by another program is listed for up to the TTL |
+
+A folder's times only vouch for it once they are a few seconds old — a second
+change within the same timestamp tick would not move them — so a folder that
+has only just changed is never cached, and read again by a search every time
+until it settles. Typing into the search box sends one query per pause; from
+the second on, each replays the record, which is shared by searches from every
+folder, and a search that stopped early leaves a record the next one carries
+on from.
+
+The storage ledger's backstop sweep, which re-checks up to 500 recorded files,
+now runs at most every 30 seconds from `/api/storage/me` and upload checks
+rather than on every call; CloudHub's own deletions still leave the ledger at
+once, so this can only keep a file removed behind CloudHub's back counted a
+little longer. The admin dashboard and restores still sweep every time.
+
+| Setting | Default | |
+|---|---|---|
+| `CACHE_DRIVER` | `files` | `files`, `apcu`, `redis`, or `none` to turn it all off — including the sweep throttle, which restores the previous behaviour exactly |
+| `CACHE_PATH` | `storage/.cache/phpfastcache` | where entries, and the generation token, are kept |
+| `CACHE_TTL_SECONDS` | `30` | the lag above; `0` stops caching listings and Favorites |
+| `CACHE_MIN_COMPUTE_MS` | `50` | answers quicker than this are never kept |
+| `CACHE_REDIS_HOST`, `_PORT`, `_PASSWORD`, `_DATABASE` | `127.0.0.1`, `6379`, empty, `0` | only for `redis`; give CloudHub a database of its own |
+
+**Security.** phpFastCache reads entries back with `unserialize()`, so anyone
+who can write into the cache directory can run code as the web server. The
+cache refuses — and the storage report says so — a `CACHE_PATH` inside
+`ROOT_DIR`, where account holders upload, or inside `public/`. The default is
+outside both and, like `vendor/` and `composer.json`/`composer.lock`, denied by
+`.htaccess` and `router.php` in the project-root layout. A custom path must stay
+out of every web root and away from other local accounts. The directory is not
+named after the `Host` header (phpFastCache's default, which lets any client
+make it create directories), never falls back to the shared temp directory,
+and entries are written to a temporary file and renamed into place.
+
+**Failure.** Every cache operation is best effort. A missing `vendor/`, an
+unwritable path, a damaged entry or an unreachable Redis is logged once and
+the request carries on uncached. The generation token and stamps are files, so
+the cache is for a single host.
+
+**Updating phpFastCache:** `composer update phpfastcache/phpfastcache --no-dev
+--prefer-dist`, keep each package's `lib/` or `src/`, its `composer.json` and its
+licence, and commit `vendor/`. `tests/phase46_cache_test.php` checks that
+`vendor/` holds exactly what `composer.lock` pins, and no tests or `.git`.
 
 ## Duplicate finder
 

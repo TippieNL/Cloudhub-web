@@ -19,6 +19,11 @@ return [
  'trash_enabled'=>env_bool('TRASH_ENABLED',true), 'trash_retention_days'=>(int)env('TRASH_RETENTION_DAYS',30),
  'storage_limit_gb'=>(float)env('STORAGE_LIMIT_GB',0), 'user_quota_gb'=>(float)env('USER_QUOTA_GB',0),
  'usage_cache_seconds'=>(int)env('USAGE_CACHE_SECONDS',300),
+ // Application cache; see .env.example and CloudHub\Helpers\Cache.
+ 'cache_driver'=>(string)env('CACHE_DRIVER','files'), 'cache_path'=>(string)env('CACHE_PATH',''),
+ 'cache_ttl_seconds'=>(int)env('CACHE_TTL_SECONDS',30), 'cache_min_compute_ms'=>(int)env('CACHE_MIN_COMPUTE_MS',50),
+ 'cache_redis_host'=>(string)env('CACHE_REDIS_HOST','127.0.0.1'), 'cache_redis_port'=>(int)env('CACHE_REDIS_PORT',6379),
+ 'cache_redis_password'=>(string)env('CACHE_REDIS_PASSWORD',''), 'cache_redis_database'=>(int)env('CACHE_REDIS_DATABASE',0),
  'https_enabled'=>env_bool('HTTPS_ENABLED'), 'require_https'=>env_bool('REQUIRE_HTTPS',false),
  'trust_proxy'=>env_bool('TRUST_PROXY',false), 'hsts_enabled'=>env_bool('HSTS_ENABLED',false), 'hsts_max_age'=>(int)env('HSTS_MAX_AGE',31536000),
  // 0 disables the timeout. The window below then governs how long a session

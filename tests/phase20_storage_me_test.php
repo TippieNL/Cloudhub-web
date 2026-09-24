@@ -83,7 +83,10 @@ $checks['the session lock is released'] = str_contains($handler, 'release_sessio
 
 // Swept exactly as assert_upload_fits() does, so the figure shown is the
 // figure that will refuse an upload.
-$checks['the ledger is swept before reporting'] = str_contains($handler, 'ledger()->sweep($fs)');
+$checks['the ledger is swept before reporting'] = str_contains($handler, 'sweep_ledger_occasionally($fs);')
+    && strpos($handler, 'sweep_ledger_occasionally($fs);') < strpos($handler, 'storage_report($fs, $config)');
+$checks['and by the same helper as an upload'] = (bool)preg_match(
+    '/function assert_upload_fits\(.*?if \(\$quota > 0 && \$user !== null\) \{\s*sweep_ledger_occasionally\(\$fs\);/s', $index);
 $checks['usage is read for the calling account'] =
     str_contains($handler, "ledger()->usage((int)\$user['id'])");
 

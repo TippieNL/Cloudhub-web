@@ -1,0 +1,17 @@
+{
+    "name": "tippienl/cloudhub-web",
+    "description": "CloudHub file server (PHP port)",
+    "type": "project",
+    "license": "proprietary",
+    "require": {
+        "php": ">=8.2",
+        "phpfastcache/phpfastcache": "^9.2"
+    },
+    "config": {
+        "platform": {
+            "php": "8.2.0"
+        },
+        "optimize-autoloader": true,
+        "sort-packages": true
+    }
+}

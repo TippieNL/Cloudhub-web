@@ -1,7 +1,7 @@
 # CloudHub — nginx server block.
 #
 # Point the document root at public/. Everything sensitive — .env, config/,
-# src/, database/, tools/, tests/, logs/ and the storage tree — then sits
+# src/, vendor/, database/, tools/, tests/, logs/ and the storage tree — then sits
 # *outside* the document root and nginx cannot serve it at all, which is a
 # stronger guarantee than any deny rule.
 #
@@ -47,7 +47,8 @@ server {
 # extension, so a shared notes.log or clip.ts would otherwise be refused by
 # the extension rule; /share/... never names a file on disk here.
 # location ~ ^/share/[A-Za-z0-9_-]{20,128}([./]|$) { try_files /dev/null /index.php$is_args$args; }
-# location ~ ^/(?:config|src|views|database|deploy|tests|tools|logs|storage|client|server|shared|script|node_modules|attached_assets)(?:/|$) { deny all; return 404; }
+# location ~ ^/(?:config|src|views|database|deploy|tests|tools|logs|storage|vendor|client|server|shared|script|node_modules|attached_assets)(?:/|$) { deny all; return 404; }
 # location ~ ^/\.env                                                               { deny all; return 404; }
+# location ~ ^/composer\.(?:json|lock)$                                            { deny all; return 404; }
 # location ~* \.(?:env|ini|log|sql|sqlite|bak|old|orig|save|dist|md|ts|tsx)$  { deny all; return 404; }
 # location ~ ^/(?:index|router)\.php$ { }   # the two entry points stay reachable
