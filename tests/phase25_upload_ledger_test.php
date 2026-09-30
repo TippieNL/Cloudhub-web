@@ -142,8 +142,12 @@ $checks['the size limit is still enforced separately'] =
 // --- routes ---------------------------------------------------------------
 
 $index = (string)file_get_contents($root.'/public/index.php');
+// Only once the copy has begun: isset($target) was also true for a copy refused
+// because the name was taken, and charged the file already there to the copier.
 $checks['a partly-failed copy attributes what landed'] =
-    str_contains($index, "if (\$verb === 'copy' && isset(\$target)) {");
+    str_contains($index, "if (\$verb === 'copy' && \$applied) {")
+    && str_contains($index, "\$applied = true;\n            \$apply(\$source, \$target);")
+    && str_contains($index, '$target = null; $applied = false;');
 $checks['the usage cache is written through a temporary file'] =
     str_contains($index, '$cacheTmp = $cache.\'.\'.bin2hex(random_bytes(4)).\'.tmp\';')
     && !str_contains($index, '@file_put_contents($cache, json_encode($report, JSON_UNESCAPED_SLASHES));');

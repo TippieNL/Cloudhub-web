@@ -919,9 +919,12 @@ $relocate = function(callable $apply, string $verb)use($fs, $config): array {
 
     $done = 0; $failed = [];
     foreach ($paths as $rel) {
+        // Reset per item, so a refusal below is judged on this item alone and
+        // never on the previous iteration's target.
+        $target = null; $applied = false;
         try {
             $source = $fs->existing($rel);
-            $target = rtrim($destination, '/').'/'.basename($source);
+            $target = $fs->childPath($destination, basename($source));
 
             // Copying into the same folder is a legitimate way to duplicate
             // something; moving into it is a no-op worth reporting.
@@ -939,6 +942,7 @@ $relocate = function(callable $apply, string $verb)use($fs, $config): array {
             // copying one file a hundred times stepped past any quota and
             // could fill the disk.
             if ($verb === 'copy') assert_upload_fits($fs, $config, (int)($fs->measure($source)['bytes'] ?? 0));
+            $applied = true;
             $apply($source, $target);
             // A move carries its attribution with it. A copy creates new bytes,
             // so it is charged to whoever made it -- otherwise a quota is
@@ -960,7 +964,11 @@ $relocate = function(callable $apply, string $verb)use($fs, $config): array {
             // and stopped counting against anyone's quota; repeated failures
             // accumulated untracked storage. Charge whatever actually landed
             // -- deleting it instead would destroy data on a partial failure.
-            if ($verb === 'copy' && isset($target)) {
+            // Only once the copy had begun: a copy refused before it -- the
+            // name is taken, the quota is full -- wrote nothing, and $target
+            // then names somebody else's file, which this used to charge to
+            // the copier, taking it off its real uploader's account.
+            if ($verb === 'copy' && $applied) {
                 foreach ($fs->copiedFiles($target) as $copied) {
                     ledger()->record($fs->relative($copied), basename($copied),
                         (int)(filesize($copied)?:0), null, Auth::user()['id'] ?? null);
@@ -1424,7 +1432,7 @@ if ($path === '/api/files/upload' && $method === 'POST') api_try(function()use($
             if (!is_uploaded_file((string)($tmp[$i]??''))) throw new RuntimeException('Invalid upload data received for '.$safe, 400);
             $size = (int)($sizes[$i]??0);
             assert_upload_fits($fs, $config, $size);
-            $dest = $target.'/'.$safe;
+            $dest = $fs->childPath($target, $safe);
             if (file_exists($dest)) {
                 if ($conflict === 'reject' || ($conflict === 'overwrite' && (!$config['allow_overwrite'] || is_dir($dest)))) {
                     throw new RuntimeException('File already exists: '.$safe, 409);

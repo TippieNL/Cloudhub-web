@@ -100,6 +100,9 @@ final class UploadService
         $safeName = $this->files->safeName($name);
         $targetDir = $this->files->existing($targetPath);
         if (!is_dir($targetDir)) throw new RuntimeException('Upload target is not a directory', 400);
+        // Refused before a byte is staged; complete() checks again, as the
+        // authoritative place the file actually lands.
+        $this->files->childPath($targetDir, $safeName);
 
         $id = preg_replace('/[^a-zA-Z0-9_-]/', '', $clientId);
         if ($id === '') $id = bin2hex(random_bytes(16));
@@ -339,7 +342,7 @@ final class UploadService
         if ($actual !== (int)$meta['size']) throw new RuntimeException('Upload is incomplete: '.$actual.' of '.$meta['size'].' bytes received', 409);
 
         $targetDir = $this->files->existing((string)$meta['targetPath']);
-        $dest = $targetDir.'/'.$meta['name'];
+        $dest = $this->files->childPath($targetDir, (string)$meta['name']);
         $policy = $this->normaliseConflict((string)$meta['conflict']);
 
         if (file_exists($dest)) {

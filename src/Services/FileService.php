@@ -94,6 +94,24 @@ final class FileService {
   return rtrim($realParent,'/').'/'.basename($candidate);
  }
 
+ /**
+  * The path of a new item called $name inside the existing directory $dir.
+  *
+  * sanitize() keeps CloudHub's own names off every path a client asks for,
+  * but uploads, moves and copies build their target from a folder and a name
+  * instead, and nothing checked the name. A file called ".trash" uploaded to
+  * the root before anything had been deleted made every later delete fail for
+  * everyone; a folder called ".thumbnails" moved there vanished from listings,
+  * search, the storage report and the quota, beyond reach of any route; and a
+  * crafted ".trash" folder became the trash, whose bookkeeping a restore
+  * believes. Every target built that way comes through here.
+  */
+ public function childPath(string $dir,string $name): string {
+  $dir=rtrim(str_replace('\\','/',$dir),'/');
+  if($dir===$this->root&&self::isReservedRootName($name))throw new RuntimeException('That name is reserved',403);
+  return $dir.'/'.$name;
+ }
+
  public function relative(string $full): string {
   $full=str_replace('\\','/',$full);$this->assertContained($full);
   $rel=substr($full,strlen($this->root));return $rel===''?'/':$rel;

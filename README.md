@@ -304,7 +304,12 @@ The trash lives at `.trash` inside the storage root, so moving a file into it
 is always a same-filesystem rename — instant, and impossible to half-finish.
 That directory is reserved: it is never listed, never searched, and cannot be
 addressed through any file route, so the trash cannot be browsed or emptied
-except through `/api/trash`. Listing the trash needs only read access;
+except through `/api/trash`. The same goes for `.uploads` and `.thumbnails`,
+and no upload, move or copy can create any of the three at the root either
+(`403 That name is reserved`): a file uploaded as `.trash` before anything had
+been deleted used to take the trash's place and make every later delete fail,
+and a folder moved in as `.thumbnails` vanished from every listing and quota.
+Bulk ZIP downloads leave them out too. Listing the trash needs only read access;
 restoring and purging need write access, like any other change to the store.
 
 ## Accounts and roles
