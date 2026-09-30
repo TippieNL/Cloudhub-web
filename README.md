@@ -21,6 +21,13 @@ For Android/KSWEB video thumbnails, no FFmpeg installation is required; compatib
 4. Ensure the PHP/web-server user can read/write `storage/` and `storage/.thumbnails/`.
 5. Large uploads use the resumable chunk API, so `upload_max_filesize` and `post_max_size` only need to exceed `UPLOAD_CHUNK_MB` (8 MB by default). A practical PHP configuration is `upload_max_filesize=16M` and `post_max_size=20M`. The application-level per-file limit defaults to 5 GB.
 6. Development: `php -S 127.0.0.1:8000 -t public`.
+7. Background tasks (large copies, archives, extraction, deleting large folders,
+   thumbnails, duplicate scans, checksums): run `php tools/worker.php` as the
+   web server's user, under whatever keeps processes alive (see **Background
+   tasks**). Without it the web server runs queued tasks itself.
+
+An existing database gets the `jobs` table from `php database/migrate.php`,
+which only adds what is missing.
 
 ## Public share links
 
@@ -666,6 +673,13 @@ one request on a phone:
 3. `GET /api/duplicates/scan` returns the last result without doing any work.
 4. `DELETE /api/duplicates/scan` discards the saved scan state.
 
+The web app no longer drives this loop: it queues a `duplicates` background
+task (see **Background tasks**), which runs the same scan to the end on the
+server and finishes with the browser closed; the page reads its progress with
+`GET`. While such a task is queued or running, `POST` and `DELETE` answer
+**409**, because the scan state is one per installation and two drivers would
+overwrite each other's progress.
+
 Each slice runs for `DUPLICATE_SCAN_SECONDS` and returns:
 
 ```json
@@ -738,6 +752,158 @@ DUPLICATE_MAX_FILES=50000
 Files below `DUPLICATE_MIN_BYTES` are skipped: every empty file is identical to
 every other one, which would otherwise produce a single enormous and useless
 group.
+
+
+## Background tasks
+
+Long file operations run on the server as tasks, so nothing depends on a
+browser request staying open. The Tasks page lists them with status, progress,
+the item being worked on, times, errors and results, and offers Cancel, Retry,
+Remove and Download; the header shows how many are running.
+
+| Task         | Started from                                                  | Needs   |
+|--------------|---------------------------------------------------------------|---------|
+| `copy`       | Copy to… on a large selection (the copy route decides)         | editor  |
+| `archive`    | Download as ZIP, or a large Download selected (`download`)     | viewer  |
+| `archive`    | Compress to ZIP (`save`: the ZIP is placed in the store)       | editor  |
+| `extract`    | Extract here on a `.zip`                                       | editor  |
+| `purge`      | Emptying a large trash; deleting a large folder with the trash off | editor |
+| `thumbnails` | Make thumbnails on a folder                                    | editor  |
+| `duplicates` | Scan on the Duplicates page                                    | editor  |
+| `checksum`   | Checksum (SHA-256) on a file                                   | viewer  |
+
+Small operations stay synchronous. The copy, delete and trash-purge routes only
+queue when the client sends `"background": "auto"` *and* the work is larger than
+`QUEUE_SYNC_MAX_FILES` / `QUEUE_SYNC_MAX_MB` (or `"background": true`). The
+Android app and scripts send neither, so for them nothing changed. Moving is a
+rename and never needs a task.
+
+### Running tasks
+
+`php tools/worker.php` claims and runs tasks until it is stopped. Run it as the
+**same user as the web server**, so the files it writes are ones the web server
+can read and delete, and restart it after changing `.env`: a running worker
+keeps the configuration it started with.
+
+```sh
+php tools/worker.php            # keep running
+php tools/worker.php --once     # run what is queued, then exit (e.g. from cron every minute)
+php tools/worker.php --status   # counts per status, and the workers alive
+```
+
+A systemd unit is enough to keep it alive:
+
+```ini
+[Service]
+User=www-data
+WorkingDirectory=/var/www/cloudhub
+ExecStart=/usr/bin/php tools/worker.php --max-seconds=3600
+Restart=always
+```
+
+Several workers may run at once, on one machine or several sharing the
+database. `SIGTERM`/Ctrl+C lets the task in hand reach its next checkpoint and
+go back to the queue; nothing is lost.
+
+With **no worker running** (KSWEB may have no PHP command line), the web server
+runs queued tasks itself: the page sends `POST /api/jobs/run`, which answers at
+once and then works through the queue in that PHP process
+(`QUEUE_RUNNER=auto`). Under PHP-FPM the connection is released before the
+work starts; under other servers the answer carries its length and
+`Connection: close`, and either way the task carries on if the browser goes
+away. Such a runner is still subject to the web server's own limits — PHP-FPM's
+`request_terminate_timeout`, for one — which a worker is not; a task cut off
+that way is recovered like any other. PHP's built-in development server only
+runs tasks this way when started with `PHP_CLI_SERVER_WORKERS` ≥ 2, as it
+otherwise answers one request at a time.
+
+### What keeps it correct
+
+- **Claiming** is a compare-and-set on the row, so two workers never run one
+  task, and everything a worker writes afterwards names its claim token: a
+  worker that stalled long enough to lose its task cannot overwrite the new
+  owner's progress or verdict.
+- **Recovery.** A task whose worker has died on this machine (its process is
+  gone) goes back to the queue within about ten seconds; one whose heartbeat has
+  been silent for `QUEUE_STALE_SECONDS` goes back from anywhere. After
+  `QUEUE_MAX_ATTEMPTS` it fails with a message instead of crashing workers in a
+  loop.
+- **Nothing half-done is ever visible.** Copies, extractions and saved archives
+  are built in `ROOT_DIR/.jobs/<task>/attempt-<n>/` and moved into place with
+  one `rename()`. A cancel, a failure or a killed worker leaves nothing in the
+  store; the staging is removed. A copy remembers which items it has placed, so
+  a retry or the next attempt after a crash only copies the rest.
+- **Deleting for good** moves the items into the task's folder first — instant,
+  and the items are out of every listing, search and restore — and the task
+  deletes them afterwards. Such a task cannot be cancelled.
+- **Ownership and roles are checked twice**: when a task is queued and again
+  when it runs. An account demoted, disabled or deleted in between gets a failed
+  task, not the write. Store-changing tasks are refused while `READ_ONLY` is on.
+
+### Security
+
+- Task routes need a session and, except `GET`, the CSRF token. Each task type
+  declares the role it needs; checksums and archives to download are reads,
+  everything else is a write.
+- Every route is scoped to the caller's own tasks. A task id is 32 hex
+  characters or it names nothing, and someone else's task answers **404**,
+  never 403, so ids cannot be probed.
+- Only registered task types can be queued, and `purge` only by the routes that
+  prepare it. Parameters are validated into canonical paths through the same
+  `FileService` checks every route uses — traversal, absolute paths, symlinks
+  and CloudHub's own folders are refused — and resolved again when the task
+  runs. No shell command is ever run; archives use `ZipArchive`.
+- **Extraction** refuses the whole archive if any entry has an absolute path, a
+  drive letter, a `..` component, a control character or a name that is not
+  UTF-8, or is encrypted. Symbolic links, devices and pipes are skipped. The
+  declared size must fit `QUEUE_EXTRACT_MAX_FILES`, `QUEUE_EXTRACT_MAX_GB`, the
+  quota and the free disk, and an entry that produces more bytes than it
+  declares stops the extraction.
+- An account may have `QUEUE_MAX_ACTIVE_PER_USER` tasks queued or running, and
+  three archives waiting to be downloaded.
+- `.jobs` is reserved at the storage root like `.trash` and `.uploads`. A folder
+  called `.jobs` that already exists there is hidden from then on — rename it
+  before upgrading.
+
+### API
+
+```
+GET    /api/jobs                  this account's tasks; ?active=1 for unfinished only
+POST   /api/jobs                  {"type": "checksum", "params": {"paths": ["/a.iso"]}}
+GET    /api/jobs/{id}             one task
+POST   /api/jobs/{id}/cancel      at once if queued; at its next checkpoint if running
+POST   /api/jobs/{id}/retry       a failed or cancelled task; a copy carries on
+DELETE /api/jobs/{id}             forget a finished task, and its download
+GET    /api/jobs/{id}/download    a finished archive (Range supported)
+POST   /api/jobs/clear            forget every finished task
+POST   /api/jobs/run              run queued tasks here when no worker does
+```
+
+`GET /api/jobs` also reports `runner`: `cli` when a worker is running,
+`inline` when the web server will run tasks, `none` when they wait for a
+worker. A task never shows its claim, its worker, its stored parameters or its
+saved state.
+
+### Relevant environment settings
+
+```ini
+QUEUE_RUNNER=auto              # auto | worker | inline
+QUEUE_RETENTION_HOURS=24       # finished tasks and their downloads are then removed
+QUEUE_MAX_ACTIVE_PER_USER=10
+QUEUE_STALE_SECONDS=120
+QUEUE_MAX_ATTEMPTS=3
+QUEUE_SYNC_MAX_FILES=200       # "background": "auto" queues above these
+QUEUE_SYNC_MAX_MB=256
+QUEUE_EXTRACT_MAX_FILES=20000
+QUEUE_EXTRACT_MAX_GB=20
+```
+
+### Adding a task type
+
+Write a class implementing `CloudHub\Services\Jobs\JobType` (extending
+`BaseJobType` gives safe defaults and the path checks), register it in
+`JobTypes::standard()`, and call `$ctx->checkpoint()` between files and chunks.
+The queue, the worker, the API and the Tasks page need nothing else.
 
 
 ## Resumable large-file uploads
