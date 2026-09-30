@@ -117,17 +117,26 @@ $assets = htmlspecialchars($assetBase, ENT_QUOTES, 'UTF-8');
     <link rel="modulepreload" href="<?= $assets ?>/assets/js/player/Overlay.js">
     <link rel="modulepreload" href="<?= $assets ?>/assets/js/player/VTTParser.js">
     <script type="module" nonce="<?= $nonce ?>" src="<?= $assets ?>/assets/js/player/PlayerUI.js"></script>
+    <?php
+    /*
+     * JSON_HEX_TAG and _AMP: the file name below is whatever the uploader
+     * chose, and inside <script> the HTML parser reads it before JavaScript
+     * does -- a name containing "<!--<script>" swallowed the rest of the page
+     * into this block and broke the player. Escaped, "<" cannot mean anything
+     * to the parser.
+     */
+    ?>
     <script nonce="<?= $nonce ?>">
-        window.CLOUDHUB_BASE = <?= json_encode($basePath, JSON_UNESCAPED_SLASHES) ?>;
-        window.CLOUDHUB_FRONT = <?= json_encode($frontController, JSON_UNESCAPED_SLASHES) ?>;
-        window.CLOUDHUB_ROUTE = <?= json_encode($path, JSON_UNESCAPED_SLASHES) ?>;
+        window.CLOUDHUB_BASE = <?= json_encode($basePath, JSON_UNESCAPED_SLASHES|JSON_HEX_TAG|JSON_HEX_AMP) ?>;
+        window.CLOUDHUB_FRONT = <?= json_encode($frontController, JSON_UNESCAPED_SLASHES|JSON_HEX_TAG|JSON_HEX_AMP) ?>;
+        window.CLOUDHUB_ROUTE = <?= json_encode($path, JSON_UNESCAPED_SLASHES|JSON_HEX_TAG|JSON_HEX_AMP) ?>;
         <?php /* So a failure can name the codec and offer a way out of it. */ ?>
         window.CLOUDHUB_MEDIA = <?= json_encode([
             'codec' => $mediaFile['codec'] ?? null,
             'codecWidelySupported' => $mediaFile['codecWidelySupported'] ?? null,
             'downloadUrl' => $mediaFile['download_url'] ?? null,
             'name' => $mediaFile['name'] ?? null,
-        ], JSON_UNESCAPED_SLASHES) ?>;
+        ], JSON_UNESCAPED_SLASHES|JSON_HEX_TAG|JSON_HEX_AMP) ?>;
     </script>
 </body>
 </html>

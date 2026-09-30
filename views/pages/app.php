@@ -334,9 +334,9 @@ $uploadSizeHelp = $maxUploadMb >= 1024
     <div id="toast"></div>
 
     <script nonce="<?= htmlspecialchars(\CloudHub\Services\Security::cspNonce(), ENT_QUOTES) ?>">
-        window.CLOUDHUB_BASE = <?= json_encode($basePath, JSON_UNESCAPED_SLASHES) ?>;
-        window.CLOUDHUB_FRONT = <?= json_encode($frontController, JSON_UNESCAPED_SLASHES) ?>;
-        window.CLOUDHUB_ROUTE = <?= json_encode($path, JSON_UNESCAPED_SLASHES) ?>;
+        window.CLOUDHUB_BASE = <?= json_encode($basePath, JSON_UNESCAPED_SLASHES|JSON_HEX_TAG|JSON_HEX_AMP) ?>;
+        window.CLOUDHUB_FRONT = <?= json_encode($frontController, JSON_UNESCAPED_SLASHES|JSON_HEX_TAG|JSON_HEX_AMP) ?>;
+        window.CLOUDHUB_ROUTE = <?= json_encode($path, JSON_UNESCAPED_SLASHES|JSON_HEX_TAG|JSON_HEX_AMP) ?>;
         window.CLOUDHUB_SHARE_EXPIRY_HOURS = <?= (int)$config['share_expiry_hours'] ?>;
         window.CLOUDHUB_UPLOAD_LIMITS = <?= json_encode([
             'maxFiles' => $config['max_upload_files'],
@@ -344,7 +344,7 @@ $uploadSizeHelp = $maxUploadMb >= 1024
             'chunkMb' => $config['upload_chunk_mb'],
             'retryCount' => $config['upload_retry_count'],
             'conflict' => $config['upload_conflict']
-        ], JSON_UNESCAPED_SLASHES) ?>;
+        ], JSON_UNESCAPED_SLASHES|JSON_HEX_TAG|JSON_HEX_AMP) ?>;
     </script>
     <script src="<?= htmlspecialchars($assetBase, ENT_QUOTES) ?>/assets/js/app.js?v=<?= (int)@filemtime(dirname(__DIR__, 2).'/public/assets/js/app.js') ?>"></script>
 </body>
