@@ -9,6 +9,7 @@ use CloudHub\Repositories\ServerRepository;
 use CloudHub\Repositories\UserRepository;
 use CloudHub\Repositories\StorageLedger;
 use CloudHub\Repositories\FavoriteRepository;
+use CloudHub\Repositories\ShareLinkRepository;
 use CloudHub\Services\Auth;
 use CloudHub\Services\UploadService;
 use CloudHub\Services\Security;
@@ -631,15 +632,15 @@ function share_resolve(FileService $fs, string $token): array {
  * anyone holding the old link -- a file nobody chose to share -- while
  * renaming or moving a shared file silently broke its link.
  *
- * mb_strlen() for the prefix because MySQL's SUBSTR() counts characters on a
- * utf8mb4 column. Failures are logged rather than thrown: the file operation
- * has already happened and must still report its own outcome.
+ * Paths are compared byte for byte (see ShareLinkRepository): the column's
+ * collation calls "/Report.pdf" and "/report.pdf" one path, and renaming one
+ * used to hand the other's public link to the renamed file. Failures are
+ * logged rather than thrown: the file operation has already happened and must
+ * still report its own outcome.
  */
 function shares_forget(string $relative): void {
     try {
-        $prefix = rtrim($relative, '/').'/';
-        $stmt = db()->prepare('DELETE FROM share_links WHERE file_path = ? OR SUBSTR(file_path, 1, ?) = ?');
-        $stmt->execute([$relative, mb_strlen($prefix), $prefix]);
+        (new ShareLinkRepository(db()))->forget($relative);
     } catch (Throwable $e) {
         error_log('['.Http::requestId().'] share cleanup failed: '.$e->getMessage());
     }
@@ -647,15 +648,7 @@ function shares_forget(string $relative): void {
 
 function shares_relocate(string $from, string $to): void {
     try {
-        $pdo = db();
-        $pdo->prepare('UPDATE share_links SET file_path = ? WHERE file_path = ?')->execute([$to, $from]);
-        $prefix = rtrim($from, '/').'/';
-        $rows = $pdo->prepare('SELECT token, file_path FROM share_links WHERE SUBSTR(file_path, 1, ?) = ?');
-        $rows->execute([mb_strlen($prefix), $prefix]);
-        $update = $pdo->prepare('UPDATE share_links SET file_path = ? WHERE token = ?');
-        foreach ($rows->fetchAll(PDO::FETCH_ASSOC) ?: [] as $row) {
-            $update->execute([rtrim($to, '/').'/'.substr((string)$row['file_path'], strlen($prefix)), (string)$row['token']]);
-        }
+        (new ShareLinkRepository(db()))->relocate($from, $to);
     } catch (Throwable $e) {
         error_log('['.Http::requestId().'] share relocation failed: '.$e->getMessage());
     }
@@ -1578,11 +1571,17 @@ if ($path === '/api/files/upload' && $method === 'POST') api_try(function()use($
          */
         $wantPermanent = $hours <= 0;
         $s = $pdo->prepare($wantPermanent
-            ? 'SELECT token,expires_at FROM share_links WHERE file_path=? AND expires_at IS NULL LIMIT 1'
-            : 'SELECT token,expires_at FROM share_links WHERE file_path=? AND expires_at IS NOT NULL'
-                .' AND expires_at>UTC_TIMESTAMP() AND ABS(TIMESTAMPDIFF(SECOND, expires_at, ?))<=60 LIMIT 1');
+            ? 'SELECT token,file_path,expires_at FROM share_links WHERE file_path=? AND expires_at IS NULL'
+            : 'SELECT token,file_path,expires_at FROM share_links WHERE file_path=? AND expires_at IS NOT NULL'
+                .' AND expires_at>UTC_TIMESTAMP() AND ABS(TIMESTAMPDIFF(SECOND, expires_at, ?))<=60');
         $s->execute($wantPermanent ? [$rel] : [$rel, gmdate('Y-m-d H:i:s', time()+$hours*3600)]);
-        $r = $s->fetch(PDO::FETCH_ASSOC);
+        // file_path compares ignoring case and accents, so "/cafe.jpg" found
+        // the live link of "/café.jpg" and handed it out as this file's. Only
+        // a byte-for-byte match is this file's link; see ShareLinkRepository.
+        $r = null;
+        foreach ($s->fetchAll(PDO::FETCH_ASSOC) ?: [] as $candidate) {
+            if ((string)$candidate['file_path'] === $rel) { $r = $candidate; break; }
+        }
 
         if (!$r) {
             $token = rtrim(strtr(base64_encode(random_bytes(32)), '+/', '-_'), '=');

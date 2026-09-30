@@ -93,15 +93,43 @@ final class StorageLedger
     /** The delete itself, which reports failure so a caller in a transaction can abort. */
     private function deleteRows(string $path): void
     {
+        $ids = array_column($this->matching($path), 'id');
+        // Every element is an int from matching(), so nothing else can reach the statement.
+        if ($ids) $this->db->exec('DELETE FROM file_metadata WHERE id IN ('.implode(',', array_map('intval', $ids)).')');
+    }
+
+    /**
+     * Rows at a path or beneath it, compared byte for byte.
+     *
+     * The column's collation ignores case, accents and trailing spaces, so a
+     * bare `file_path = ?` took "/Photos" and "/café.jpg" for "/photos" and
+     * "/cafe.jpg": uploading cafe.jpg dropped the row of café.jpg, which then
+     * counted against nobody, and moving /photos dragged /Photos's rows along.
+     * SQL narrows, PHP decides -- FavoriteRepository::matching() does the same.
+     *
+     * mb_strlen, not strlen, for SQL: the column is utf8mb4 and MySQL's
+     * SUBSTR() counts characters, so a byte length overshoots for any
+     * non-ASCII name. "/Fotos N/" is 10 bytes but 9 characters, so the
+     * comparison took "/Fotos N/a" and matched nothing -- every row beneath an
+     * accented, CJK or emoji folder survived its deletion and kept counting
+     * against the owner's quota. str_starts_with() in PHP, which compares bytes.
+     *
+     * @return list<array{id:int,path:string,row:array}>
+     */
+    private function matching(string $path): array
+    {
         $prefix = rtrim($path, '/').'/';
-        // mb_strlen, not strlen: the column is utf8mb4 and MySQL's SUBSTR()
-        // counts characters, so a byte length overshoots for any non-ASCII
-        // name. "/Fotos N/" is 10 bytes but 9 characters, so the comparison
-        // took "/Fotos N/a" and matched nothing -- every row beneath an
-        // accented, CJK or emoji folder survived its deletion and kept
-        // counting against the owner's quota.
-        $stmt = $this->db->prepare('DELETE FROM file_metadata WHERE file_path = ? OR SUBSTR(file_path, 1, ?) = ?');
+        $stmt = $this->db->prepare(
+            'SELECT id, file_path, original_name, size, mime_type, uploaded_by FROM file_metadata
+             WHERE file_path = ? OR SUBSTR(file_path, 1, ?) = ?');
         $stmt->execute([$path, mb_strlen($prefix), $prefix]);
+        $rows = [];
+        foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) ?: [] as $r) {
+            $p = (string)$r['file_path'];
+            if ($p !== $path && !str_starts_with($p, $prefix)) continue;
+            $rows[] = ['id' => (int)$r['id'], 'path' => $p, 'row' => $r];
+        }
+        return $rows;
     }
 
     /**
@@ -123,23 +151,15 @@ final class StorageLedger
             // descendants renamed and the rest pointing at a folder that no
             // longer exists.
             $this->transactionally(function() use ($from, $to): void {
-            $stmt = $this->db->prepare('UPDATE file_metadata SET file_path = ? WHERE file_path = ?');
-            $stmt->execute([$to, $from]);
-
+            // matching() compares bytes, so /Photos is not carried along with
+            // /photos. strlen for PHP's substr(), which counts bytes; the query
+            // inside matching() uses mb_strlen for MySQL's SUBSTR(), which
+            // counts characters -- each length has to match its function.
             $prefix = rtrim($from, '/').'/';
-            // mb_strlen for SQL, strlen for PHP: MySQL's SUBSTR() counts
-            // characters on a utf8mb4 column while PHP's substr() counts
-            // bytes, so the two lengths are genuinely different numbers and
-            // each has to match the function it is passed to. Using the byte
-            // length in the query left every descendant of an accented, CJK
-            // or emoji folder pointing at the old path after a move.
-            $stmt = $this->db->prepare('SELECT id, file_path FROM file_metadata WHERE SUBSTR(file_path, 1, ?) = ?');
-            $stmt->execute([mb_strlen($prefix), $prefix]);
-            $rows = $stmt->fetchAll(PDO::FETCH_ASSOC) ?: [];
-
             $update = $this->db->prepare('UPDATE file_metadata SET file_path = ? WHERE id = ?');
-            foreach ($rows as $row) {
-                $update->execute([rtrim($to, '/').'/'.substr((string)$row['file_path'], strlen($prefix)), (int)$row['id']]);
+            foreach ($this->matching($from) as $row) {
+                $moved = $row['path'] === $from ? $to : rtrim($to, '/').'/'.substr($row['path'], strlen($prefix));
+                $update->execute([$moved, $row['id']]);
             }
             });
         } catch (Throwable $e) {
@@ -160,18 +180,13 @@ final class StorageLedger
     public function rowsUnder(string $path): array
     {
         try {
-            $prefix = rtrim($path, '/').'/';
-            $stmt = $this->db->prepare(
-                'SELECT file_path, original_name, size, mime_type, uploaded_by FROM file_metadata
-                 WHERE file_path = ? OR SUBSTR(file_path, 1, ?) = ?');
-            $stmt->execute([$path, mb_strlen($prefix), $prefix]);
-            return array_map(static fn(array $r): array => [
-                'path' => (string)$r['file_path'],
-                'name' => (string)$r['original_name'],
-                'size' => (int)$r['size'],
-                'mime' => $r['mime_type'] === null ? null : (string)$r['mime_type'],
-                'userId' => $r['uploaded_by'] === null ? null : (int)$r['uploaded_by'],
-            ], $stmt->fetchAll(PDO::FETCH_ASSOC) ?: []);
+            return array_map(static fn(array $m): array => [
+                'path' => $m['path'],
+                'name' => (string)$m['row']['original_name'],
+                'size' => (int)$m['row']['size'],
+                'mime' => $m['row']['mime_type'] === null ? null : (string)$m['row']['mime_type'],
+                'userId' => $m['row']['uploaded_by'] === null ? null : (int)$m['row']['uploaded_by'],
+            ], $this->matching($path));
         } catch (Throwable $e) {
             error_log('[ledger] rowsUnder failed: '.$e->getMessage());
             return [];

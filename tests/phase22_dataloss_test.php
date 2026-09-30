@@ -109,11 +109,13 @@ $checks['the character length matches the child rows'] =
 $ledgerSrc = (string)file_get_contents(dirname(__DIR__).'/src/Repositories/StorageLedger.php');
 $checks['forget() passes a character length to SQL'] =
     str_contains($ledgerSrc, '$stmt->execute([$path, mb_strlen($prefix), $prefix]);');
+// relocate() and rowsUnder() find their rows through the same matching()
+// query that forget() uses, so the character length above covers all three.
 $checks['relocate() passes a character length to SQL'] =
-    str_contains($ledgerSrc, '$stmt->execute([mb_strlen($prefix), $prefix]);');
+    str_contains($ledgerSrc, 'foreach ($this->matching($from) as $row) {');
 // PHP's substr() is byte-based, so the rewrite below it must keep strlen().
 $checks['the PHP-side substring still uses a byte length'] =
-    str_contains($ledgerSrc, "substr((string)\$row['file_path'], strlen(\$prefix))");
+    str_contains($ledgerSrc, "substr(\$row['path'], strlen(\$prefix))");
 
 // --- sweep() advances instead of re-reading the same rows ----------------
 //

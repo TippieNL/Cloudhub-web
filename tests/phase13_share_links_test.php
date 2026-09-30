@@ -96,8 +96,13 @@ $checks['moving or renaming a file carries its links'] =
     && str_contains($index, 'shares_relocate($fs->relative($source), $fs->relative($target));');
 // MySQL's SUBSTR() counts characters on utf8mb4, so a byte length would miss
 // every link beneath an accented or emoji folder.
+// The bookkeeping lives in ShareLinkRepository, which both helpers delegate to;
+// phase47 exercises it against a case-insensitive column.
+$shareRepo = (string)file_get_contents($root.'/src/Repositories/ShareLinkRepository.php');
 $checks['link cleanup is prefix-matched by characters'] =
-    substr_count($index, 'mb_strlen($prefix), $prefix]);') >= 2;
+    str_contains($shareRepo, '$stmt->execute([$path, mb_strlen($prefix), $prefix]);')
+    && str_contains($index, '(new ShareLinkRepository(db()))->forget($relative);')
+    && str_contains($index, '(new ShareLinkRepository(db()))->relocate($from, $to);');
 
 $bad = false;
 foreach ($checks as $name => $ok) {

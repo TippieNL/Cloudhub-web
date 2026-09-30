@@ -51,6 +51,14 @@ file later saved under the same name is never served to someone holding an old
 link; moving or renaming the file, or a folder above it, carries its links
 along.
 
+Paths are matched byte for byte. MySQL compares `file_path` ignoring case,
+accents and trailing spaces, so `/Report.pdf` and `/report.pdf`, or
+`/café.jpg` and `/cafe.jpg`, were one path to it: renaming one moved the
+other's public link onto it — its holder was then served a file nobody had
+shared — and sharing `/cafe.jpg` handed out `/café.jpg`'s live link. The same
+rule now governs the upload ledger, where the collation moved or dropped quota
+rows belonging to the lookalike.
+
 A share URL ends in the file's extension, so `.htaccess`, `router.php` and
 `deploy/nginx-security.conf.example` route `/share/` before any deny rule: a
 shared `notes.log`, `dump.sql` or MPEG-TS `clip.ts` used to be refused with a
