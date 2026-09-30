@@ -362,8 +362,10 @@ nor counted in the number it holds. Bounding the walk was rejected — a
 dashboard that stops counting early reports a number that is simply wrong.
 
 Two optional limits, both `0` (unlimited) by default, checked on every way
-bytes arrive — `POST /api/uploads/init` before a single byte is staged, and
-likewise a copy, a WebDAV `PUT` and the legacy multipart upload:
+bytes arrive — `POST /api/uploads/init` before a single byte is staged and
+again at `POST /api/uploads/complete` (bytes still being staged count against
+nobody, so uploads started side by side each passed the first check and all
+landed), and likewise a copy, a WebDAV `PUT` and the legacy multipart upload:
 
 | Setting | Caps |
 |---|---|

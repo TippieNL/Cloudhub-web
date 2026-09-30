@@ -305,6 +305,11 @@ function flag_video_thumbnail(array $entry, string $root): array {
 
 const THUMBNAIL_VIDEO_EXTENSIONS = ['mp4', 'webm', 'ogv', 'ogg', 'mov', 'm4v', 'avi', 'mkv', 'mpeg', 'mpg', '3gp', '3g2', 'ts', 'm2ts', 'mts'];
 const THUMBNAIL_IMAGE_EXTENSIONS = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp'];
+/** Already-compressed formats, which a ZIP stores rather than deflates again. */
+const ZIP_STORED_EXTENSIONS = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'avif', 'heic', 'heif',
+    'mp4', 'm4v', 'mov', 'mkv', 'webm', 'avi', '3gp', '3g2', 'mpeg', 'mpg', 'ogv',
+    'mp3', 'm4a', 'aac', 'ogg', 'oga', 'opus', 'flac',
+    'zip', 'gz', 'tgz', 'bz2', 'xz', '7z', 'rar', 'docx', 'xlsx', 'pptx', 'odt', 'ods', 'odp', 'epub'];
 
 /**
  * The most pixels a thumbnail will decode.
@@ -705,8 +710,44 @@ function share_media_kind(string $file): string {
     return 'other';
 }
 
+/**
+ * A storage server as an administrator sees it: credentials masked.
+ *
+ * Masked by what a key looks like rather than by a list of three names, which
+ * left the HTTP adapter's `headers` -- where an API's bearer token lives -- and
+ * an SFTP `passphrase` in the clear. PUT puts a masked value back unchanged.
+ */
 function mask_server(array $s): array {
-    foreach (['password', 'privateKey', 'apiKey'] as $k)if (!empty($s['config'][$k]))$s['config'][$k] = '••••••••'; return $s;
+    foreach (is_array($s['config'] ?? null) ? $s['config'] : [] as $k => $v) {
+        if (!empty($v) && preg_match('/pass|secret|token|key|auth|header|credential|cookie/i', (string)$k)) $s['config'][$k] = '••••••••';
+    }
+    return $s;
+}
+
+/**
+ * A storage server as any signed-in account may see it.
+ *
+ * /api/servers/active is readable by viewers, and the page that asks shows a
+ * name and a type. It used to return each server's whole configuration --
+ * hosts, accounts, paths and custom request headers -- to every account.
+ */
+function public_server(array $s): array {
+    return ['id' => $s['id'], 'name' => $s['name'], 'type' => $s['type'], 'isActive' => $s['isActive'], 'isDefault' => $s['isDefault']];
+}
+
+/** The fields a server may be created or updated with, validated. */
+function server_input(array $b, bool $partial): array {
+    $types = ['local', 'ftp', 'sftp', 'smb', 'http_api'];
+    if (!$partial || array_key_exists('name', $b)) {
+        if (!is_string($b['name'] ?? null) || trim($b['name']) === '' || mb_strlen($b['name']) > 190) Http::error(422, 'VALIDATION_FAILED', 'name must be a string of 1 to 190 characters');
+    }
+    if (!$partial || array_key_exists('type', $b)) {
+        if (!in_array($b['type'] ?? null, $types, true)) Http::error(422, 'VALIDATION_FAILED', 'type must be one of '.implode(', ', $types));
+    }
+    if (!$partial || array_key_exists('config', $b)) {
+        if (!is_array($b['config'] ?? null) || ($b['config'] !== [] && array_is_list($b['config']))) Http::error(422, 'VALIDATION_FAILED', 'config must be an object');
+    }
+    return $b;
 }
 
 if ($path === '/api/auth/login' && $method === 'POST') api_try(function()use($config) {
@@ -1336,9 +1377,16 @@ if ($path === '/api/uploads/chunk' && $method === 'PUT') api_try(function() {
     $id = (string)($_GET['id']??''); $offset = (int)($_SERVER['HTTP_X_UPLOAD_OFFSET']??-1);
     return uploads()->append($id, $offset, 'php://input');
 });
-if ($path === '/api/uploads/complete' && $method === 'POST') api_try(function()use($fs) {
+if ($path === '/api/uploads/complete' && $method === 'POST') api_try(function()use($fs, $config) {
     $b = Http::body();
-    $done = uploads()->complete((string)($b['id']??''));
+    $id = (string)($b['id']??'');
+    // Checked again where the file lands. init only saw what was stored when
+    // it began, and bytes still being staged count against nobody, so several
+    // uploads started together each passed the quota and all of them landed.
+    // The browser sends files one at a time, so for it this changes nothing.
+    $staged = (int)(uploads()->status($id)['size'] ?? 0);
+    if ($staged > 0)assert_upload_fits($fs, $config, $staged);
+    $done = uploads()->complete($id);
 
     // Attribute the finished file to whoever uploaded it, so a per-account
     // quota has something to count. Best-effort, like the audit log.
@@ -1511,22 +1559,38 @@ if ($path === '/api/files/upload' && $method === 'POST') api_try(function()use($
 
         $add = function(string $full, string $prefix)use(&$add, $zip, $fs): void {
             if (is_dir($full)) {
-                $entries = array_values(array_filter(scandir($full)?:[], fn($n) => $n !== '.' && $n !== '..'));
+                // childPaths() applies the listing's rules: symlinks skipped,
+                // and CloudHub's own .trash and .uploads left out. Walked with
+                // a bare scandir(), a ZIP of "/" handed any signed-in account
+                // every deleted file, the trash's per-account bookkeeping and
+                // other people's unfinished uploads, which no other route
+                // reaches.
+                $entries = $fs->childPaths($full);
                 // An empty directory has no files to imply it, so without this
                 // it disappeared from the archive entirely.
                 if (!$entries) {
                     $zip->addEmptyDir(ltrim($prefix, '/'));
                     return;
                 }
-                foreach ($entries as $n) {
-                    if ($fs->escapingSymlink($full.'/'.$n))continue;
-                    $add($full.'/'.$n, $prefix.'/'.$n);
-                }
+                foreach ($entries as $child)$add($child, $prefix.'/'.basename($child));
                 return;
             }
-            if (is_file($full))$zip->addFile($full, ltrim($prefix, '/'));
+            if (!is_file($full))return;
+            $entry = ltrim($prefix, '/');
+            $zip->addFile($full, $entry);
+            // Photos, video, audio and archives are compressed already, and
+            // deflating them again gains nothing while costing most of the
+            // time the archive takes: 100 MB of video took 2.2-3.0 s deflated
+            // against 0.1-0.9 s stored, for the same size.
+            if (in_array(strtolower(pathinfo($full, PATHINFO_EXTENSION)), ZIP_STORED_EXTENSIONS, true)
+                && method_exists($zip, 'setCompressionName')) {
+                $zip->setCompressionName($entry, ZipArchive::CM_STORE);
+            }
         };
 
+        // Building a large archive can outlast max_execution_time, as streaming
+        // one can; serve_file_range() lifts it for the same reason.
+        @set_time_limit(0);
         try {
             foreach ($files as $p) {
                 $f = $fs->existing((string)$p);
@@ -1969,16 +2033,17 @@ if ($path === '/api/files/upload' && $method === 'POST') api_try(function()use($
 
     if (str_starts_with($path, '/api/servers')) api_try(function()use($path, $method) {
         $repo = new ServerRepository();
-        if ($path === '/api/servers/active' && $method === 'GET')return array_map('mask_server', $repo->all(true));
+        // Configuration is for administrators; everyone else gets the names.
+        if ($path === '/api/servers/active' && $method === 'GET')return array_map(Authorization::isAdmin() ? 'mask_server' : 'public_server', $repo->all(true));
         Authorization::requireAdmin();
         if ($path === '/api/servers' && $method === 'GET')return array_map('mask_server', $repo->all()); if ($path === '/api/servers' && $method === 'POST') {
-            $b = Http::body(); if (empty($b['name']) || empty($b['type'])||!isset($b['config']))throw new RuntimeException('name, type, and config are required', 400); return mask_server($repo->create(['name' => $b['name'], 'type' => $b['type'], 'config' => $b['config'], 'isActive' => $b['isActive']??true, 'isDefault' => $b['isDefault']??false]));
+            $b = server_input(Http::body(), false); return mask_server($repo->create(['name' => trim($b['name']), 'type' => $b['type'], 'config' => $b['config'], 'isActive' => (bool)($b['isActive']??true), 'isDefault' => (bool)($b['isDefault']??false)]));
         }if (preg_match('#^/api/servers/(\d+)(?:/(toggle|set-default))?$#', $path, $m)) {
             $id = (int)$m[1]; $s = $repo->get($id); if (!$s)throw new RuntimeException('Server not found', 404); if ($method === 'GET')return mask_server($s); if ($method === 'DELETE') {
                 $repo->delete($id); return ['success' => true,
                     'message' => 'Server deleted'];
             }if ($method === 'PUT') {
-                $b = Http::body(); if (isset($b['config']))foreach ($b['config'] as $k => $v)if ($v === '••••••••')$b['config'][$k] = $s['config'][$k]??$v; return mask_server($repo->update($id, $b));
+                $b = server_input(Http::body(), true); if (isset($b['config']))foreach ($b['config'] as $k => $v)if ($v === '••••••••')$b['config'][$k] = $s['config'][$k]??$v; return mask_server($repo->update($id, $b));
             }if (($m[2]??'') === 'toggle' && $method === 'POST')return mask_server($repo->update($id, ['isActive'=>!$s['isActive']])); if (($m[2]??'') === 'set-default' && $method === 'POST') {
                 $repo->setDefault($id); return ['success' => true,
                     'message' => $s['name'].' set as default'];
