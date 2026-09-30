@@ -331,9 +331,11 @@ $checks['a job of a type this version does not have fails, running nothing'] = $
 
 // A dead worker's job is taken back at once.
 $orphan = $queue('probe', []);
-$deadId = 'cli:'.WorkerRegistry::host().':999999:abcdef';
+// A pid nothing is running as: pid_max can be far above a million.
+for ($deadPid = 999999; WorkerRegistry::pidAlive($deadPid) !== false && $deadPid < 1999999; $deadPid++);
+$deadId = 'cli:'.WorkerRegistry::host().':'.$deadPid.':abcdef';
 $claimedByDead = $jobs->claimNext($deadId);
-$checks['the model: that pid is not running'] = WorkerRegistry::pidAlive(999999) === false && $claimedByDead['id'] === $orphan['id'];
+$checks['the model: that pid is not running'] = WorkerRegistry::pidAlive($deadPid) === false && $claimedByDead['id'] === $orphan['id'];
 $house = $worker->housekeeping(true);
 $checks["a dead worker's job goes back to the queue without waiting to go stale"] = in_array($orphan['id'], $house['recovered'], true)
     && $jobs->find($orphan['id'])['status'] === 'pending';
@@ -435,14 +437,15 @@ $checks['a file that is not an archive is refused when queued'] = $refusal('extr
 // Deleting for good.
 mkdir($root.'/doomed/deep/er', 0775, true);
 for ($i = 0; $i < 30; $i++) file_put_contents($root.'/doomed/deep/er/f'.$i, 'x');
-symlink('/etc/hostname', $root.'/doomed/keep-target');
+file_put_contents($base.'/outside-the-store.txt', 'keep me');
+symlink($base.'/outside-the-store.txt', $root.'/doomed/keep-target');
 $purgeId = JobRepository::newId();
 $hold = PurgeJob::holdingDir($env, $purgeId);
 rename($root.'/doomed', $hold.'/doomed');
 $purge = $jobs->create(1, 'purge', 'Delete "doomed"', '', ['entries' => 1, 'files' => 30], $purgeId);
 $purged = $run($purge);
 $checks['a deletion job deletes what was moved into it'] = $purged['status'] === 'completed' && !is_dir($root.'/.jobs/'.$purgeId)
-    && $purged['result']['files'] === 31 && is_file('/etc/hostname');
+    && $purged['result']['files'] === 31 && file_get_contents($base.'/outside-the-store.txt') === 'keep me';
 $checks['a client cannot queue one'] = !$types->get('purge')->clientCreatable()
     && $refusal('purge', []) === 400;
 
