@@ -512,7 +512,10 @@ function storage_report(FileService $fs, array $config, bool $force = false): ar
     if (!is_dir(dirname($cache)))@mkdir(dirname($cache), 0775, true);
     // Written through a temporary file, as the thumbnail cache already is: a
     // reader hitting a half-written usage.json gets JSON it cannot decode.
-    $reportJson = json_encode($report, JSON_UNESCAPED_SLASHES);
+    // Names that are not UTF-8 are substituted: the report only displays
+    // them, and failing to encode meant it was never cached at all, so every
+    // quota check and dashboard visit walked the whole store again.
+    $reportJson = json_encode($report, JSON_UNESCAPED_SLASHES|JSON_INVALID_UTF8_SUBSTITUTE);
     if ($reportJson !== false) {
         $cacheTmp = $cache.'.'.bin2hex(random_bytes(4)).'.tmp';
         if (@file_put_contents($cacheTmp, $reportJson) !== strlen($reportJson) || !@rename($cacheTmp, $cache)) {

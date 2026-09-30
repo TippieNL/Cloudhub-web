@@ -346,7 +346,11 @@ final class DuplicateFinder
     private function writeJson(string $file, array $payload): void
     {
         if (!is_dir($this->cacheDir) && !@mkdir($this->cacheDir, 0775, true) && !is_dir($this->cacheDir)) return;
-        $json = json_encode($payload, JSON_UNESCAPED_SLASHES);
+        // A path that is not UTF-8 is substituted, and then simply fails to
+        // resolve and drops out of the scan. Without the flag the whole state
+        // failed to encode, was never saved, and every poll began the scan
+        // again from nothing -- a scan that never finished.
+        $json = json_encode($payload, JSON_UNESCAPED_SLASHES|JSON_INVALID_UTF8_SUBSTITUTE);
         if ($json === false) return;
         $tmp = $file.'.'.bin2hex(random_bytes(4)).'.tmp';
         if (@file_put_contents($tmp, $json) !== strlen($json) || !@rename($tmp, $file)) @unlink($tmp);

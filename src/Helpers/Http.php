@@ -87,10 +87,15 @@ final class Http {
  }
  public static function error(int $status,string $code,string $message,array $details=[]):never{
   http_response_code($status);header('Content-Type: application/json; charset=utf-8');header('Cache-Control: no-store');header('X-Request-ID: '.self::requestId());
-  $x=['error'=>['code'=>$code,'message'=>$message],'requestId'=>self::requestId()];if($details)$x['error']['details']=$details;echo json_encode($x,JSON_UNESCAPED_SLASHES|JSON_UNESCAPED_UNICODE);exit;
+  $x=['error'=>['code'=>$code,'message'=>$message],'requestId'=>self::requestId()];if($details)$x['error']['details']=$details;echo json_encode($x,JSON_UNESCAPED_SLASHES|JSON_UNESCAPED_UNICODE|JSON_INVALID_UTF8_SUBSTITUTE);exit;
  }
+ /**
+  * Bytes that are not UTF-8 -- a name made on a Latin-1 system, or sent over
+  * WebDAV -- are substituted rather than thrown on: one such file name used to
+  * turn its whole folder's listing, and any search that found it, into a 500.
+  */
  public static function json(mixed $data,int $status=200):never{
-  http_response_code($status);header('Content-Type: application/json; charset=utf-8');header('Cache-Control: no-store');header('X-Request-ID: '.self::requestId());echo json_encode($data,JSON_UNESCAPED_SLASHES|JSON_UNESCAPED_UNICODE|JSON_THROW_ON_ERROR);exit;
+  http_response_code($status);header('Content-Type: application/json; charset=utf-8');header('Cache-Control: no-store');header('X-Request-ID: '.self::requestId());echo json_encode($data,JSON_UNESCAPED_SLASHES|JSON_UNESCAPED_UNICODE|JSON_INVALID_UTF8_SUBSTITUTE|JSON_THROW_ON_ERROR);exit;
  }
  public static function string(array $b,string $key,int $min=1,int $max=255):string{
   $v=$b[$key]??null;if(!is_string($v))self::error(422,'VALIDATION_FAILED',"$key must be a string");$v=trim($v);$n=function_exists('mb_strlen')?mb_strlen($v):strlen($v);if($n<$min||$n>$max)self::error(422,'VALIDATION_FAILED',"$key must be between $min and $max characters");return $v;

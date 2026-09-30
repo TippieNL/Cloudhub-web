@@ -21,7 +21,7 @@ final class AuditLog {
    $requestId=\CloudHub\Helpers\Http::requestId();
    $safe=self::sanitize($context);
    $stmt=$pdo->prepare('INSERT INTO security_events(user_id,username,event_type,outcome,ip_address,user_agent,request_id,context_json,created_at) VALUES(?,?,?,?,?,?,?,?,UTC_TIMESTAMP())');
-   $stmt->execute([$uid,$username,substr($event,0,80),substr($outcome,0,20),substr($ip,0,45),$ua,$requestId,$safe?json_encode($safe,JSON_UNESCAPED_SLASHES|JSON_UNESCAPED_UNICODE):null]);
+   $stmt->execute([$uid,$username,substr($event,0,80),substr($outcome,0,20),substr($ip,0,45),$ua,$requestId,$safe?json_encode($safe,JSON_UNESCAPED_SLASHES|JSON_UNESCAPED_UNICODE|JSON_INVALID_UTF8_SUBSTITUTE):null]);
    self::pruneOccasionally($pdo);
   } catch (\Throwable $e) {
    error_log('[audit] '.$e->getMessage());
