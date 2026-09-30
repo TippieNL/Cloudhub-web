@@ -21,6 +21,14 @@ use CloudHub\Services\StorageQuota;
 use CloudHub\Services\ImageThumbnailer;
 use CloudHub\Services\MediaProbe;
 use CloudHub\Services\AuditLog;
+use CloudHub\Repositories\JobRepository;
+use CloudHub\Services\Jobs\JobEnvironment;
+use CloudHub\Services\Jobs\JobType;
+use CloudHub\Services\Jobs\JobTypes;
+use CloudHub\Services\Jobs\PurgeJob;
+use CloudHub\Services\Jobs\Tree;
+use CloudHub\Services\Jobs\Worker;
+use CloudHub\Services\Jobs\WorkerRegistry;
 
 $fs = new FileService($config); $basePath = Http::basePath(); $assetBase = Http::assetBase(); $path = Http::requestPath($basePath); $method = $_SERVER['REQUEST_METHOD']??'GET';
 $frontController = ($basePath === '' ? '/' : $basePath.'/');
@@ -451,6 +459,168 @@ function db(): PDO {
     return \CloudHub\Helpers\Db::connection();
 }
 /**
+* The background queue and what its jobs work with, built on first use and
+* sharing the request's connection. See CloudHub\Services\Jobs.
+*/
+function job_env(): JobEnvironment {
+    static $env = null; global $config, $fs;
+    return $env ??= new JobEnvironment($config, $fs, db(), dirname(__DIR__));
+}
+function job_types(): JobTypes {
+    static $types = null;
+    return $types ??= JobTypes::standard();
+}
+function worker_registry(): WorkerRegistry {
+    static $registry = null;
+    return $registry ??= new WorkerRegistry(dirname(__DIR__).'/storage/.cache/queue');
+}
+/**
+* Who runs queued tasks: 'cli' when tools/worker.php is running, 'inline' when
+* this web server runs them itself after answering, 'none' when they wait for
+* a worker to be started.
+*
+* PHP's built-in server answers one request at a time unless it was started
+* with PHP_CLI_SERVER_WORKERS, so a task run inside it would hold up every
+* other request until it finished; there, only a worker runs tasks.
+*/
+function queue_runner(array $config): string {
+    $mode = (string)$config['queue_runner'];
+    $canInline = $mode !== 'worker' && !(PHP_SAPI === 'cli-server' && (int)getenv('PHP_CLI_SERVER_WORKERS') < 2);
+    if ($mode === 'inline' && $canInline) return 'inline';
+    if (worker_registry()->alive('cli') !== []) return 'cli';
+    return $canInline ? 'inline' : 'none';
+}
+/** Refuse a new task when the account already has its fill queued or running. */
+function queue_admit(int $userId, array $config): void {
+    $max = max(1, (int)$config['queue_max_active_per_user']);
+    if (job_env()->jobs()->activeCount($userId) >= $max) {
+        throw new RuntimeException('You already have '.$max.' tasks queued or running; wait for one to finish', 429);
+    }
+}
+/** Queue a prepared job for the signed-in account and answer with it as its owner sees it. */
+function queue_job(JobType $type, array $prepared, ?string $id = null): array {
+    $user = Auth::user();
+    $job = job_env()->jobs()->create((int)$user['id'], $type->name(), $prepared['label'], $prepared['target'], $prepared['payload'], $id);
+    AuditLog::write(db(), 'job.queue', 'success', ['id' => $job['id'], 'type' => $type->name()]);
+    return job_types()->present($job);
+}
+/**
+* Whether a request that offers to run in the background should: it asked
+* outright, or asked for 'auto' and is bigger than QUEUE_SYNC_MAX_FILES or
+* QUEUE_SYNC_MAX_MB. Small work stays synchronous, as it always was, and so
+* does everything when nothing would run the task.
+*
+* @param callable(int, int): bool $large whether the work exceeds that many files or bytes
+*/
+function queue_wanted(array $b, array $config, callable $large): bool {
+    $asked = $b['background'] ?? false;
+    if ($asked === true) return true;
+    if ($asked !== 'auto' || queue_runner($config) === 'none') return false;
+    return $large(max(1, (int)$config['queue_sync_max_files']), max(1, (int)$config['queue_sync_max_mb']) * 1048576);
+}
+/**
+* Take items out of sight and queue their permanent deletion.
+*
+* Each item is renamed into the new job's holding folder -- instant, atomic,
+* and the same filesystem, as ROOT_DIR/.jobs is inside the store -- before
+* the job exists, so no worker can see the job without its items. An item
+* that is gone by the time it is moved (restored a moment ago, say) is
+* skipped; any other failure puts back what was moved and refuses the whole
+* request. See CloudHub\Services\Jobs\PurgeJob.
+*
+* @param list<string> $items absolute paths
+* @return array|null the job, or null when there was nothing left to delete
+*/
+function queue_purge(array $items, string $label, int $files): ?array {
+    $env = job_env();
+    $id = JobRepository::newId();
+    $hold = PurgeJob::holdingDir($env, $id);
+    $moved = [];
+    // Put back only where nothing has appeared since: rename() replaces a
+    // file, and a new upload under the old name must not be the one lost.
+    // Whatever cannot go back stays held, and housekeeping deletes it -- the
+    // deletion that was asked for -- rather than anything else.
+    $undo = static function () use (&$moved, $hold, $env, $id): void {
+        $stranded = false;
+        foreach (array_reverse($moved) as $item) {
+            if (file_exists($item) || is_link($item) || !@rename($hold.'/'.basename($item), $item)) $stranded = true;
+        }
+        if (!$stranded) { try { $env->removeWorkDir($id); } catch (Throwable) {} }
+    };
+    foreach ($items as $item) {
+        if (@rename($item, $hold.'/'.basename($item))) { $moved[] = $item; continue; }
+        if (!file_exists($item) && !is_link($item)) continue;
+        $undo();
+        throw new RuntimeException('Unable to delete '.basename($item), 500);
+    }
+    if (!$moved) { $undo(); return null; }
+    try {
+        return queue_job(job_types()->get('purge'), ['label' => $label, 'target' => '',
+            'payload' => ['entries' => count($moved), 'files' => $files]], $id);
+    } catch (Throwable $e) {
+        $undo();
+        throw $e;
+    }
+}
+/**
+* queue_purge() for a route that can still do the work itself: when the items
+* cannot be taken out of sight -- a mount point inside the store, a folder
+* that will not rename -- or the account has its fill of tasks, the route
+* deletes synchronously, as it did before tasks existed. Null means "do it here".
+*/
+function queue_purge_or_null(array $items, string $label, int $files, array $config): ?array {
+    try {
+        queue_admit((int)Auth::user()['id'], $config);
+        return queue_purge($items, $label, $files);
+    } catch (RuntimeException $e) {
+        if ($e instanceof PDOException) throw $e;
+        error_log('['.Http::requestId().'] deleting in the foreground instead: '.$e->getMessage());
+        return null;
+    }
+}
+/** One of the signed-in account's jobs, or a 404 that says nothing about anyone else's. */
+function job_for(string $id): array {
+    return job_env()->jobs()->findFor($id, (int)Auth::user()['id']) ?? throw new RuntimeException('Task not found', 404);
+}
+/**
+* Drop what a removed job kept for its owner -- an archive waiting to be
+* downloaded -- now, rather than at the next housekeeping. A deletion's
+* holding folder is housekeeping's: it may be large.
+*/
+function job_forget_output(string $id): void {
+    try {
+        $dir = job_env()->workDir($id);
+        if (is_dir($dir.'/output') && !is_link($dir.'/output')) job_env()->files->deleteTree($dir.'/output');
+        if (is_dir($dir) && (scandir($dir) ?: []) === ['.', '..']) @rmdir($dir);
+    } catch (Throwable $e) {
+        error_log('['.Http::requestId().'] task output cleanup failed: '.$e->getMessage());
+    }
+}
+/**
+* Answer now and keep running once the answer has gone.
+*
+* Under PHP-FPM (and LiteSpeed) the connection is handed back before the work
+* starts. Elsewhere the length and Connection: close let the client finish
+* reading; whether the server passes the answer on before the script ends is
+* its business, and the web app never waits for this answer anyway.
+*/
+function finish_response_early(array $data): void {
+    ignore_user_abort(true);
+    @set_time_limit(0);
+    @ini_set('zlib.output_compression', '0');
+    $json = json_encode($data, JSON_UNESCAPED_SLASHES|JSON_THROW_ON_ERROR);
+    while (ob_get_level() > 0) @ob_end_clean();
+    http_response_code(200);
+    header('Content-Type: application/json; charset=utf-8');
+    header('Cache-Control: no-store');
+    header('Content-Length: '.strlen($json));
+    header('Connection: close');
+    echo $json;
+    flush();
+    if (function_exists('fastcgi_finish_request')) fastcgi_finish_request();
+    elseif (function_exists('litespeed_finish_request')) litespeed_finish_request();
+}
+/**
  * Absolute origin (scheme://host) for links handed to other people.
  *
  * X-Forwarded-Proto is only believed when TRUST_PROXY is set, matching
@@ -673,6 +843,14 @@ if ($isProtectedApi && $method !== 'OPTIONS') {
      */
     $writeExemptPost = ['/api/files/download-zip', '/api/thumbnail/video', '/api/users/me/password', '/api/favorites'];
     /*
+     * Background tasks decide per task, not per route: a checksum or an
+     * archive to download is reading, cancelling or removing your own task
+     * changes nothing in the store, and copying or extracting is writing. Each
+     * /api/jobs route checks what its task's type needs (JobType::capability),
+     * and the worker checks it again when the task runs. CSRF still applies.
+     */
+    $isJobRoute = $path === '/api/jobs' || str_starts_with($path, '/api/jobs/');
+    /*
      * Everything that is not a read is a write -- by default, not by list.
      *
      * This used to name POST, PUT, PATCH and DELETE, so WebDAV's own verbs
@@ -685,7 +863,7 @@ if ($isProtectedApi && $method !== 'OPTIONS') {
     if (!in_array($method, ['GET', 'HEAD', 'OPTIONS', 'PROPFIND'], true)) {
         Auth::verifyCsrf();
         if (str_starts_with($path, '/api/servers'))Authorization::requireAdmin();
-        elseif (!in_array($path, $writeExemptPost, true))Authorization::requireWrite();
+        elseif (!in_array($path, $writeExemptPost, true) && !$isJobRoute)Authorization::requireWrite();
     }
 }
 /*
@@ -706,6 +884,10 @@ if ($isProtectedApi && $method !== 'OPTIONS') {
 $cacheNeutralWrites = ['/api/auth/login', '/api/auth/logout', '/api/uploads/init', '/api/uploads/chunk',
     '/api/uploads/cancel', '/api/uploads/cleanup', '/api/thumbnail/video', '/api/files/download-zip',
     '/api/users/me/password', '/api/duplicates/scan'];
+// Queueing, cancelling or removing a task changes nothing a listing shows.
+// A task that writes to the store retires the generation itself when it
+// finishes (Worker::execute()), which is the moment its changes are there.
+if (str_starts_with($path, '/api/jobs')) $cacheNeutralWrites[] = $path;
 if (!in_array($method, ['GET', 'HEAD', 'OPTIONS', 'PROPFIND'], true) && !in_array($path, $cacheNeutralWrites, true)) {
     register_shutdown_function(static function (): void {
         cache_ready();
@@ -801,6 +983,16 @@ if ($path === '/api/files/delete' && $method === 'DELETE') api_try(function()use
     // says which happened, so the UI never claims the wrong thing.
     if (!$config['trash_enabled']) {
         $rel = $fs->relative($p);
+        // A large folder leaves the listing at once and a worker deletes it,
+        // when the client offers that; see queue_purge().
+        if (queue_wanted($b, $config, static fn(int $maxFiles): bool => Tree::measure($fs, $p, $maxFiles)['truncated'])
+            && ($job = queue_purge_or_null([$p], 'Delete "'.basename($p).'"', 0, $config)) !== null) {
+            ledger()->forget($rel);
+            shares_forget($rel);
+            favorites()->forget($rel);
+            AuditLog::write(db(), 'file.delete', 'success', ['path' => $rel, 'job' => $job['id']]);
+            Http::json(['success' => true, 'trashed' => false, 'queued' => true, 'job' => $job, 'message' => 'Deleting in the background'], 202);
+        }
         $fs->deleteTree($p);
         ledger()->forget($rel);
         shares_forget($rel);
@@ -909,7 +1101,29 @@ if ($path === '/api/files/move' && $method === 'POST') api_try(function()use($re
         if (!rename($src, $dst))throw new RuntimeException('The move failed', 500);
     }, 'move');
 });
-if ($path === '/api/files/copy' && $method === 'POST') api_try(function()use($relocate, $fs) {
+if ($path === '/api/files/copy' && $method === 'POST') api_try(function()use($relocate, $fs, $config) {
+    /*
+     * A client may offer to have a large copy done in the background
+     * ("background": "auto", or true to insist). Without it -- as the Android
+     * app and scripts call it -- the copy is made here, as it always was.
+     */
+    $b = Http::body(65536);
+    $large = static function (int $maxFiles, int $maxBytes) use ($b, $fs): bool {
+        $files = 0; $bytes = 0;
+        foreach (array_filter((array)($b['paths'] ?? []), 'is_string') as $p) {
+            try { $m = Tree::measure($fs, $fs->existing($p), $maxFiles - $files, $maxBytes - $bytes); }
+            catch (RuntimeException) { continue; }
+            $files += $m['files']; $bytes += $m['bytes'];
+            if ($m['truncated'] || $files > $maxFiles || $bytes > $maxBytes) return true;
+        }
+        return false;
+    };
+    if (queue_wanted($b, $config, $large)) {
+        queue_admit((int)Auth::user()['id'], $config);
+        $type = job_types()->get('copy');
+        $prepared = $type->prepare(['paths' => $b['paths'] ?? null, 'destination' => $b['destination'] ?? '/'], job_env(), Auth::user());
+        Http::json(['success' => true, 'queued' => true, 'job' => queue_job($type, $prepared), 'message' => 'Copying in the background'], 202);
+    }
     return $relocate(fn(string $src, string $dst) => $fs->copyTree($src, $dst), 'copy');
 });
 /**
@@ -1041,10 +1255,22 @@ if ($path === '/api/duplicates/scan' && $method === 'POST') api_try(function() {
     // deliberate here.
     Authorization::requireRead();
     release_session_lock();
+    duplicates_idle();
 
     $b = Http::body();
     return duplicates()->scan((string)($b['path'] ?? '/'), !empty($b['restart']));
 });
+/**
+* A background scan (DuplicatesJob) drives the same finder, whose one saved
+* scan belongs to the whole installation; a slice advanced here meanwhile
+* would overwrite its progress, or start the scan over under it. Reading the
+* result as it grows is what GET is for.
+*/
+function duplicates_idle(): void {
+    if (job_env()->jobs()->anyActive('duplicates')) {
+        throw new RuntimeException('A duplicate scan is running in the background; its results appear here as it goes', 409);
+    }
+}
 // The operative check for reading a finished scan: any signed-in account may
 // see what the last one found.
 if ($path === '/api/duplicates/scan' && $method === 'GET') api_try(function() {
@@ -1054,8 +1280,130 @@ if ($path === '/api/duplicates/scan' && $method === 'GET') api_try(function() {
 });
 if ($path === '/api/duplicates/scan' && $method === 'DELETE') api_try(function() {
     Authorization::requireRead();
+    duplicates_idle();
     duplicates()->reset();
     return ['success' => true];
+});
+/**
+* Background tasks: long file operations a worker runs while nobody waits.
+*
+* Every route here is scoped to the signed-in account. A task id is 32 hex
+* characters or it names nothing, and another account's task is "not found",
+* never "forbidden", so ids cannot be probed. Queueing checks the role the
+* task's type needs and validates every parameter into canonical paths
+* (JobType::prepare()); the worker checks the account and the paths again
+* when it runs. Only registered types can be queued, and only those a client
+* may queue directly -- a deletion's task is prepared by the route that takes
+* the items out of sight.
+*
+*   GET    /api/jobs                    this account's tasks (?active=1: unfinished only)
+*   POST   /api/jobs                    queue one: {"type": ..., "params": {...}}
+*   GET    /api/jobs/{id}               one task
+*   POST   /api/jobs/{id}/cancel        stop it: at once if queued, at its next checkpoint if running
+*   POST   /api/jobs/{id}/retry         queue a failed or cancelled task again
+*   DELETE /api/jobs/{id}               forget a finished task, and its download
+*   GET    /api/jobs/{id}/download      a finished archive
+*   POST   /api/jobs/clear              forget every finished task
+*   POST   /api/jobs/run                run queued tasks here, after answering, when no worker does
+*/
+if ($path === '/api/jobs' && $method === 'GET') api_try(function()use($config) {
+    release_session_lock();
+    $user = (int)Auth::user()['id'];
+    $jobs = job_env()->jobs();
+    $types = job_types();
+    return ['jobs' => array_map(static fn(array $job): array => $types->present($job), $jobs->listFor($user, !empty($_GET['active']))),
+        'active' => $jobs->activeCount($user), 'runner' => queue_runner($config)];
+});
+if ($path === '/api/jobs' && $method === 'POST') api_try(function()use($config, $fs) {
+    $user = Auth::user();
+    $b = Http::body(262144);
+    $type = job_types()->get(Http::string($b, 'type', 1, 32));
+    if ($type === null || !$type->clientCreatable()) throw new RuntimeException('Unknown operation', 400);
+    $params = $b['params'] ?? [];
+    if (!is_array($params) || ($params !== [] && array_is_list($params))) Http::error(422, 'VALIDATION_FAILED', 'params must be an object');
+    if ($type->capability($params) === 'write') Authorization::requireWrite();
+    queue_admit((int)$user['id'], $config);
+    // One at a time means one waiting too: a second duplicate scan queued
+    // behind the first would only start the same scan over when it ends.
+    if ($type->exclusive() && job_env()->jobs()->anyActive($type->name())) {
+        throw new RuntimeException('One of these is already queued or running; wait for it to finish', 409);
+    }
+    $prepared = $type->prepare($params, job_env(), $user);
+    if ($type->capability($prepared['payload']) === 'write') Authorization::requireWrite();
+    if ($type->writesStore($prepared['payload'])) $fs->writable();
+    Http::json(['success' => true, 'job' => queue_job($type, $prepared)], 201);
+});
+if ($path === '/api/jobs/clear' && $method === 'POST') api_try(function() {
+    $user = (int)Auth::user()['id'];
+    $removed = 0;
+    foreach (job_env()->jobs()->finishedFor($user) as $job) {
+        if (!job_env()->jobs()->remove($job['id'], $user)) continue;
+        job_forget_output($job['id']);
+        $removed++;
+    }
+    return ['success' => true, 'removed' => $removed];
+});
+if ($path === '/api/jobs/run' && $method === 'POST') api_try(function()use($config) {
+    release_session_lock();
+    if (queue_runner($config) !== 'inline') return ['success' => true, 'running' => false];
+    // One web runner at a time is plenty: a second would only compete with
+    // the first for the same queue, holding another server process to do it.
+    if (worker_registry()->alive('web') !== []) return ['success' => true, 'running' => true];
+    $worker = new Worker(job_env(), job_types(), worker_registry(), 'web',
+        static function (string $line): void { error_log('[queue] '.$line); });
+    $worker->beat();
+    finish_response_early(['success' => true, 'running' => true]);
+    cache_ready();
+    // The answer has gone, so nothing below may try to send another: a
+    // failure is the log's, and the task it hit is recovered like any other.
+    try {
+        $worker->runUntilIdle();
+    } catch (Throwable $e) {
+        error_log('[queue] '.get_class($e).': '.$e->getMessage());
+    } finally {
+        $worker->shutdown();
+    }
+    exit;
+});
+if (preg_match('#^/api/jobs/([a-f0-9]{32})(?:/(cancel|retry|download))?$#', $path, $m)) api_try(function()use($m, $method, $config, $fs) {
+    $job = job_for($m[1]);
+    $type = job_types()->get($job['type']);
+    $action = $m[2] ?? '';
+    $user = (int)Auth::user()['id'];
+    $jobs = job_env()->jobs();
+
+    if ($action === '' && $method === 'GET') {
+        release_session_lock();
+        return ['job' => job_types()->present($job)];
+    }
+    if ($action === 'download' && ($method === 'GET' || $method === 'HEAD')) {
+        release_session_lock();
+        $file = $type?->download($job, job_env());
+        if ($file === null) throw new RuntimeException('This task has nothing to download, or its download has been removed', 404);
+        serve_file_range($file['path'], $file['mime'], 'attachment', $method, ['Cache-Control: private,no-store']);
+    }
+    if ($action === 'cancel' && $method === 'POST') {
+        $outcome = $jobs->requestCancel($job['id'], $user, $type?->cancelableWhileRunning() ?? true, $type?->cancelableWhilePending() ?? true);
+        AuditLog::write(db(), 'job.cancel', 'success', ['id' => $job['id'], 'type' => $job['type']]);
+        return ['success' => true, 'status' => $outcome, 'job' => job_types()->present($jobs->find($job['id']) ?? $job)];
+    }
+    if ($action === 'retry' && $method === 'POST') {
+        if ($type === null) throw new RuntimeException('This kind of task is not supported by this version of CloudHub', 409);
+        // Asked again: the account may have been demoted, or the server made
+        // read-only, since the task was first queued.
+        if ($type->capability($job['payload']) === 'write') Authorization::requireWrite();
+        if ($type->writesStore($job['payload'])) $fs->writable();
+        queue_admit($user, $config);
+        if (!$jobs->retry($job['id'], $user)) throw new RuntimeException('Only a failed or cancelled task can be retried', 409);
+        AuditLog::write(db(), 'job.retry', 'success', ['id' => $job['id'], 'type' => $job['type']]);
+        return ['success' => true, 'job' => job_types()->present($jobs->find($job['id']) ?? $job)];
+    }
+    if ($action === '' && $method === 'DELETE') {
+        if (!$jobs->remove($job['id'], $user)) throw new RuntimeException('Only a finished task can be removed; cancel it first', 409);
+        job_forget_output($job['id']);
+        return ['success' => true];
+    }
+    throw new RuntimeException('API endpoint not found', 404);
 });
 /**
 * What the storage this install writes to can actually do.
@@ -1183,11 +1531,28 @@ if ($path === '/api/trash/restore' && $method === 'POST') api_try(function()use(
             ? 'Restored as "'.basename($restored['path']).'" because the original name was taken'
             : 'Restored to '.$restored['path']];
 });
-if ($path === '/api/trash/purge' && $method === 'POST') api_try(function()use($fs) {
+if ($path === '/api/trash/purge' && $method === 'POST') api_try(function()use($fs, $config) {
     $fs->writable();
     $b = Http::body();
     $all = !empty($b['all']);
-    $n = $fs->trashPurge($all?null:Http::string($b, 'id', 1, 64));
+    $id = $all ? null : Http::string($b, 'id', 1, 64);
+    // Emptying a large trash, when the client offers that, takes the entries
+    // out of the trash at once and leaves the deleting to a worker.
+    $entries = null;
+    $pick = static function () use (&$entries, $fs, $all, $id): array {
+        return $entries ??= array_values(array_filter($fs->trashList(), static fn(array $m): bool => $all || $m['id'] === $id));
+    };
+    if (queue_wanted($b, $config, static fn(int $maxFiles): bool => array_sum(array_column($pick(), 'files')) > $maxFiles) && $pick()) {
+        $picked = $pick();
+        $job = queue_purge_or_null(array_map(static fn(array $m): string => $fs->trashRoot().'/'.$m['id'], $picked),
+            $all ? 'Empty the trash' : 'Delete "'.$picked[0]['name'].'" for good', (int)array_sum(array_column($picked, 'files')), $config);
+        if ($job !== null) {
+            AuditLog::write(db(), 'file.purge', 'success', ['entries' => count($picked), 'all' => $all, 'job' => $job['id']]);
+            Http::json(['success' => true, 'queued' => true, 'purged' => count($picked), 'job' => $job,
+                'message' => 'Deleting '.(count($picked) === 1 ? '1 item' : count($picked).' items').' in the background'], 202);
+        }
+    }
+    $n = $fs->trashPurge($id);
     AuditLog::write(db(), 'file.purge', 'success', ['entries' => $n, 'all' => $all]);
     return ['success' => true, 'purged' => $n,
         'message' => $n === 1?'Permanently deleted 1 item':'Permanently deleted '.$n.' items'];
@@ -1904,7 +2269,7 @@ if ($path === '/api/files/upload' && $method === 'POST') api_try(function()use($
         http_response_code(204); header('Allow: GET, POST, PUT, PATCH, DELETE, OPTIONS'); exit;
     }
     if (str_starts_with($path, '/api/'))Http::error(404, 'NOT_FOUND', 'API endpoint not found');
-    if (in_array($path, ['/', '/servers', '/browse', '/users', '/trash', '/storage', '/duplicates'], true)) {
+    if (in_array($path, ['/', '/servers', '/browse', '/users', '/trash', '/storage', '/duplicates', '/tasks'], true)) {
         require dirname(__DIR__).'/views/pages/app.php'; exit;
     }
 /**

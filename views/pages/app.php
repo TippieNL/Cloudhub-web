@@ -46,10 +46,13 @@ $uploadSizeHelp = $maxUploadMb >= 1024
             <a href="<?= htmlspecialchars($frontController, ENT_QUOTES) ?>?route=%2Ftrash" data-route="/trash">Trash</a>
             <a href="<?= htmlspecialchars($frontController, ENT_QUOTES) ?>?route=%2Fbrowse" data-route="/browse">Browse</a>
             <a href="<?= htmlspecialchars($frontController, ENT_QUOTES) ?>?route=%2Fduplicates" data-route="/duplicates">Duplicates</a>
+            <a id="nav-tasks" href="<?= htmlspecialchars($frontController, ENT_QUOTES) ?>?route=%2Ftasks" data-route="/tasks">Tasks</a>
             <a id="nav-users" href="<?= htmlspecialchars($frontController, ENT_QUOTES) ?>?route=%2Fusers" data-route="/users" hidden>Users</a>
             <a id="nav-storage" href="<?= htmlspecialchars($frontController, ENT_QUOTES) ?>?route=%2Fstorage" data-route="/storage" hidden>Storage</a>
         </nav>
         <div class="header-actions">
+            <?php /* Beside the account controls rather than in the nav: on a phone the nav scrolls sideways and the Tasks link is often off-screen. */ ?>
+            <a id="tasks-indicator" class="tasks-indicator" href="<?= htmlspecialchars($frontController, ENT_QUOTES) ?>?route=%2Ftasks" hidden><span class="tasks-spinner" aria-hidden="true"></span><span id="tasks-badge"></span></a>
             <button id="theme" aria-label="Toggle dark mode">◐</button>
             <button id="change-password" type="button">Password</button>
             <button id="logout">Log out</button>
@@ -93,6 +96,7 @@ $uploadSizeHelp = $maxUploadMb >= 1024
                 <button id="selection-download" type="button">Download</button>
                 <button id="selection-move" type="button">Move</button>
                 <button id="selection-copy" type="button">Copy</button>
+                <button id="selection-compress" type="button" data-writer hidden>Compress</button>
                 <button id="selection-delete" type="button">Delete</button>
             </div>
             <p id="search-status" class="muted" role="status" aria-live="polite" hidden></p>
@@ -323,6 +327,14 @@ $uploadSizeHelp = $maxUploadMb >= 1024
                 <button id="dupe-delete" type="button" class="danger-button" disabled>Delete selected</button>
             </div>
             <div id="dupe-groups"></div>
+        </section>
+        <section id="tasks-page" hidden>
+            <div class="toolbar">
+                <h2>Background tasks</h2>
+                <button id="tasks-clear" type="button">Clear finished</button>
+            </div>
+            <p id="tasks-note" class="muted">Large copies, archives, extraction and deletions run here, on the server. They carry on if you close this page.</p>
+            <div id="tasks-list" aria-live="polite"></div>
         </section>
         <section id="browse-page" hidden>
             <h2>Remote server browser</h2>
