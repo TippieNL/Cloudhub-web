@@ -29,6 +29,7 @@ require dirname(__DIR__).'/config/bootstrap.php';
 
 use CloudHub\Helpers\Cache;
 use CloudHub\Helpers\Db;
+use CloudHub\Repositories\JobRepository;
 use CloudHub\Services\FileService;
 use CloudHub\Services\Jobs\JobEnvironment;
 use CloudHub\Services\Jobs\JobTypes;
@@ -57,6 +58,13 @@ $build = static function (?string $id = null) use ($config, $projectDir, $regist
     $env = new JobEnvironment($config, new FileService($config), Db::connection(), $projectDir);
     return new Worker($env, JobTypes::standard(), $registry, 'cli', $log, $id);
 };
+
+// The table is created if an upgrade skipped database/migrate.php, as the web
+// app does; if this database account may not create it, say how to.
+if (!JobRepository::ensureTable(Db::connection())) {
+    fwrite(STDERR, "The jobs table is missing and could not be created. Run: php database/migrate.php\n");
+    exit(1);
+}
 
 if (isset($options['status'])) {
     $env = new JobEnvironment($config, new FileService($config), Db::connection(), $projectDir);

@@ -490,6 +490,40 @@ function queue_runner(array $config): string {
     if (worker_registry()->alive('cli') !== []) return 'cli';
     return $canInline ? 'inline' : 'none';
 }
+/**
+* Whether the background queue can be used: its table is there, or has just
+* been created.
+*
+* An installation that took the queue without running database/migrate.php --
+* on KSWEB there may be no PHP command line to run it with -- has no jobs
+* table, and every request that touched the queue failed with a 500: the
+* duplicate scan and large copies too, which worked before the queue existed.
+* The table is created here the first time it is needed. Where the database
+* account may not create tables the queue is unavailable instead: nothing is
+* queued, and everything that existed before it works as it did. Creating it
+* is then not tried again for ten minutes, so the log says so once, not on
+* every request.
+*/
+function queue_ready(): bool {
+    static $ready = null;
+    if ($ready !== null) return $ready;
+    $stamp = dirname(__DIR__).'/storage/.cache/queue/no-jobs-table';
+    $failedLately = is_file($stamp) && time() - (int)@filemtime($stamp) < 600;
+    try {
+        $ready = JobRepository::ensureTable(db(), !$failedLately);
+    } catch (Throwable $e) {
+        error_log('['.Http::requestId().'] background tasks unavailable: '.$e->getMessage());
+        $ready = false;
+    }
+    if (!$ready && !$failedLately && (is_dir(dirname($stamp)) || @mkdir(dirname($stamp), 0775, true))) @touch($stamp);
+    return $ready;
+}
+const QUEUE_UNAVAILABLE_MESSAGE = 'Background tasks are not available: the database has no jobs table and this server could not create it. '
+    .'Run php database/migrate.php, or create the table from database/schema.sql.';
+/** Answer 503 for a task route while the queue cannot be used, saying why and what fixes it. */
+function queue_require(): void {
+    if (!queue_ready()) Http::error(503, 'QUEUE_UNAVAILABLE', QUEUE_UNAVAILABLE_MESSAGE);
+}
 /** Refuse a new task when the account already has its fill queued or running. */
 function queue_admit(int $userId, array $config): void {
     $max = max(1, (int)$config['queue_max_active_per_user']);
@@ -514,8 +548,11 @@ function queue_job(JobType $type, array $prepared, ?string $id = null): array {
 */
 function queue_wanted(array $b, array $config, callable $large): bool {
     $asked = $b['background'] ?? false;
+    if ($asked !== true && $asked !== 'auto') return false;
+    // Without the queue the work is done here, as it was before there was one.
+    if (!queue_ready()) return false;
     if ($asked === true) return true;
-    if ($asked !== 'auto' || queue_runner($config) === 'none') return false;
+    if (queue_runner($config) === 'none') return false;
     return $large(max(1, (int)$config['queue_sync_max_files']), max(1, (int)$config['queue_sync_max_mb']) * 1048576);
 }
 /**
@@ -1267,6 +1304,8 @@ if ($path === '/api/duplicates/scan' && $method === 'POST') api_try(function() {
 * result as it grows is what GET is for.
 */
 function duplicates_idle(): void {
+    // No queue, no background scan: the route works as it did before.
+    if (!queue_ready()) return;
     if (job_env()->jobs()->anyActive('duplicates')) {
         throw new RuntimeException('A duplicate scan is running in the background; its results appear here as it goes', 409);
     }
@@ -1308,13 +1347,17 @@ if ($path === '/api/duplicates/scan' && $method === 'DELETE') api_try(function()
 */
 if ($path === '/api/jobs' && $method === 'GET') api_try(function()use($config) {
     release_session_lock();
+    // Asked by every page as it loads: an install without the queue says so
+    // rather than failing, and the page offers what it offered before.
+    if (!queue_ready()) return ['jobs' => [], 'active' => 0, 'runner' => 'none', 'available' => false, 'message' => QUEUE_UNAVAILABLE_MESSAGE];
     $user = (int)Auth::user()['id'];
     $jobs = job_env()->jobs();
     $types = job_types();
     return ['jobs' => array_map(static fn(array $job): array => $types->present($job), $jobs->listFor($user, !empty($_GET['active']))),
-        'active' => $jobs->activeCount($user), 'runner' => queue_runner($config)];
+        'active' => $jobs->activeCount($user), 'runner' => queue_runner($config), 'available' => true];
 });
 if ($path === '/api/jobs' && $method === 'POST') api_try(function()use($config, $fs) {
+    queue_require();
     $user = Auth::user();
     $b = Http::body(262144);
     $type = job_types()->get(Http::string($b, 'type', 1, 32));
@@ -1334,6 +1377,7 @@ if ($path === '/api/jobs' && $method === 'POST') api_try(function()use($config, 
     Http::json(['success' => true, 'job' => queue_job($type, $prepared)], 201);
 });
 if ($path === '/api/jobs/clear' && $method === 'POST') api_try(function() {
+    queue_require();
     $user = (int)Auth::user()['id'];
     $removed = 0;
     foreach (job_env()->jobs()->finishedFor($user) as $job) {
@@ -1345,7 +1389,7 @@ if ($path === '/api/jobs/clear' && $method === 'POST') api_try(function() {
 });
 if ($path === '/api/jobs/run' && $method === 'POST') api_try(function()use($config) {
     release_session_lock();
-    if (queue_runner($config) !== 'inline') return ['success' => true, 'running' => false];
+    if (!queue_ready() || queue_runner($config) !== 'inline') return ['success' => true, 'running' => false];
     // One web runner at a time is plenty: a second would only compete with
     // the first for the same queue, holding another server process to do it.
     if (worker_registry()->alive('web') !== []) return ['success' => true, 'running' => true];
@@ -1366,6 +1410,7 @@ if ($path === '/api/jobs/run' && $method === 'POST') api_try(function()use($conf
     exit;
 });
 if (preg_match('#^/api/jobs/([a-f0-9]{32})(?:/(cancel|retry|download))?$#', $path, $m)) api_try(function()use($m, $method, $config, $fs) {
+    queue_require();
     $job = job_for($m[1]);
     $type = job_types()->get($job['type']);
     $action = $m[2] ?? '';

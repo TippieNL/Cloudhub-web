@@ -43,6 +43,80 @@ final class JobRepository
         $this->clock = $clock ?? static fn(): int => time();
     }
 
+    /**
+     * The jobs table, exactly as database/schema.sql and database/migrate.php
+     * create it; tests/phase52 holds the three to one another.
+     *
+     * Kept here as well so the application can create the table itself. An
+     * installation that took the queue without running migrate.php -- on
+     * KSWEB there may be no PHP command line to run it with -- had no table,
+     * and every request that touched the queue failed with a 500, the
+     * duplicate scan and large copies among them.
+     */
+    public const TABLE_DDL = "CREATE TABLE IF NOT EXISTS jobs (
+ id CHAR(32) NOT NULL PRIMARY KEY,
+ user_id INT UNSIGNED NOT NULL,
+ type VARCHAR(32) NOT NULL,
+ status ENUM('pending','processing','completed','failed','cancelled') NOT NULL DEFAULT 'pending',
+ label VARCHAR(255) NOT NULL DEFAULT '',
+ target VARCHAR(1024) NOT NULL DEFAULT '',
+ payload MEDIUMTEXT NOT NULL,
+ state MEDIUMTEXT NULL,
+ result MEDIUMTEXT NULL,
+ progress_done BIGINT UNSIGNED NOT NULL DEFAULT 0,
+ progress_total BIGINT UNSIGNED NOT NULL DEFAULT 0,
+ progress_unit VARCHAR(10) NOT NULL DEFAULT 'items',
+ current_item VARCHAR(1024) NULL,
+ error VARCHAR(1000) NULL,
+ attempts INT UNSIGNED NOT NULL DEFAULT 0,
+ cancel_requested TINYINT(1) NOT NULL DEFAULT 0,
+ claim_token CHAR(32) NULL,
+ worker VARCHAR(100) NULL,
+ revision INT UNSIGNED NOT NULL DEFAULT 0,
+ created_at DATETIME NOT NULL,
+ started_at DATETIME NULL,
+ heartbeat_at DATETIME NULL,
+ finished_at DATETIME NULL,
+ INDEX idx_jobs_queue (status, created_at),
+ INDEX idx_jobs_user (user_id, created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci";
+
+    /** Whether $e says the jobs table does not exist: SQLSTATE 42S02 on MySQL and MariaDB, "no such table" on SQLite. */
+    public static function missingTable(\Throwable $e): bool
+    {
+        if (!$e instanceof \PDOException) return false;
+        $message = $e->getMessage();
+        $missing = (string)$e->getCode() === '42S02' || str_contains($message, 'SQLSTATE[42S02]') || str_contains($message, 'no such table');
+        return $missing && (bool)preg_match('/\bjobs\b/', $message);
+    }
+
+    /**
+     * Make sure the jobs table exists, creating it when it does not and
+     * $create allows.
+     *
+     * @return bool false when it is missing and was not created -- the
+     *   database account may not be allowed to create tables
+     */
+    public static function ensureTable(PDO $db, bool $create = true): bool
+    {
+        try {
+            $db->query('SELECT 1 FROM jobs LIMIT 1');
+            return true;
+        } catch (\PDOException $e) {
+            if (!self::missingTable($e)) throw $e;
+        }
+        if (!$create) return false;
+        try {
+            $db->exec(self::TABLE_DDL);
+            error_log('[queue] created the missing jobs table; database/migrate.php does this too');
+            return true;
+        } catch (\PDOException $e) {
+            error_log('[queue] background tasks are unavailable: the jobs table is missing and could not be created ('
+                .$e->getMessage().'). Run php database/migrate.php, or create it from database/schema.sql.');
+            return false;
+        }
+    }
+
     /** Job ids are 32 lower-case hex characters; anything else names no job. */
     public static function validId(string $id): bool
     {

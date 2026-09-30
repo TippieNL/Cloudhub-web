@@ -74,6 +74,34 @@ $newDb = static function () use ($ddl): PDO {
     return $db;
 };
 
+// --- the table, wherever it is created --------------------------------------------------
+
+$norm = static fn(string $sql): string => trim((string)preg_replace('/\s+/', ' ', $sql));
+$migrate = (string)file_get_contents(dirname(__DIR__).'/database/migrate.php');
+preg_match('/\$pdo->exec\("(CREATE TABLE IF NOT EXISTS jobs \(.*?\) ENGINE=[^"]*)"\);/s', $migrate, $mm);
+$checks['schema.sql, migrate.php and the application create the same jobs table'] = isset($m[0], $mm[1])
+    && $norm(rtrim($m[0], ';')) === $norm(JobRepository::TABLE_DDL) && $norm($mm[1]) === $norm(JobRepository::TABLE_DDL);
+
+$mysqlMissing = new PDOException("SQLSTATE[42S02]: Base table or view not found: 1146 Table 'cloud_file_hub.jobs' doesn't exist");
+$checks["the missing table is recognised as MariaDB and MySQL report it"] = JobRepository::missingTable($mysqlMissing);
+$checks['and as SQLite does'] = (static function (): bool {
+    try { (new PDO('sqlite::memory:', null, null, [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]))->query('SELECT 1 FROM jobs'); }
+    catch (PDOException $e) { return JobRepository::missingTable($e); }
+    return false;
+})();
+$checks['but not another table, another error, or anything else'] =
+    !JobRepository::missingTable(new PDOException("SQLSTATE[42S02]: Base table or view not found: 1146 Table 'x.favorites' doesn't exist"))
+    && !JobRepository::missingTable(new PDOException("SQLSTATE[HY000] [2002] Connection refused while reading jobs"))
+    && !JobRepository::missingTable(new RuntimeException("SQLSTATE[42S02]: Table 'x.jobs' doesn't exist"));
+
+$bare = new PDO('sqlite::memory:', null, null, [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+$checks['without the table, and not allowed to create it, the queue is unavailable -- not an error'] =
+    JobRepository::ensureTable($bare, false) === false
+    // SQLite refuses the MySQL definition, as a database account without CREATE refuses any.
+    && JobRepository::ensureTable($bare) === false;
+$bare->exec('CREATE TABLE jobs (id TEXT)');
+$checks['with the table the queue is available'] = JobRepository::ensureTable($bare, false) === true;
+
 // --- the repository ----------------------------------------------------------------
 
 $db = $newDb();

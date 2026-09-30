@@ -27,7 +27,9 @@ For Android/KSWEB video thumbnails, no FFmpeg installation is required; compatib
    tasks**). Without it the web server runs queued tasks itself.
 
 An existing database gets the `jobs` table from `php database/migrate.php`,
-which only adds what is missing.
+which only adds what is missing. Where that cannot be run — KSWEB may have no
+PHP command line — the application creates the table itself the first time it
+needs it (see **Without the jobs table**).
 
 ## Public share links
 
@@ -816,6 +818,21 @@ away. Such a runner is still subject to the web server's own limits — PHP-FPM'
 that way is recovered like any other. PHP's built-in development server only
 runs tasks this way when started with `PHP_CLI_SERVER_WORKERS` ≥ 2, as it
 otherwise answers one request at a time.
+
+### Without the jobs table
+
+An upgrade that skipped `php database/migrate.php` has no `jobs` table. The
+first request that needs the queue creates it, with the same statement
+`migrate.php` uses, and the log says so once. If the database account is not
+allowed to create tables, background tasks are **unavailable** instead of
+failing: `GET /api/jobs` answers `"available": false`, the task routes answer
+**503** `QUEUE_UNAVAILABLE`, and everything that existed before the queue works
+as it did — copies, deletions and trash purges run inside the request, the web
+app builds ZIPs and runs duplicate scans while the page waits, and the Tasks
+page says what to run. The log explains why once, and creating the table is
+retried every ten minutes. Run `php database/migrate.php`, or execute the
+`CREATE TABLE IF NOT EXISTS jobs` statement from `database/schema.sql` in
+phpMyAdmin, to turn the queue on.
 
 ### What keeps it correct
 

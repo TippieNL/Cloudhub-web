@@ -1096,12 +1096,12 @@ function showContextMenu(path, x, y) {
     const f = currentEntries().find(item => item.path === path);
     const menu = $('#file-context');
     if (!f) return;
-    const writer = canWrite();
+    const writer = canWrite() && tasks.available;
     const isZip = !f.isDirectory && /\.zip$/i.test(f.name);
     menu.innerHTML = `${f.isDirectory ? '<button data-cmd="open">Open</button><button data-cmd="zipdown">Download as ZIP</button>' : '<button data-cmd="preview">Preview</button><button data-cmd="download">Download</button><button data-cmd="share">Share</button>'}<button data-cmd="rename">Rename</button><button data-cmd="move">Move to…</button><button data-cmd="copy">Copy to…</button>`
         + (writer ? '<button data-cmd="compress">Compress to ZIP</button>' : '')
         + (writer && isZip ? '<button data-cmd="extract">Extract here</button>' : '')
-        + (f.isDirectory ? '' : '<button data-cmd="checksum">Checksum (SHA-256)</button>')
+        + (f.isDirectory || !tasks.available ? '' : '<button data-cmd="checksum">Checksum (SHA-256)</button>')
         + (writer && f.isDirectory ? '<button data-cmd="thumbs">Make thumbnails</button>' : '')
         + '<button data-cmd="delete" class="danger-text">Delete</button>';
     menu.hidden = false;
@@ -1675,6 +1675,11 @@ async function downloadSelected() {
     // pack, so those are built by a task and downloaded when ready. A few
     // small files are still packed while the browser waits, as before.
     if (entries.some(f => !f || f.isDirectory) || bytes > 100 * 1048576 || paths.length > 50) return downloadAsArchive(paths);
+    return downloadZipNow(paths);
+}
+
+/** A ZIP built while the browser waits: small selections, and any selection where the server has no queue. */
+async function downloadZipNow(paths) {
     // Still through a Blob: the archive is built by a POST, which the browser
     // cannot hand to its download manager with the CSRF header attached.
     // Caught here because this runs straight from a click: a refusal (nothing
@@ -1684,7 +1689,7 @@ async function downloadSelected() {
         toast('Preparing the archive…');
         const r = await api('/api/files/download-zip', {
             method: 'POST',
-            body: { files: [...S.selected] }
+            body: { files: paths }
         });
         saveBlob(await r.blob(), 'download.zip');
     } catch (e) {
@@ -2055,7 +2060,7 @@ $('#recalculate-usage').addEventListener('click', () => loadStorage(true));
  * audit entry; a second path to the same dangerous operation is the last thing
  * this feature should add.
  */
-const dupeState = { groups: [], selected: new Set(), scanning: false, job: null, timer: 0 };
+const dupeState = { groups: [], selected: new Set(), scanning: false, cancel: false, job: null, timer: 0 };
 
 function dupeKept(group) {
     // The copy to keep by default: shallowest path, then oldest, then by name,
@@ -2142,7 +2147,7 @@ function applyDupeProgress(d) {
 
 async function scanDuplicates() {
     if (dupeState.scanning) {
-        if (!dupeState.job) return;
+        if (!dupeState.job) { dupeState.cancel = true; return; }
         try {
             await api(`/api/jobs/${dupeState.job}/cancel`, { method: 'POST' });
             $('#dupe-status').textContent += ' Stopping…';
@@ -2152,37 +2157,69 @@ async function scanDuplicates() {
         return;
     }
     const path = $('#dupe-path').value.trim() || '/';
+    if (!tasks.available) return scanDuplicatesHere(path);
     try {
         const job = await queueTask('duplicates', { path });
         dupeState.selected.clear();
         $('#dupe-groups').innerHTML = '';
         followDuplicateScan(job.id);
     } catch (e) {
+        if (noteQueueUnavailable(e)) return scanDuplicatesHere(path);
         $('#dupe-progress').hidden = false;
         $('#dupe-status').textContent = e.message;
     }
 }
 
 /**
- * Show a running scan until it ends: the finder's state for progress and the
+ * The scan as a poll loop, a slice of work per request, while the page stays
+ * open: how it ran before tasks, and how it runs where the server has no
+ * queue.
+ */
+async function scanDuplicatesHere(path) {
+    dupeState.scanning = true;
+    dupeState.cancel = false;
+    dupeState.selected.clear();
+    $('#dupe-scan').textContent = 'Stop';
+    $('#dupe-progress').hidden = false;
+    $('#dupe-groups').innerHTML = '';
+
+    let restart = true;
+    try {
+        for (;;) {
+            const d = await (await api('/api/duplicates/scan', { method: 'POST', body: { path, restart } })).json();
+            restart = false;
+            applyDupeProgress(d);
+            renderDuplicates();
+            if (d.done) break;
+            if (dupeState.cancel) { $('#dupe-status').textContent += ' Stopped.'; break; }
+        }
+    } catch (e) {
+        $('#dupe-status').textContent = e.message;
+    } finally {
+        dupeState.scanning = false;
+        dupeState.cancel = false;
+        $('#dupe-scan').textContent = 'Scan';
+    }
+}
+
+/**
+ * Show a scan task until it ends: the finder's state for progress and the
  * groups found so far, and the task for whether it is still going.
  */
 function followDuplicateScan(jobId) {
     dupeState.scanning = true;
     dupeState.job = jobId;
-    $('#dupe-scan').textContent = jobId ? 'Stop' : 'Scan';
-    $('#dupe-scan').disabled = !jobId;
+    $('#dupe-scan').textContent = 'Stop';
     $('#dupe-progress').hidden = false;
     clearTimeout(dupeState.timer);
     const step = async () => {
         let job = null;
         try {
-            if (jobId) job = (await (await api(`/api/jobs/${jobId}`)).json()).job;
+            job = (await (await api(`/api/jobs/${jobId}`)).json()).job;
             const d = await (await api('/api/duplicates/scan')).json();
             if (d.started !== false) { applyDupeProgress(d); renderDuplicates(); }
             if (job?.status === 'pending') $('#dupe-status').textContent = 'Waiting to start…';
-            const over = jobId ? !['pending', 'processing'].includes(job?.status) : d.done;
-            if (!over) { dupeState.timer = setTimeout(step, 1500); return; }
+            if (['pending', 'processing'].includes(job?.status)) { dupeState.timer = setTimeout(step, 1500); return; }
             if (job?.status === 'cancelled') $('#dupe-status').textContent += ' Stopped.';
             if (job?.status === 'failed') $('#dupe-status').textContent = job.error || 'The scan failed.';
         } catch (e) {
@@ -2191,7 +2228,6 @@ function followDuplicateScan(jobId) {
         dupeState.scanning = false;
         dupeState.job = null;
         $('#dupe-scan').textContent = 'Scan';
-        $('#dupe-scan').disabled = false;
     };
     step();
 }
@@ -2260,6 +2296,11 @@ $('#dupe-delete').addEventListener('click', async () => {
  * the work begins, or is holding it open while it works; nothing here waits.
  */
 const tasks = {
+    // False when the server has no queue (its jobs table is missing and could
+    // not be created): nothing is queued, and every action works the way it
+    // did before there were tasks.
+    available: true,
+    unavailable: '',
     active: 0,
     runner: '',
     timer: 0,
@@ -2275,6 +2316,20 @@ const canWrite = () => S.role === 'editor' || S.role === 'admin';
 function signedIn() {
     document.querySelectorAll('[data-writer]').forEach(el => el.hidden = !canWrite());
     watchTasks();
+}
+
+/** Controls that only exist as tasks go when the server has no queue. */
+function applyTaskAvailability() {
+    $('#selection-compress').hidden = !canWrite() || !tasks.available;
+}
+
+/** Remember that the server has no queue, from a 503 it answered with. */
+function noteQueueUnavailable(error) {
+    if (error?.code !== 'QUEUE_UNAVAILABLE') return false;
+    tasks.available = false;
+    tasks.unavailable = error.message;
+    applyTaskAvailability();
+    return true;
 }
 const TASK_STATUS = { pending: 'Queued', processing: 'Running', completed: 'Completed', failed: 'Failed', cancelled: 'Cancelled' };
 /** Store-changing types: the folder on screen is reloaded when one finishes. */
@@ -2331,6 +2386,9 @@ async function pollTasks() {
     }
     tasks.active = d.active;
     tasks.runner = d.runner;
+    tasks.available = d.available !== false;
+    tasks.unavailable = d.message || '';
+    applyTaskAvailability();
     const current = new Set(d.jobs.filter(j => j.status === 'pending' || j.status === 'processing').map(j => j.id));
     // A task that was running and is not any more has finished: find out how.
     const finished = [...tasks.watched].filter(id => !current.has(id));
@@ -2378,7 +2436,13 @@ function taskQueued(job, onDone = null) {
 }
 
 async function queueTask(type, params, onDone = null) {
-    const d = await (await api('/api/jobs', { method: 'POST', body: { type, params } })).json();
+    let d;
+    try {
+        d = await (await api('/api/jobs', { method: 'POST', body: { type, params } })).json();
+    } catch (e) {
+        noteQueueUnavailable(e);
+        throw e;
+    }
     taskQueued(d.job, onDone);
     return d.job;
 }
@@ -2410,6 +2474,12 @@ function taskResult(j) {
 
 function renderTasks() {
     const box = $('#tasks-list');
+    if (!tasks.available) {
+        $('#tasks-note').textContent = tasks.unavailable;
+        $('#tasks-clear').hidden = true;
+        box.innerHTML = '<p class="muted">Copies, deletions, downloads and duplicate scans still work; they run while this page waits, as they did before.</p>';
+        return;
+    }
     $('#tasks-note').textContent = tasks.runner === 'none' && tasks.jobs.some(j => j.status === 'pending')
         ? 'No background worker is running, so queued tasks are waiting. An administrator can start one with: php tools/worker.php'
         : 'Large copies, archives, extraction and deletions run here, on the server. They carry on if you close this page.';
@@ -2529,13 +2599,18 @@ async function makeThumbnails(path) {
     }
 }
 
-/** A ZIP of items, built by the server and downloaded once it is ready. */
+/**
+* A ZIP of items, built by the server and downloaded once it is ready -- or,
+* where the server has no queue, built while the page waits, as before.
+*/
 async function downloadAsArchive(paths) {
+    if (!tasks.available) return downloadZipNow(paths);
     try {
         const job = await queueTask('archive', { paths, mode: 'download' });
         autoDownloads.add(job.id);
         toast('Preparing the archive in the background; it downloads when ready (see Tasks)');
     } catch (x) {
+        if (noteQueueUnavailable(x)) return downloadZipNow(paths);
         toast(x.message);
     }
 }
@@ -2553,13 +2628,13 @@ async function route() {
     } else if (p === '/duplicates') {
         $('#duplicates-page').hidden = false;
         // Show whatever the last scan found without starting a new one: a scan
-        // reads files, and opening a tab should not. A scan still running --
-        // this account's task, or anyone's -- is followed until it ends.
+        // reads files, and opening a tab should not. This account's scan task,
+        // if one is still running, is followed until it ends.
         try {
             const d = await (await api('/api/duplicates/scan')).json();
             if (d.started !== false) { applyDupeProgress(d); renderDuplicates(); }
             const mine = (await (await api('/api/jobs?active=1')).json()).jobs.find(j => j.type === 'duplicates');
-            if (mine || (d.started !== false && !d.done)) followDuplicateScan(mine?.id || null);
+            if (mine) followDuplicateScan(mine.id);
         } catch { /* nothing scanned yet */ }
     } else if (p === '/tasks') {
         $('#tasks-page').hidden = false;

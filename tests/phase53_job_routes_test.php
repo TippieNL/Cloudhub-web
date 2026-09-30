@@ -51,12 +51,29 @@ $checks['and never sends a second answer'] = str_contains($run, 'catch (Throwabl
 
 // --- existing routes stay as they were ------------------------------------------------
 $wanted = substr($index, (int)strpos($index, 'function queue_wanted('), 500);
-$checks['a route only queues when the client offers it'] = str_contains($wanted, "if (\$asked === true) return true;")
-    && str_contains($wanted, "if (\$asked !== 'auto' || queue_runner(\$config) === 'none') return false;");
+$checks['a route only queues when the client offers it'] = str_contains($wanted, "if (\$asked !== true && \$asked !== 'auto') return false;")
+    && str_contains($wanted, "if (queue_runner(\$config) === 'none') return false;");
+$checks['and does the work itself where the server has no queue'] = str_contains($wanted, 'if (!queue_ready()) return false;');
 $checks['copy, delete and purge are the routes that offer it'] = substr_count($index, 'queue_wanted($b, $config,') === 3;
 $checks['moving items out of sight never replaces what took their place'] =
     str_contains($index, "if (file_exists(\$item) || is_link(\$item) || !@rename(\$hold.'/'.basename(\$item), \$item)) \$stranded = true;");
 $checks['a background scan is not advanced by the scan route meanwhile'] = substr_count($index, 'duplicates_idle();') === 2;
+$checks['and the scan route works where there is no queue'] =
+    str_contains(substr($index, (int)strpos($index, 'function duplicates_idle(): void {'), 200), 'if (!queue_ready()) return;');
+
+// --- an install without the jobs table -------------------------------------------------
+$checks['the table is created when missing, or the queue reported unavailable'] =
+    str_contains($index, '$ready = JobRepository::ensureTable(db(), !$failedLately);')
+    && str_contains($index, "Http::error(503, 'QUEUE_UNAVAILABLE', QUEUE_UNAVAILABLE_MESSAGE);");
+$checks['the list every page asks for says so, rather than failing'] =
+    str_contains($index, "if (!queue_ready()) return ['jobs' => [], 'active' => 0, 'runner' => 'none', 'available' => false, 'message' => QUEUE_UNAVAILABLE_MESSAGE];");
+$checks['the other task routes answer 503'] = substr_count($index, '    queue_require();') === 3
+    && str_contains($run, 'if (!queue_ready() || queue_runner($config) !== \'inline\') return');
+$checks['the worker creates the table too'] = str_contains($worker, 'if (!JobRepository::ensureTable(Db::connection())) {');
+$checks['the page scans and zips while it waits, as before, without a queue'] =
+    str_contains($app, 'if (!tasks.available) return scanDuplicatesHere(path);')
+    && str_contains($app, 'if (!tasks.available) return downloadZipNow(paths);')
+    && str_contains($app, 'const writer = canWrite() && tasks.available;');
 $checks['.jobs is reserved at the root'] = str_contains($fileService, "public const RESERVED_ROOT_NAMES=['.trash','.thumbnails','.uploads','.jobs'];");
 $checks['the worker only runs from the command line'] = str_contains($worker, "if (PHP_SAPI !== 'cli') { http_response_code(404); exit; }");
 

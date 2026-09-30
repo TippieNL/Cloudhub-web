@@ -38,7 +38,9 @@ function extract_js51(string $source, string $signature): string {
     return '';
 }
 
-$zip = extract_js51($app, 'async function downloadSelected()');
+// The ZIP built while the browser waits moved into its own function when
+// large selections began going through background tasks.
+$zip = extract_js51($app, 'async function downloadZipNow(paths)');
 $checks['a refused ZIP is reported'] = str_contains($zip, 'try {') && str_contains($zip, "} catch (e) {\n        toast(e.message);");
 
 $boot = substr($app, (int)strrpos($app, '(async () => {'));
