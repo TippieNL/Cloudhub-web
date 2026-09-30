@@ -40,12 +40,18 @@ final class DuplicateFinder
 
     private string $cacheDir;
 
-    public function __construct(private array $config, private FileService $files)
+    /**
+     * @param string|null $cacheDir where the scan and the hash cache are kept;
+     *   the installation's own by default. The background job passes the one
+     *   its environment names, so a worker run against another project
+     *   directory -- a test's, say -- never touches this installation's scan.
+     */
+    public function __construct(private array $config, private FileService $files, ?string $cacheDir = null)
     {
         // Beside usage.json, the trash-purge stamp and the ledger sweep cursor:
         // outside the storage root, so this bookkeeping is never listed,
         // searched, counted, or reported as a duplicate of itself.
-        $this->cacheDir = dirname(__DIR__, 2).'/storage/.cache';
+        $this->cacheDir = $cacheDir ?? dirname(__DIR__, 2).'/storage/.cache';
     }
 
     /**
