@@ -51,6 +51,14 @@ file later saved under the same name is never served to someone holding an old
 link; moving or renaming the file, or a folder above it, carries its links
 along.
 
+Paths are matched byte for byte. MySQL compares `file_path` ignoring case,
+accents and trailing spaces, so `/Report.pdf` and `/report.pdf`, or
+`/café.jpg` and `/cafe.jpg`, were one path to it: renaming one moved the
+other's public link onto it — its holder was then served a file nobody had
+shared — and sharing `/cafe.jpg` handed out `/café.jpg`'s live link. The same
+rule now governs the upload ledger, where the collation moved or dropped quota
+rows belonging to the lookalike.
+
 A share URL ends in the file's extension, so `.htaccess`, `router.php` and
 `deploy/nginx-security.conf.example` route `/share/` before any deny rule: a
 shared `notes.log`, `dump.sql` or MPEG-TS `clip.ts` used to be refused with a
@@ -296,7 +304,12 @@ The trash lives at `.trash` inside the storage root, so moving a file into it
 is always a same-filesystem rename — instant, and impossible to half-finish.
 That directory is reserved: it is never listed, never searched, and cannot be
 addressed through any file route, so the trash cannot be browsed or emptied
-except through `/api/trash`. Listing the trash needs only read access;
+except through `/api/trash`. The same goes for `.uploads` and `.thumbnails`,
+and no upload, move or copy can create any of the three at the root either
+(`403 That name is reserved`): a file uploaded as `.trash` before anything had
+been deleted used to take the trash's place and make every later delete fail,
+and a folder moved in as `.thumbnails` vanished from every listing and quota.
+Bulk ZIP downloads leave them out too. Listing the trash needs only read access;
 restoring and purging need write access, like any other change to the store.
 
 ## Accounts and roles
@@ -308,13 +321,27 @@ which requires their current one.
 
 | Role | Can |
 |---|---|
-| `viewer` | Browse, preview, download (including bulk ZIP) and create share links |
-| `editor` | Also upload, rename, move and delete |
+| `viewer` | Browse, preview and download (including bulk ZIP) |
+| `editor` | Also upload, rename, move, delete and create share links |
+
+A share link hands a file to anyone who holds it, without an account, so
+creating and revoking one needs the `editor` role: `POST /api/shares/create`
+answers a viewer with `403`. (This table used to list share links under
+`viewer`; the server has always required `editor`.)
 | `admin` | Also manage storage servers and accounts, and read the audit trail |
 
 The API behind the screen is `/api/users` (administrator-only) plus
 `POST /api/users/me/password` (any signed-in user). Password hashes are never
 returned by any of them.
+
+Storage-server configuration is administrator-only as well. `GET
+/api/servers/active`, which any signed-in account may call, returns each
+active server's id, name, type and flags; it used to return the whole
+configuration — hosts, accounts, paths and the HTTP adapter's request
+headers, bearer tokens included — to viewers. Administrators see the
+configuration with every credential-like field masked (`password`,
+`passphrase`, `apiKey`, `privateKey`, `headers`, anything named like a token
+or secret), and a masked value sent back in a `PUT` keeps the stored one.
 
 Every request that is not a read — anything but `GET`, `HEAD`, `OPTIONS` and
 WebDAV's `PROPFIND` — needs the CSRF token and the `editor` role, WebDAV's
@@ -349,8 +376,10 @@ nor counted in the number it holds. Bounding the walk was rejected — a
 dashboard that stops counting early reports a number that is simply wrong.
 
 Two optional limits, both `0` (unlimited) by default, checked on every way
-bytes arrive — `POST /api/uploads/init` before a single byte is staged, and
-likewise a copy, a WebDAV `PUT` and the legacy multipart upload:
+bytes arrive — `POST /api/uploads/init` before a single byte is staged and
+again at `POST /api/uploads/complete` (bytes still being staged count against
+nobody, so uploads started side by side each passed the first check and all
+landed), and likewise a copy, a WebDAV `PUT` and the legacy multipart upload:
 
 | Setting | Caps |
 |---|---|
@@ -469,6 +498,26 @@ Downloads are handed to the browser's own download manager, which streams them
 to disk; the page used to read the whole file into memory first. A `HEAD`
 request goes first, so a missing file is reported rather than saved as a file
 holding an error, and names outside ASCII travel in `filename*`.
+
+Bulk ZIP downloads store photos, video, audio and archives as they are and
+deflate only what compresses; deflating 100 MB of video again took 2.2–3.0 s
+against 0.1–0.9 s for the same size.
+
+## File names
+
+File names are bytes on Linux, and one written on a Latin-1 system — an old
+archive unpacked, a Samba share, a WebDAV client — is not valid UTF-8 and has
+no JSON form. Such a name no longer breaks its folder: it lists with `�` in
+place of the bytes it cannot show (it used to turn the whole folder's listing
+into a 500). Moving one to the trash is refused with `422` and the file stays
+where it is — it used to be moved with an empty `meta.json`, after which it
+was unlisted, unrestorable and never purged. Rename it over WebDAV, or on the
+disk, first. CloudHub itself no longer creates such names: uploads, new
+folders, renames and WebDAV targets must be valid UTF-8 (`400`).
+
+A WebDAV `PUT` whose body ends before its `Content-Length` — a client that
+disconnected mid-upload — is discarded with `400` rather than committed over
+the file it was replacing.
 
 Existing image thumbnails continue to use the on-disk thumbnail cache. Full
 media is loaded only after the user requests a preview.

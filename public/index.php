@@ -9,6 +9,7 @@ use CloudHub\Repositories\ServerRepository;
 use CloudHub\Repositories\UserRepository;
 use CloudHub\Repositories\StorageLedger;
 use CloudHub\Repositories\FavoriteRepository;
+use CloudHub\Repositories\ShareLinkRepository;
 use CloudHub\Services\Auth;
 use CloudHub\Services\UploadService;
 use CloudHub\Services\Security;
@@ -304,6 +305,11 @@ function flag_video_thumbnail(array $entry, string $root): array {
 
 const THUMBNAIL_VIDEO_EXTENSIONS = ['mp4', 'webm', 'ogv', 'ogg', 'mov', 'm4v', 'avi', 'mkv', 'mpeg', 'mpg', '3gp', '3g2', 'ts', 'm2ts', 'mts'];
 const THUMBNAIL_IMAGE_EXTENSIONS = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp'];
+/** Already-compressed formats, which a ZIP stores rather than deflates again. */
+const ZIP_STORED_EXTENSIONS = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'avif', 'heic', 'heif',
+    'mp4', 'm4v', 'mov', 'mkv', 'webm', 'avi', '3gp', '3g2', 'mpeg', 'mpg', 'ogv',
+    'mp3', 'm4a', 'aac', 'ogg', 'oga', 'opus', 'flac',
+    'zip', 'gz', 'tgz', 'bz2', 'xz', '7z', 'rar', 'docx', 'xlsx', 'pptx', 'odt', 'ods', 'odp', 'epub'];
 
 /**
  * The most pixels a thumbnail will decode.
@@ -511,7 +517,10 @@ function storage_report(FileService $fs, array $config, bool $force = false): ar
     if (!is_dir(dirname($cache)))@mkdir(dirname($cache), 0775, true);
     // Written through a temporary file, as the thumbnail cache already is: a
     // reader hitting a half-written usage.json gets JSON it cannot decode.
-    $reportJson = json_encode($report, JSON_UNESCAPED_SLASHES);
+    // Names that are not UTF-8 are substituted: the report only displays
+    // them, and failing to encode meant it was never cached at all, so every
+    // quota check and dashboard visit walked the whole store again.
+    $reportJson = json_encode($report, JSON_UNESCAPED_SLASHES|JSON_INVALID_UTF8_SUBSTITUTE);
     if ($reportJson !== false) {
         $cacheTmp = $cache.'.'.bin2hex(random_bytes(4)).'.tmp';
         if (@file_put_contents($cacheTmp, $reportJson) !== strlen($reportJson) || !@rename($cacheTmp, $cache)) {
@@ -631,15 +640,15 @@ function share_resolve(FileService $fs, string $token): array {
  * anyone holding the old link -- a file nobody chose to share -- while
  * renaming or moving a shared file silently broke its link.
  *
- * mb_strlen() for the prefix because MySQL's SUBSTR() counts characters on a
- * utf8mb4 column. Failures are logged rather than thrown: the file operation
- * has already happened and must still report its own outcome.
+ * Paths are compared byte for byte (see ShareLinkRepository): the column's
+ * collation calls "/Report.pdf" and "/report.pdf" one path, and renaming one
+ * used to hand the other's public link to the renamed file. Failures are
+ * logged rather than thrown: the file operation has already happened and must
+ * still report its own outcome.
  */
 function shares_forget(string $relative): void {
     try {
-        $prefix = rtrim($relative, '/').'/';
-        $stmt = db()->prepare('DELETE FROM share_links WHERE file_path = ? OR SUBSTR(file_path, 1, ?) = ?');
-        $stmt->execute([$relative, mb_strlen($prefix), $prefix]);
+        (new ShareLinkRepository(db()))->forget($relative);
     } catch (Throwable $e) {
         error_log('['.Http::requestId().'] share cleanup failed: '.$e->getMessage());
     }
@@ -647,15 +656,7 @@ function shares_forget(string $relative): void {
 
 function shares_relocate(string $from, string $to): void {
     try {
-        $pdo = db();
-        $pdo->prepare('UPDATE share_links SET file_path = ? WHERE file_path = ?')->execute([$to, $from]);
-        $prefix = rtrim($from, '/').'/';
-        $rows = $pdo->prepare('SELECT token, file_path FROM share_links WHERE SUBSTR(file_path, 1, ?) = ?');
-        $rows->execute([mb_strlen($prefix), $prefix]);
-        $update = $pdo->prepare('UPDATE share_links SET file_path = ? WHERE token = ?');
-        foreach ($rows->fetchAll(PDO::FETCH_ASSOC) ?: [] as $row) {
-            $update->execute([rtrim($to, '/').'/'.substr((string)$row['file_path'], strlen($prefix)), (string)$row['token']]);
-        }
+        (new ShareLinkRepository(db()))->relocate($from, $to);
     } catch (Throwable $e) {
         error_log('['.Http::requestId().'] share relocation failed: '.$e->getMessage());
     }
@@ -709,8 +710,44 @@ function share_media_kind(string $file): string {
     return 'other';
 }
 
+/**
+ * A storage server as an administrator sees it: credentials masked.
+ *
+ * Masked by what a key looks like rather than by a list of three names, which
+ * left the HTTP adapter's `headers` -- where an API's bearer token lives -- and
+ * an SFTP `passphrase` in the clear. PUT puts a masked value back unchanged.
+ */
 function mask_server(array $s): array {
-    foreach (['password', 'privateKey', 'apiKey'] as $k)if (!empty($s['config'][$k]))$s['config'][$k] = '••••••••'; return $s;
+    foreach (is_array($s['config'] ?? null) ? $s['config'] : [] as $k => $v) {
+        if (!empty($v) && preg_match('/pass|secret|token|key|auth|header|credential|cookie/i', (string)$k)) $s['config'][$k] = '••••••••';
+    }
+    return $s;
+}
+
+/**
+ * A storage server as any signed-in account may see it.
+ *
+ * /api/servers/active is readable by viewers, and the page that asks shows a
+ * name and a type. It used to return each server's whole configuration --
+ * hosts, accounts, paths and custom request headers -- to every account.
+ */
+function public_server(array $s): array {
+    return ['id' => $s['id'], 'name' => $s['name'], 'type' => $s['type'], 'isActive' => $s['isActive'], 'isDefault' => $s['isDefault']];
+}
+
+/** The fields a server may be created or updated with, validated. */
+function server_input(array $b, bool $partial): array {
+    $types = ['local', 'ftp', 'sftp', 'smb', 'http_api'];
+    if (!$partial || array_key_exists('name', $b)) {
+        if (!is_string($b['name'] ?? null) || trim($b['name']) === '' || mb_strlen($b['name']) > 190) Http::error(422, 'VALIDATION_FAILED', 'name must be a string of 1 to 190 characters');
+    }
+    if (!$partial || array_key_exists('type', $b)) {
+        if (!in_array($b['type'] ?? null, $types, true)) Http::error(422, 'VALIDATION_FAILED', 'type must be one of '.implode(', ', $types));
+    }
+    if (!$partial || array_key_exists('config', $b)) {
+        if (!is_array($b['config'] ?? null) || ($b['config'] !== [] && array_is_list($b['config']))) Http::error(422, 'VALIDATION_FAILED', 'config must be an object');
+    }
+    return $b;
 }
 
 if ($path === '/api/auth/login' && $method === 'POST') api_try(function()use($config) {
@@ -926,9 +963,12 @@ $relocate = function(callable $apply, string $verb)use($fs, $config): array {
 
     $done = 0; $failed = [];
     foreach ($paths as $rel) {
+        // Reset per item, so a refusal below is judged on this item alone and
+        // never on the previous iteration's target.
+        $target = null; $applied = false;
         try {
             $source = $fs->existing($rel);
-            $target = rtrim($destination, '/').'/'.basename($source);
+            $target = $fs->childPath($destination, basename($source));
 
             // Copying into the same folder is a legitimate way to duplicate
             // something; moving into it is a no-op worth reporting.
@@ -946,6 +986,7 @@ $relocate = function(callable $apply, string $verb)use($fs, $config): array {
             // copying one file a hundred times stepped past any quota and
             // could fill the disk.
             if ($verb === 'copy') assert_upload_fits($fs, $config, (int)($fs->measure($source)['bytes'] ?? 0));
+            $applied = true;
             $apply($source, $target);
             // A move carries its attribution with it. A copy creates new bytes,
             // so it is charged to whoever made it -- otherwise a quota is
@@ -967,7 +1008,11 @@ $relocate = function(callable $apply, string $verb)use($fs, $config): array {
             // and stopped counting against anyone's quota; repeated failures
             // accumulated untracked storage. Charge whatever actually landed
             // -- deleting it instead would destroy data on a partial failure.
-            if ($verb === 'copy' && isset($target)) {
+            // Only once the copy had begun: a copy refused before it -- the
+            // name is taken, the quota is full -- wrote nothing, and $target
+            // then names somebody else's file, which this used to charge to
+            // the copier, taking it off its real uploader's account.
+            if ($verb === 'copy' && $applied) {
                 foreach ($fs->copiedFiles($target) as $copied) {
                     ledger()->record($fs->relative($copied), basename($copied),
                         (int)(filesize($copied)?:0), null, Auth::user()['id'] ?? null);
@@ -1332,9 +1377,16 @@ if ($path === '/api/uploads/chunk' && $method === 'PUT') api_try(function() {
     $id = (string)($_GET['id']??''); $offset = (int)($_SERVER['HTTP_X_UPLOAD_OFFSET']??-1);
     return uploads()->append($id, $offset, 'php://input');
 });
-if ($path === '/api/uploads/complete' && $method === 'POST') api_try(function()use($fs) {
+if ($path === '/api/uploads/complete' && $method === 'POST') api_try(function()use($fs, $config) {
     $b = Http::body();
-    $done = uploads()->complete((string)($b['id']??''));
+    $id = (string)($b['id']??'');
+    // Checked again where the file lands. init only saw what was stored when
+    // it began, and bytes still being staged count against nobody, so several
+    // uploads started together each passed the quota and all of them landed.
+    // The browser sends files one at a time, so for it this changes nothing.
+    $staged = (int)(uploads()->status($id)['size'] ?? 0);
+    if ($staged > 0)assert_upload_fits($fs, $config, $staged);
+    $done = uploads()->complete($id);
 
     // Attribute the finished file to whoever uploaded it, so a per-account
     // quota has something to count. Best-effort, like the audit log.
@@ -1431,7 +1483,7 @@ if ($path === '/api/files/upload' && $method === 'POST') api_try(function()use($
             if (!is_uploaded_file((string)($tmp[$i]??''))) throw new RuntimeException('Invalid upload data received for '.$safe, 400);
             $size = (int)($sizes[$i]??0);
             assert_upload_fits($fs, $config, $size);
-            $dest = $target.'/'.$safe;
+            $dest = $fs->childPath($target, $safe);
             if (file_exists($dest)) {
                 if ($conflict === 'reject' || ($conflict === 'overwrite' && (!$config['allow_overwrite'] || is_dir($dest)))) {
                     throw new RuntimeException('File already exists: '.$safe, 409);
@@ -1507,22 +1559,38 @@ if ($path === '/api/files/upload' && $method === 'POST') api_try(function()use($
 
         $add = function(string $full, string $prefix)use(&$add, $zip, $fs): void {
             if (is_dir($full)) {
-                $entries = array_values(array_filter(scandir($full)?:[], fn($n) => $n !== '.' && $n !== '..'));
+                // childPaths() applies the listing's rules: symlinks skipped,
+                // and CloudHub's own .trash and .uploads left out. Walked with
+                // a bare scandir(), a ZIP of "/" handed any signed-in account
+                // every deleted file, the trash's per-account bookkeeping and
+                // other people's unfinished uploads, which no other route
+                // reaches.
+                $entries = $fs->childPaths($full);
                 // An empty directory has no files to imply it, so without this
                 // it disappeared from the archive entirely.
                 if (!$entries) {
                     $zip->addEmptyDir(ltrim($prefix, '/'));
                     return;
                 }
-                foreach ($entries as $n) {
-                    if ($fs->escapingSymlink($full.'/'.$n))continue;
-                    $add($full.'/'.$n, $prefix.'/'.$n);
-                }
+                foreach ($entries as $child)$add($child, $prefix.'/'.basename($child));
                 return;
             }
-            if (is_file($full))$zip->addFile($full, ltrim($prefix, '/'));
+            if (!is_file($full))return;
+            $entry = ltrim($prefix, '/');
+            $zip->addFile($full, $entry);
+            // Photos, video, audio and archives are compressed already, and
+            // deflating them again gains nothing while costing most of the
+            // time the archive takes: 100 MB of video took 2.2-3.0 s deflated
+            // against 0.1-0.9 s stored, for the same size.
+            if (in_array(strtolower(pathinfo($full, PATHINFO_EXTENSION)), ZIP_STORED_EXTENSIONS, true)
+                && method_exists($zip, 'setCompressionName')) {
+                $zip->setCompressionName($entry, ZipArchive::CM_STORE);
+            }
         };
 
+        // Building a large archive can outlast max_execution_time, as streaming
+        // one can; serve_file_range() lifts it for the same reason.
+        @set_time_limit(0);
         try {
             foreach ($files as $p) {
                 $f = $fs->existing((string)$p);
@@ -1578,11 +1646,17 @@ if ($path === '/api/files/upload' && $method === 'POST') api_try(function()use($
          */
         $wantPermanent = $hours <= 0;
         $s = $pdo->prepare($wantPermanent
-            ? 'SELECT token,expires_at FROM share_links WHERE file_path=? AND expires_at IS NULL LIMIT 1'
-            : 'SELECT token,expires_at FROM share_links WHERE file_path=? AND expires_at IS NOT NULL'
-                .' AND expires_at>UTC_TIMESTAMP() AND ABS(TIMESTAMPDIFF(SECOND, expires_at, ?))<=60 LIMIT 1');
+            ? 'SELECT token,file_path,expires_at FROM share_links WHERE file_path=? AND expires_at IS NULL'
+            : 'SELECT token,file_path,expires_at FROM share_links WHERE file_path=? AND expires_at IS NOT NULL'
+                .' AND expires_at>UTC_TIMESTAMP() AND ABS(TIMESTAMPDIFF(SECOND, expires_at, ?))<=60');
         $s->execute($wantPermanent ? [$rel] : [$rel, gmdate('Y-m-d H:i:s', time()+$hours*3600)]);
-        $r = $s->fetch(PDO::FETCH_ASSOC);
+        // file_path compares ignoring case and accents, so "/cafe.jpg" found
+        // the live link of "/café.jpg" and handed it out as this file's. Only
+        // a byte-for-byte match is this file's link; see ShareLinkRepository.
+        $r = null;
+        foreach ($s->fetchAll(PDO::FETCH_ASSOC) ?: [] as $candidate) {
+            if ((string)$candidate['file_path'] === $rel) { $r = $candidate; break; }
+        }
 
         if (!$r) {
             $token = rtrim(strtr(base64_encode(random_bytes(32)), '+/', '-_'), '=');
@@ -1959,16 +2033,17 @@ if ($path === '/api/files/upload' && $method === 'POST') api_try(function()use($
 
     if (str_starts_with($path, '/api/servers')) api_try(function()use($path, $method) {
         $repo = new ServerRepository();
-        if ($path === '/api/servers/active' && $method === 'GET')return array_map('mask_server', $repo->all(true));
+        // Configuration is for administrators; everyone else gets the names.
+        if ($path === '/api/servers/active' && $method === 'GET')return array_map(Authorization::isAdmin() ? 'mask_server' : 'public_server', $repo->all(true));
         Authorization::requireAdmin();
         if ($path === '/api/servers' && $method === 'GET')return array_map('mask_server', $repo->all()); if ($path === '/api/servers' && $method === 'POST') {
-            $b = Http::body(); if (empty($b['name']) || empty($b['type'])||!isset($b['config']))throw new RuntimeException('name, type, and config are required', 400); return mask_server($repo->create(['name' => $b['name'], 'type' => $b['type'], 'config' => $b['config'], 'isActive' => $b['isActive']??true, 'isDefault' => $b['isDefault']??false]));
+            $b = server_input(Http::body(), false); return mask_server($repo->create(['name' => trim($b['name']), 'type' => $b['type'], 'config' => $b['config'], 'isActive' => (bool)($b['isActive']??true), 'isDefault' => (bool)($b['isDefault']??false)]));
         }if (preg_match('#^/api/servers/(\d+)(?:/(toggle|set-default))?$#', $path, $m)) {
             $id = (int)$m[1]; $s = $repo->get($id); if (!$s)throw new RuntimeException('Server not found', 404); if ($method === 'GET')return mask_server($s); if ($method === 'DELETE') {
                 $repo->delete($id); return ['success' => true,
                     'message' => 'Server deleted'];
             }if ($method === 'PUT') {
-                $b = Http::body(); if (isset($b['config']))foreach ($b['config'] as $k => $v)if ($v === '••••••••')$b['config'][$k] = $s['config'][$k]??$v; return mask_server($repo->update($id, $b));
+                $b = server_input(Http::body(), true); if (isset($b['config']))foreach ($b['config'] as $k => $v)if ($v === '••••••••')$b['config'][$k] = $s['config'][$k]??$v; return mask_server($repo->update($id, $b));
             }if (($m[2]??'') === 'toggle' && $method === 'POST')return mask_server($repo->update($id, ['isActive'=>!$s['isActive']])); if (($m[2]??'') === 'set-default' && $method === 'POST') {
                 $repo->setDefault($id); return ['success' => true,
                     'message' => $s['name'].' set as default'];

@@ -87,11 +87,30 @@ final class FileService {
  public function destination(string $requested): string {
   $candidate=$this->sanitize($requested);
   if($candidate===$this->root)throw new RuntimeException('The storage root cannot be used as a destination item',400);
+  self::assertUtf8Name(basename($candidate));
   $parent=dirname($candidate);$realParent=realpath($parent);
   if($realParent===false||!is_dir($realParent))throw new RuntimeException('Destination parent directory not found',404);
   $realParent=str_replace('\\','/',$realParent);$this->assertContained($realParent);
   if($this->pathContainsSymlink($parent))throw new RuntimeException('Symlink destinations are not allowed',403);
   return rtrim($realParent,'/').'/'.basename($candidate);
+ }
+
+ /**
+  * The path of a new item called $name inside the existing directory $dir.
+  *
+  * sanitize() keeps CloudHub's own names off every path a client asks for,
+  * but uploads, moves and copies build their target from a folder and a name
+  * instead, and nothing checked the name. A file called ".trash" uploaded to
+  * the root before anything had been deleted made every later delete fail for
+  * everyone; a folder called ".thumbnails" moved there vanished from listings,
+  * search, the storage report and the quota, beyond reach of any route; and a
+  * crafted ".trash" folder became the trash, whose bookkeeping a restore
+  * believes. Every target built that way comes through here.
+  */
+ public function childPath(string $dir,string $name): string {
+  $dir=rtrim(str_replace('\\','/',$dir),'/');
+  if($dir===$this->root&&self::isReservedRootName($name))throw new RuntimeException('That name is reserved',403);
+  return $dir.'/'.$name;
  }
 
  public function relative(string $full): string {
@@ -172,8 +191,22 @@ final class FileService {
   if(str_contains($name,"\0"))throw new RuntimeException('Invalid filename',400);
   $n=basename(str_replace('\\','/',$name));
   if($n===''||$n==='.'||$n==='..'||preg_match('/[\x00-\x1F\x7F]/u',$n))throw new RuntimeException('Invalid filename',400);
+  self::assertUtf8Name($n);
   if(strlen($n)>255)throw new RuntimeException('Filename is too long',400);
   return $n;
+ }
+
+ /**
+  * Refuse to create a name that is not valid UTF-8.
+  *
+  * Such a name has no JSON form, so CloudHub could list it only as a
+  * lookalike it cannot address -- no download, rename or delete -- and the
+  * control-character check above never saw it: preg_match() with /u returns
+  * false on invalid UTF-8, which reads as "no match". Existing files with
+  * such names stay reachable over WebDAV; this only stops making new ones.
+  */
+ private static function assertUtf8Name(string $name): void {
+  if(!mb_check_encoding($name,'UTF-8'))throw new RuntimeException('File names must be valid UTF-8 text',400);
  }
 
  public function deleteTree(string $path): void {
@@ -564,20 +597,30 @@ final class FileService {
 
   $id=gmdate('Ymd-His').'-'.bin2hex(random_bytes(4));
   $entry=$this->trashRoot().'/'.$id;
+  $name=basename($realPath);
+
+  $meta=['id'=>$id,'name'=>$name,'originalPath'=>$original,'isDirectory'=>$isDir,
+   'bytes'=>$measured['bytes'],'files'=>$measured['files'],
+   'deletedAt'=>gmdate('c'),'deletedBy'=>$actor];
+  /*
+   * Encoded before anything moves. A name that is not valid UTF-8 has no JSON
+   * form: json_encode() returned false, file_put_contents() wrote an empty
+   * meta.json and reported success, and the item was gone from the trash for
+   * good -- unlisted, unrestorable, never purged -- while the caller was told
+   * it had been moved there. It stays where it is instead.
+   */
+  $metaJson=json_encode($meta,JSON_UNESCAPED_SLASHES|JSON_PRETTY_PRINT);
+  if($metaJson===false)throw new RuntimeException('"'.mb_scrub($name,'UTF-8').'" cannot go to the trash because its name is not valid UTF-8; rename it first',422);
+
   // Suppressed because the return value is checked right here and turned
   // into an exception that says what failed and why; the raw warning is the
   // same fact with less context, and bootstrap's handler logs the throw.
   if(!@mkdir($entry.'/payload',0775,true))throw new RuntimeException('Unable to open the trash',500);
 
-  $name=basename($realPath);
   if(!rename($realPath,$entry.'/payload/'.$name)){
    $this->deleteTree($entry);
    throw new RuntimeException('Unable to move '.$name.' to the trash',500);
   }
-
-  $meta=['id'=>$id,'name'=>$name,'originalPath'=>$original,'isDirectory'=>$isDir,
-   'bytes'=>$measured['bytes'],'files'=>$measured['files'],
-   'deletedAt'=>gmdate('c'),'deletedBy'=>$actor];
 
   /*
    * A trash entry without readable metadata is worse than a failed delete.
@@ -592,7 +635,9 @@ final class FileService {
    * deleting things. So the move is put back and the delete fails loudly,
    * leaving the file where the user last saw it.
    */
-  if(file_put_contents($entry.'/meta.json',json_encode($meta,JSON_UNESCAPED_SLASHES|JSON_PRETTY_PRINT))===false){
+  // Compared with the length, not with false: a short write -- the disk
+  // filling part way -- is as unreadable as no write at all.
+  if(file_put_contents($entry.'/meta.json',$metaJson)!==strlen($metaJson)){
    if(!rename($entry.'/payload/'.$name,$realPath))
     throw new RuntimeException('Unable to record the deletion of '.$name.', and it could not be put back. It is in '.$this->relative($entry),500);
    $this->deleteTree($entry);

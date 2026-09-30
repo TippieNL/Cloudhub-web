@@ -25,11 +25,16 @@ const S = {
     results: null
 };
 const $ = s => document.querySelector(s);
+let toastTimer = 0;
 const toast = m => {
     const t = $('#toast');
     t.textContent = m;
     t.style.display = 'block';
-    setTimeout(() => t.style.display = 'none', 2200);
+    // Each message gets its full time on screen: an earlier message's timer
+    // used to hide the one that replaced it, so "Preparing…" cut a quick
+    // error short.
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => t.style.display = 'none', 2200);
 };
 
 async function api(url, opt = {}) {
@@ -77,7 +82,7 @@ async function login(u, p) {
     $('#nav-users').hidden = S.role !== 'admin';
     $('#nav-storage').hidden = S.role !== 'admin';
     $('#login').style.display = 'none';
-    await route();
+    await openRoute();
 }
 
 $('#login-form').addEventListener('submit', async e => {
@@ -563,70 +568,65 @@ function renderFiles() {
         </article>`;
     }).join('');
 
-    // Images still use the authenticated server-side image thumbnail endpoint.
-    document.querySelectorAll('.thumb-preview:not(.video-thumb) img').forEach(img => {
-        img.addEventListener('error', () => {
-            const button = img.closest('.thumb-preview');
-            if (!button) return;
-            button.replaceWith(Object.assign(document.createElement('span'), {
-                className: 'file-icon',
-                textContent: '🖼️'
-            }));
-        }, { once: true });
-    });
-
     // Frames for files no longer listed can go; the rest stay cached so a
     // search keystroke or sort change does not re-decode them.
     releaseStaleVideoThumbs(new Set(currentEntries().map(videoThumbKey)));
 
     initVideoThumbnails();
-
-    document.querySelectorAll('[data-open]').forEach(b => {
-        b.addEventListener('click', e => {
-            e.stopPropagation();
-            loadFiles(decodeURIComponent(b.dataset.open));
-        });
-    });
-    document.querySelectorAll('[data-preview]').forEach(b => {
-        b.addEventListener('click', e => {
-            e.stopPropagation();
-            openPreview(decodeURIComponent(b.dataset.preview));
-        });
-    });
-    document.querySelectorAll('[data-down]').forEach(b => {
-        b.addEventListener('click', e => {
-            e.stopPropagation();
-            download(decodeURIComponent(b.dataset.down));
-        });
-    });
-    document.querySelectorAll('[data-share]').forEach(b => {
-        b.addEventListener('click', e => {
-            e.stopPropagation();
-            share(decodeURIComponent(b.dataset.share));
-        });
-    });
-    document.querySelectorAll('[data-menu]').forEach(b => {
-        b.addEventListener('click', e => {
-            e.stopPropagation();
-            showContextMenu(decodeURIComponent(b.dataset.menu), e.clientX, e.clientY);
-        });
-    });
-    document.querySelectorAll('[data-sel]').forEach(c => {
-        c.addEventListener('change', () => toggleSelection(decodeURIComponent(c.dataset.sel), c.checked));
-    });
-    document.querySelectorAll('.file').forEach(card => {
-        card.addEventListener('contextmenu', e => {
-            e.preventDefault();
-            showContextMenu(decodeURIComponent(card.dataset.path), e.clientX, e.clientY);
-        });
-        card.addEventListener('dblclick', () => {
-            const p = decodeURIComponent(card.dataset.path);
-            const f = currentEntries().find(x => x.path === p);
-            f?.isDirectory ? loadFiles(p) : openPreview(p);
-        });
-    });
     updateSelectionUI();
 }
+
+/*
+ * The file list's listeners, bound once to the list itself.
+ *
+ * renderFiles() used to attach six or seven listeners to every card each time
+ * it ran -- every debounced keystroke, sort change and view toggle -- after a
+ * document-wide query for each kind: on a 3,200-file folder, some 20,000
+ * closures per render. The markup is still rebuilt; the listeners are not.
+ */
+const fileList = $('#file-list');
+fileList.addEventListener('click', e => {
+    const b = e.target.closest('[data-open],[data-preview],[data-down],[data-share],[data-menu]');
+    if (!b || !fileList.contains(b)) return;
+    // As the per-button listeners did: the click goes no further, so the
+    // document's handler that closes the context menu does not see it.
+    e.stopPropagation();
+    const d = b.dataset;
+    if (d.open !== undefined) loadFiles(decodeURIComponent(d.open));
+    else if (d.preview !== undefined) openPreview(decodeURIComponent(d.preview));
+    else if (d.down !== undefined) download(decodeURIComponent(d.down));
+    else if (d.share !== undefined) share(decodeURIComponent(d.share));
+    else showContextMenu(decodeURIComponent(d.menu), e.clientX, e.clientY);
+});
+fileList.addEventListener('change', e => {
+    const c = e.target.closest('[data-sel]');
+    if (c && fileList.contains(c)) toggleSelection(decodeURIComponent(c.dataset.sel), c.checked);
+});
+fileList.addEventListener('contextmenu', e => {
+    const card = e.target.closest('.file');
+    if (!card || !fileList.contains(card)) return;
+    e.preventDefault();
+    showContextMenu(decodeURIComponent(card.dataset.path), e.clientX, e.clientY);
+});
+fileList.addEventListener('dblclick', e => {
+    const card = e.target.closest('.file');
+    if (!card || !fileList.contains(card)) return;
+    const p = decodeURIComponent(card.dataset.path);
+    const f = currentEntries().find(x => x.path === p);
+    f?.isDirectory ? loadFiles(p) : openPreview(p);
+});
+// Images still use the authenticated server-side image thumbnail endpoint. A
+// load error does not bubble, so it is caught on the way down instead.
+fileList.addEventListener('error', e => {
+    const img = e.target;
+    if (!(img instanceof HTMLImageElement)) return;
+    const button = img.closest('.thumb-preview');
+    if (!button || button.classList.contains('video-thumb')) return;
+    button.replaceWith(Object.assign(document.createElement('span'), {
+        className: 'file-icon',
+        textContent: '🖼️'
+    }));
+}, true);
 
 /** Bumped per preview, so a slow response cannot fill a dialog opened after it. */
 let previewRun = 0;
@@ -1643,32 +1643,47 @@ async function downloadSelected() {
     if (!S.selected.size) return toast('Select files first');
     // Still through a Blob: the archive is built by a POST, which the browser
     // cannot hand to its download manager with the CSRF header attached.
-    const r = await api('/api/files/download-zip', {
-        method: 'POST',
-        body: { files: [...S.selected] }
-    });
-    saveBlob(await r.blob(), 'download.zip');
+    // Caught here because this runs straight from a click: a refusal (nothing
+    // readable, too many files) used to vanish as an unhandled rejection,
+    // leaving the button looking as if it did nothing.
+    try {
+        toast('Preparing the archive…');
+        const r = await api('/api/files/download-zip', {
+            method: 'POST',
+            body: { files: [...S.selected] }
+        });
+        saveBlob(await r.blob(), 'download.zip');
+    } catch (e) {
+        toast(e.message);
+    }
 }
 $('#zip').addEventListener('click', downloadSelected);
 $('#selection-download').addEventListener('click', downloadSelected);
 
 async function servers() {
-    const list = await (await api('/api/servers')).json();
-    $('#server-list').innerHTML = list.map(s => `<div class="server"><strong>${esc(s.name)}</strong> <small>${s.type}${s.isDefault ? ' · default' : ''}${s.isActive ? ' · active' : ' · inactive'}</small><div class="actions"><button data-toggle="${s.id}">Toggle</button><button data-default="${s.id}">Set default</button><button data-sdel="${s.id}">Delete</button></div></div>`).join('');
-    
-    document.querySelectorAll('[data-toggle]').forEach(b => b.addEventListener('click', async () => {
-        await api(`/api/servers/${b.dataset.toggle}/toggle`, { method: 'POST' });
-        servers();
-    }));
-    document.querySelectorAll('[data-default]').forEach(b => b.addEventListener('click', async () => {
-        await api(`/api/servers/${b.dataset.default}/set-default`, { method: 'POST' });
-        servers();
-    }));
-    document.querySelectorAll('[data-sdel]').forEach(b => b.addEventListener('click', async () => {
-        if (await askConfirm('Delete server', 'Delete this storage server?', 'Delete')) {
-            await api(`/api/servers/${b.dataset.sdel}`, { method: 'DELETE' });
-            servers();
+    let list;
+    try {
+        list = await (await api('/api/servers')).json();
+    } catch (e) {
+        $('#server-list').innerHTML = `<p class="error">${esc(e.message)}</p>`;
+        return;
+    }
+    $('#server-list').innerHTML = list.map(s => `<div class="server"><strong>${esc(s.name)}</strong> <small>${esc(String(s.type))}${s.isDefault ? ' · default' : ''}${s.isActive ? ' · active' : ' · inactive'}</small><div class="actions"><button data-toggle="${s.id}">Toggle</button><button data-default="${s.id}">Set default</button><button data-sdel="${s.id}">Delete</button></div></div>`).join('');
+
+    // A failed action is reported rather than left as an unhandled rejection,
+    // and the list is redrawn either way so it shows what the server holds.
+    const act = async (url, method) => {
+        try {
+            await api(url, { method });
+        } catch (e) {
+            toast(e.message);
         }
+        servers();
+    };
+    document.querySelectorAll('[data-toggle]').forEach(b => b.addEventListener('click', () => act(`/api/servers/${b.dataset.toggle}/toggle`, 'POST')));
+    document.querySelectorAll('[data-default]').forEach(b => b.addEventListener('click', () => act(`/api/servers/${b.dataset.default}/set-default`, 'POST')));
+    document.querySelectorAll('[data-sdel]').forEach(b => b.addEventListener('click', async () => {
+        if (await askConfirm('Delete server', 'Delete this storage server?', 'Delete')) act(`/api/servers/${b.dataset.sdel}`, 'DELETE');
     }));
 }
 
@@ -2194,31 +2209,52 @@ async function route() {
         await servers();
     } else if (p === '/browse') {
         $('#browse-page').hidden = false;
-        const a = await (await api('/api/servers/active')).json();
-        $('#active-servers').innerHTML = a.map(s => `<div class="server">${esc(s.name)} · ${s.type}</div>`).join('');
+        try {
+            const a = await (await api('/api/servers/active')).json();
+            $('#active-servers').innerHTML = a.map(s => `<div class="server">${esc(s.name)} · ${esc(String(s.type))}</div>`).join('');
+        } catch (e) {
+            $('#active-servers').innerHTML = `<p class="error">${esc(e.message)}</p>`;
+        }
     } else {
         $('#files-page').hidden = false;
         await loadFiles();
     }
 }
 
+/**
+ * Open the page the URL names, reporting a failure as what it is.
+ *
+ * The two callers used to share a catch with the sign-in itself, so a server
+ * error opening the first folder put the sign-in form in front of somebody who
+ * was signed in -- or, straight after signing in, wrote the error into a form
+ * that had just been hidden.
+ */
+async function openRoute() {
+    try {
+        await route();
+    } catch (e) {
+        toast(e.message);
+    }
+}
+
 (async () => {
+    let d;
     try {
         const r = await fetch(appUrl('/api/auth/status'), { credentials: 'same-origin' });
-        const d = await r.json();
-        if (d.authenticated) {
-            S.csrf = d.csrfToken || '';
-            S.role = d.user?.role || 'viewer';
-            // Convenience only: /api/users is administrator-gated server-side.
-            $('#nav-users').hidden = S.role !== 'admin';
-            $('#nav-storage').hidden = S.role !== 'admin';
-            $('#login').style.display = 'none';
-            await route();
-        } else {
-            $('#login').style.display = 'flex';
-        }
+        d = await r.json();
     } catch {
-        $('#login').style.display = 'flex';
+        d = null;
     }
+    if (!d?.authenticated) {
+        $('#login').style.display = 'flex';
+        return;
+    }
+    S.csrf = d.csrfToken || '';
+    S.role = d.user?.role || 'viewer';
+    // Convenience only: /api/users is administrator-gated server-side.
+    $('#nav-users').hidden = S.role !== 'admin';
+    $('#nav-storage').hidden = S.role !== 'admin';
+    $('#login').style.display = 'none';
+    await openRoute();
 })();
 
