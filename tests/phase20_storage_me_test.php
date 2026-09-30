@@ -85,8 +85,12 @@ $checks['the session lock is released'] = str_contains($handler, 'release_sessio
 // figure that will refuse an upload.
 $checks['the ledger is swept before reporting'] = str_contains($handler, 'sweep_ledger_occasionally($fs);')
     && strpos($handler, 'sweep_ledger_occasionally($fs);') < strpos($handler, 'storage_report($fs, $config)');
+// assert_upload_fits() delegates to StorageQuota::assertFits(), which sweeps
+// through the same throttle the handler's sweep_ledger_occasionally() uses.
+$quotaSrc = (string)file_get_contents($root.'/src/Services/StorageQuota.php');
 $checks['and by the same helper as an upload'] = (bool)preg_match(
-    '/function assert_upload_fits\(.*?if \(\$quota > 0 && \$user !== null\) \{\s*sweep_ledger_occasionally\(\$fs\);/s', $index);
+    '/function assertFits\(.*?if \(\$quota > 0 && \$userId !== null\) \{\s*\$this->sweepOccasionally\(\);/s', $quotaSrc)
+    && str_contains($index, "cache_ready();\n    quota()->sweepOccasionally();");
 $checks['usage is read for the calling account'] =
     str_contains($handler, "ledger()->usage((int)\$user['id'])");
 

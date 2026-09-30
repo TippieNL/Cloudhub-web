@@ -17,6 +17,8 @@ use CloudHub\Services\LoginRateLimiter;
 use CloudHub\Services\Authorization;
 use CloudHub\Services\DuplicateFinder;
 use CloudHub\Services\StorageDiagnostics;
+use CloudHub\Services\StorageQuota;
+use CloudHub\Services\ImageThumbnailer;
 use CloudHub\Services\MediaProbe;
 use CloudHub\Services\AuditLog;
 
@@ -272,11 +274,9 @@ function purge_expired_trash_occasionally(FileService $fs, int $retentionDays): 
  * file yields a new key and the stale thumbnail is simply never read again.
  */
 function thumbnail_cache_path(string $file, ?int $mtime = null): ?string {
-    $mtime ??= @filemtime($file);
-    if ($mtime === false)return null;
-    $dir = dirname(__DIR__).'/storage/.thumbnails/images';
-    if (!is_dir($dir) && !@mkdir($dir, 0775, true) && !is_dir($dir))return null;
-    return $dir.'/'.md5($file.':'.$mtime).'.webp';
+    // ImageThumbnailer holds the key, so the background thumbnail job writes
+    // exactly the entries this route serves.
+    return ImageThumbnailer::cachePath(dirname(__DIR__), $file, $mtime);
 }
 
 /**
@@ -304,57 +304,11 @@ function flag_video_thumbnail(array $entry, string $root): array {
 }
 
 const THUMBNAIL_VIDEO_EXTENSIONS = ['mp4', 'webm', 'ogv', 'ogg', 'mov', 'm4v', 'avi', 'mkv', 'mpeg', 'mpg', '3gp', '3g2', 'ts', 'm2ts', 'mts'];
-const THUMBNAIL_IMAGE_EXTENSIONS = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp'];
 /** Already-compressed formats, which a ZIP stores rather than deflates again. */
 const ZIP_STORED_EXTENSIONS = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'avif', 'heic', 'heif',
     'mp4', 'm4v', 'mov', 'mkv', 'webm', 'avi', '3gp', '3g2', 'mpeg', 'mpg', 'ogv',
     'mp3', 'm4a', 'aac', 'ogg', 'oga', 'opus', 'flac',
     'zip', 'gz', 'tgz', 'bz2', 'xz', '7z', 'rar', 'docx', 'xlsx', 'pptx', 'odt', 'ods', 'odp', 'epub'];
-
-/**
- * The most pixels a thumbnail will decode.
- *
- * GD holds a decoded image at up to four bytes a pixel whatever the file's
- * size, so a 285 KB PNG declaring 10000x10000 pixels took one thumbnail
- * request to 704 MB -- measured -- and nothing caches the failure, so every
- * listing of that folder asked again. memory_limit is no defence: Debian and
- * Ubuntu build PHP against the system libgd, whose allocations PHP never
- * counts, and `php -S` runs with no limit at all. 50 megapixels still covers
- * a phone's full-resolution photo.
- */
-const THUMBNAIL_MAX_SOURCE_PIXELS = 50_000_000;
-
-/** Whether an image of these dimensions may be decoded for a thumbnail. */
-function thumbnail_source_fits(int $w, int $h): bool {
-    if ($w < 1 || $h < 1 || $w * $h > THUMBNAIL_MAX_SOURCE_PIXELS) return false;
-    // Where GD's memory is PHP's own (the bundled build), stay inside the
-    // limit rather than die at it with a fatal error no handler can answer.
-    $limit = (int)ini_parse_quantity((string)ini_get('memory_limit'));
-    if (defined('GD_BUNDLED') && GD_BUNDLED && $limit > 0) {
-        return $w * $h * 5 < $limit - memory_get_usage(true);
-    }
-    return true;
-}
-
-/**
- * Turn a thumbnail the way its photo's EXIF orientation says (1-8).
- *
- * Phones store a photo as the sensor saw it and record how it was held;
- * browsers apply that to the original, but GD does not and the WebP written
- * here carries no EXIF, so portrait photos lay on their side in the grid while
- * opening upright. Applied to the small thumbnail, not the full photo, so the
- * turn costs nothing worth measuring.
- */
-function thumbnail_orient(\GdImage $im, int $orientation): \GdImage {
-    if (in_array($orientation, [2, 4, 5, 7], true)) imageflip($im, IMG_FLIP_HORIZONTAL);
-    // imagerotate() turns anticlockwise.
-    $angle = match ($orientation) { 3, 4 => 180, 5, 8 => 90, 6, 7 => -90, default => 0 };
-    if ($angle === 0) return $im;
-    $turned = imagerotate($im, $angle, 0);
-    if ($turned === false) return $im;
-    imagedestroy($im);
-    return $turned;
-}
 
 /**
  * Send a cached thumbnail, answering conditional requests with 304.
@@ -466,107 +420,32 @@ function file_cache(): FileCache {
     return $cache ??= new FileCache($fs);
 }
 /**
-* ledger()->sweep(), at most once every LEDGER_SWEEP_SECONDS.
+* The store limit and per-account quota, sharing the request's ledger.
 *
-* Each sweep resolves up to 500 recorded paths, which on Android's FUSE storage
-* measured half a second -- and assert_upload_fits() ran one for every file of
-* a batch upload, so 150 files under a quota spent over a minute re-checking
-* the same rows. The sweep is the backstop for files removed behind CloudHub's
-* back; CloudHub's own deletions leave the ledger straight away. So skipping
-* a repeat within seconds can only leave a vanished file counted a little
-* longer, never let an upload through that should have been refused.
-*
-* Off with the cache (CACHE_DRIVER=none), which restores a sweep every time.
-* The admin dashboard and restore still sweep unconditionally.
+* The measuring and enforcing live in StorageQuota, so the background worker
+* refuses exactly what these routes refuse. The functions below keep the names
+* every route already calls.
 */
-const LEDGER_SWEEP_SECONDS = 30;
+function quota(): StorageQuota {
+    static $quota = null; global $fs, $config;
+    return $quota ??= new StorageQuota($fs, $config, ledger(), dirname(__DIR__));
+}
+/** StorageQuota::sweepOccasionally(), after the cache it consults is configured. */
 function sweep_ledger_occasionally(FileService $fs): void {
     cache_ready();
-    $stamp = dirname(__DIR__).'/storage/.cache/ledger-sweep';
-    if (Cache::enabled()) {
-        $last = @filemtime($stamp);
-        if ($last !== false && time() - $last < LEDGER_SWEEP_SECONDS) return;
-        if (is_dir(dirname($stamp)) || @mkdir(dirname($stamp), 0775, true) || is_dir(dirname($stamp))) @touch($stamp);
-    }
-    ledger()->sweep($fs);
+    quota()->sweepOccasionally();
 }
-/**
-* Measured storage use, cached.
-*
-* Measuring means walking the whole store, which is far too expensive to do on
-* every upload. The result is written to a small cache file and reused for
-* usage_cache_seconds; $force recomputes it for the "Recalculate" button.
-*
-* The cache lives outside the storage root so it is neither listed, searched,
-* nor counted in the figure it holds.
-*/
+/** Measured storage use, cached; see StorageQuota::report(). */
 function storage_report(FileService $fs, array $config, bool $force = false): array {
-    $cache = dirname(__DIR__).'/storage/.cache/usage.json';
-    $ttl = max(0, (int)$config['usage_cache_seconds']);
-
-    if (!$force && $ttl > 0 && is_file($cache) && time() - (int)filemtime($cache) < $ttl) {
-        $cached = json_decode((string)file_get_contents($cache), true);
-        if (is_array($cached) && isset($cached['bytes'])) {
-            $cached['cached'] = true;
-            return $cached;
-        }
-    }
-
-    $report = $fs->storageReport();
-    $report['cached'] = false;
-    if (!is_dir(dirname($cache)))@mkdir(dirname($cache), 0775, true);
-    // Written through a temporary file, as the thumbnail cache already is: a
-    // reader hitting a half-written usage.json gets JSON it cannot decode.
-    // Names that are not UTF-8 are substituted: the report only displays
-    // them, and failing to encode meant it was never cached at all, so every
-    // quota check and dashboard visit walked the whole store again.
-    $reportJson = json_encode($report, JSON_UNESCAPED_SLASHES|JSON_INVALID_UTF8_SUBSTITUTE);
-    if ($reportJson !== false) {
-        $cacheTmp = $cache.'.'.bin2hex(random_bytes(4)).'.tmp';
-        if (@file_put_contents($cacheTmp, $reportJson) !== strlen($reportJson) || !@rename($cacheTmp, $cache)) {
-            @unlink($cacheTmp);
-        }
-    }
-    return $report;
+    return quota()->report($force);
 }
 /**
 * Refuse an upload that would breach the whole-store limit or the caller's own
-* quota, before a single byte is staged.
-*
-* Both limits are opt-in (0 means unlimited) and both fail open: if the figure
-* cannot be obtained the upload proceeds, because blocking a legitimate upload
-* over a bookkeeping problem is worse than letting one through.
+* quota, before a single byte is staged. See StorageQuota::assertFits().
 */
-function human_bytes(int $n): string {
-    // Limits are configured in GB but can be set low; "0 GB of 0 GB used" is
-    // not an answer, so the unit follows the number.
-    $units = ['B', 'KB', 'MB', 'GB', 'TB'];
-    $i = 0;
-    $v = (float)$n;
-    while ($v >= 1024 && $i < count($units) - 1) { $v /= 1024; $i++; }
-    return ($v >= 100 || $i === 0?round($v):round($v, 1)).' '.$units[$i];
-}
 function assert_upload_fits(FileService $fs, array $config, int $size): void {
-    $limit = (int)round((float)$config['storage_limit_gb'] * 1073741824);
-    if ($limit > 0) {
-        $report = storage_report($fs, $config);
-        $used = (int)($report['bytes'] ?? 0);
-        if ($used + $size > $limit) {
-            throw new RuntimeException('The file store is full ('.
-                human_bytes($used).' of '.human_bytes($limit).' used)', 507);
-        }
-    }
-
-    $quota = (int)round((float)$config['user_quota_gb'] * 1073741824);
-    $user = Auth::user();
-    if ($quota > 0 && $user !== null) {
-        sweep_ledger_occasionally($fs);
-        $used = ledger()->usage($user['id']);
-        if ($used + $size > $quota) {
-            throw new RuntimeException('You have used '.human_bytes($used).
-                ' of your '.human_bytes($quota).' quota', 507);
-        }
-    }
+    cache_ready();
+    quota()->assertFits($size, Auth::user()['id'] ?? null);
 }
 function db(): PDO {
     return \CloudHub\Helpers\Db::connection();
@@ -1782,66 +1661,10 @@ if ($path === '/api/files/upload' && $method === 'POST') api_try(function()use($
             throw new RuntimeException('No thumbnail has been generated for this video yet', 404);
         }
 
-        if (!in_array($ext, THUMBNAIL_IMAGE_EXTENSIONS, true)) {
-            throw new RuntimeException('Not a supported thumbnail type', 400);
-        }
-        if (!extension_loaded('gd')) {
-            throw new RuntimeException('GD extension is required for image thumbnails', 503);
-        }
-
-        // Measured from the header before anything is decoded: see
-        // THUMBNAIL_MAX_SOURCE_PIXELS.
-        $dimensions = @getimagesize($f);
-        if ($dimensions === false)throw new RuntimeException('This file is not a readable image', 415);
-        if (!thumbnail_source_fits((int)$dimensions[0], (int)$dimensions[1])) {
-            throw new RuntimeException('This image is too large to make a thumbnail of', 422);
-        }
-
-        $create = match($ext) {
-            'jpg', 'jpeg' => @imagecreatefromjpeg($f),
-            'png' => @imagecreatefrompng($f),
-            'gif' => @imagecreatefromgif($f),
-            'webp' => function_exists('imagecreatefromwebp') ? @imagecreatefromwebp($f) : false,
-            'bmp' => function_exists('imagecreatefrombmp') ? @imagecreatefrombmp($f) : false,
-            default => false
-        };
-        if (!$create)throw new RuntimeException('Failed to generate thumbnail', 500);
-
-        // Dimensions come from the decoded image, which is the one resampled.
-        $w = imagesx($create);
-        $h = imagesy($create);
-        if (!$w || !$h) {
-            imagedestroy($create);
-            throw new RuntimeException('Failed to generate thumbnail', 500);
-        }
-
-        $scale = min(300 / $w, 300 / $h, 1);
-        $nw = max(1, (int)round($w * $scale));
-        $nh = max(1, (int)round($h * $scale));
-        $im = imagecreatetruecolor($nw, $nh);
-        // A truecolor canvas starts opaque black with save-alpha off, so a
-        // transparent PNG or GIF resampled onto it came out with black behind
-        // whatever should have shown through, and imagewebp() then wrote no
-        // alpha channel at all. Blending is turned off so the source alpha is
-        // copied rather than composited against the black.
-        imagealphablending($im, false);
-        imagesavealpha($im, true);
-        imagefill($im, 0, 0, imagecolorallocatealpha($im, 0, 0, 0, 127));
-        imagecopyresampled($im, $create, 0, 0, 0, 0, $nw, $nh, $w, $h);
-        if (($ext === 'jpg' || $ext === 'jpeg') && function_exists('exif_read_data')) {
-            $im = thumbnail_orient($im, (int)(@exif_read_data($f)['Orientation'] ?? 1));
-        }
-
-        // Write through a temporary file: two browsers asking for the same new
-        // thumbnail at once must not read a half-written one.
-        $tmp = $cache.'.'.bin2hex(random_bytes(4)).'.tmp';
-        $ok = @imagewebp($im, $tmp, 75);
-        imagedestroy($im);
-        imagedestroy($create);
-        if (!$ok || !@rename($tmp, $cache)) {
-            @unlink($tmp);
-            throw new RuntimeException('Failed to store image thumbnail', 500);
-        }
+        // Decoded, scaled, turned upright and stored by ImageThumbnailer, which
+        // the background thumbnail job shares -- with the same guards, codes
+        // and messages this route always answered with.
+        ImageThumbnailer::generate($f, $cache);
 
         send_thumbnail($cache);
     });

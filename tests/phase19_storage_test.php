@@ -178,12 +178,17 @@ $checks['the usage route is administrator-only'] = (function () use ($index): bo
     $at = strpos($index, "'/api/storage/usage' && \$method === 'GET'");
     return $at !== false && str_contains(substr($index, $at, 200), 'Authorization::requireAdmin()');
 })();
+// The measuring and enforcing moved to StorageQuota, which the background
+// worker shares; index.php keeps the functions every route calls.
+$quotaSrc = (string)file_get_contents($root.'/src/Services/StorageQuota.php');
 $checks['the measurement is cached'] =
     str_contains($index, "function storage_report(FileService \$fs, array \$config, bool \$force = false)")
-    && str_contains($index, "time() - (int)filemtime(\$cache) < \$ttl");
+    && str_contains($index, 'return quota()->report($force);')
+    && str_contains($quotaSrc, "time() - (int)filemtime(\$cache) < \$ttl");
 $checks['the cache can be forced fresh'] = str_contains($index, "storage_report(\$fs, \$config, !empty(\$_GET['refresh']))");
 $checks['the cache lives outside the storage root'] =
-    str_contains($index, "dirname(__DIR__).'/storage/.cache/usage.json'");
+    str_contains($quotaSrc, "\$this->projectDir.'/storage/.cache/usage.json'")
+    && str_contains($index, 'new StorageQuota($fs, $config, ledger(), dirname(__DIR__))');
 $checks['the usage route sweeps stale ledger rows'] = (function () use ($index): bool {
     $at = strpos($index, "'/api/storage/usage' && \$method === 'GET'");
     return $at !== false && str_contains(substr($index, $at, 1200), 'ledger()->sweep($fs);');
@@ -196,17 +201,18 @@ $checks['both limits are checked before anything is staged'] = (function () use 
     $body = substr($index, $at, 600);
     return strpos($body, 'assert_upload_fits') < strpos($body, 'uploads()->init');
 })();
-$checks['the whole-store limit is enforced'] = str_contains($index, "The file store is full");
-$checks['the per-account quota is enforced'] = str_contains($index, "of your '.human_bytes(\$quota).' quota");
+$checks['the whole-store limit is enforced'] = str_contains($quotaSrc, "The file store is full");
+$checks['the per-account quota is enforced'] = str_contains($quotaSrc, "of your '.self::humanBytes(\$quota).' quota")
+    && str_contains($index, "quota()->assertFits(\$size, Auth::user()['id'] ?? null);");
 $checks['both limits are opt-in'] =
-    str_contains($index, 'if ($limit > 0) {') && str_contains($index, 'if ($quota > 0 && $user !== null) {');
+    str_contains($quotaSrc, 'if ($limit > 0) {') && str_contains($quotaSrc, 'if ($quota > 0 && $userId !== null) {');
 // "Insufficient storage" is a 5xx, and 5xx messages are masked -- but the
 // caller cannot act on "an internal server error occurred".
 $checks['a quota refusal explains itself'] =
     str_contains($index, "507 => 'INSUFFICIENT_STORAGE'")
     && str_contains($index, '$known = isset($codes[$status]);')
     && str_contains($index, "\$msg = (\$status >= 500 && !\$known)?'An internal server error occurred':\$e->getMessage();");
-$checks['limits below a gigabyte still read sensibly'] = str_contains($index, 'function human_bytes(int $n): string');
+$checks['limits below a gigabyte still read sensibly'] = str_contains($quotaSrc, 'public static function humanBytes(int $n): string');
 
 // --- ledger maintenance points -----------------------------------------
 foreach ([

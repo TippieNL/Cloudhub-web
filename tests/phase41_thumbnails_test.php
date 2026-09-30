@@ -10,38 +10,30 @@ declare(strict_types=1);
  * - Phone photos record their rotation in EXIF, which GD ignores and the WebP
  *   thumbnail drops, so portrait photos lay on their side in the grid.
  *
- * The helpers are lifted from public/index.php and run against real GD
- * images, including a JPEG carrying a real EXIF Orientation tag.
+ * The helpers live in ImageThumbnailer, shared by GET /api/thumbnail and the
+ * background thumbnail job, and are run here against real GD images,
+ * including a JPEG carrying a real EXIF Orientation tag.
  */
 $root = dirname(__DIR__);
 $index = (string)file_get_contents($root.'/public/index.php');
+$thumbSrc = (string)file_get_contents($root.'/src/Services/ImageThumbnailer.php');
 $checks = [];
 
-function extract_function41(string $source, string $name): string {
-    $start = strpos($source, 'function '.$name.'(');
-    if ($start === false) return '';
-    $open = strpos($source, '{', $start);
-    if ($open === false) return '';
-    $depth = 0;
-    for ($i = $open, $n = strlen($source); $i < $n; $i++) {
-        if ($source[$i] === '{') $depth++;
-        elseif ($source[$i] === '}') { $depth--; if ($depth === 0) return substr($source, $start, $i-$start+1); }
-    }
-    return '';
-}
-
 if (!extension_loaded('gd')) { echo "[SKIP] GD is not loaded\n"; exit(0); }
-preg_match('/^const THUMBNAIL_MAX_SOURCE_PIXELS = [0-9_]+;$/m', $index, $const);
-$lifted = ($const[0] ?? '')."\n".extract_function41($index, 'thumbnail_source_fits')."\n".extract_function41($index, 'thumbnail_orient');
-$checks['the helpers could be lifted from index.php'] = isset($const[0]) && str_contains($lifted, 'function thumbnail_orient(');
-eval($lifted);
+require $root.'/src/Services/ImageThumbnailer.php';
+use CloudHub\Services\ImageThumbnailer;
+function thumbnail_source_fits(int $w, int $h): bool { return ImageThumbnailer::sourceFits($w, $h); }
+function thumbnail_orient(\GdImage $im, int $orientation): \GdImage { return ImageThumbnailer::orient($im, $orientation); }
+$checks['the route generates through ImageThumbnailer'] =
+    str_contains($index, 'ImageThumbnailer::generate($f, $cache);')
+    && str_contains($index, 'return ImageThumbnailer::cachePath(dirname(__DIR__), $file, $mtime);');
 
 // --- the decode guard ------------------------------------------------------
 $checks['a 10000x10000 declaration is refused'] = !thumbnail_source_fits(10000, 10000);
 $checks['a 48 MP phone photo is allowed'] = thumbnail_source_fits(8000, 6000);
 $checks['a nonsense size is refused'] = !thumbnail_source_fits(0, 100) && !thumbnail_source_fits(100, -1);
 $checks['the route measures before it decodes'] =
-    (bool)preg_match('/\$dimensions = @getimagesize\(\$f\);.*thumbnail_source_fits\(.*\$create = match\(\$ext\)/s', $index);
+    (bool)preg_match('/\$dimensions = @getimagesize\(\$file\);.*self::sourceFits\(.*\$create = match \(\$ext\)/s', $thumbSrc);
 
 // --- orientation: where the top-left pixel of a 4x2 image must end up -------
 // The EXIF meaning of each value, as the correction that makes it upright.
@@ -77,9 +69,23 @@ if (function_exists('exif_read_data')) {
         && (imagecolorat($upright, 10, 5) >> 16 & 0xFF) > 200 && (imagecolorat($upright, 10, 35) & 0xFF) > 200;
 }
 $checks['JPEG thumbnails are turned by their EXIF'] =
-    str_contains($index, "\$im = thumbnail_orient(\$im, (int)(@exif_read_data(\$f)['Orientation'] ?? 1));");
+    str_contains($thumbSrc, "\$im = self::orient(\$im, (int)(@exif_read_data(\$file)['Orientation'] ?? 1));");
 $checks['the thumbnail canvas keeps transparency'] =
-    str_contains($index, "imagesavealpha(\$im, true);") && str_contains($index, "imagefill(\$im, 0, 0, imagecolorallocatealpha(\$im, 0, 0, 0, 127));");
+    str_contains($thumbSrc, "imagesavealpha(\$im, true);") && str_contains($thumbSrc, "imagefill(\$im, 0, 0, imagecolorallocatealpha(\$im, 0, 0, 0, 127));");
+
+// --- a real thumbnail, end to end -------------------------------------------------
+$src = sys_get_temp_dir().'/cloudhub-p41-'.bin2hex(random_bytes(4)).'.png';
+$img = imagecreatetruecolor(900, 300);
+imagefill($img, 0, 0, imagecolorallocate($img, 10, 200, 30));
+imagepng($img, $src);
+$out = $src.'.webp';
+ImageThumbnailer::generate($src, $out);
+$made = @getimagesize($out);
+$checks['generate() writes a 300px WebP'] = $made !== false && $made[0] === 300 && $made[1] === 100 && $made[2] === IMAGETYPE_WEBP;
+$refused = null;
+try { ImageThumbnailer::generate($src.'.txt', $out); } catch (RuntimeException $e) { $refused = $e->getCode(); }
+$checks['a type that takes no thumbnail is a 400'] = $refused === 400;
+@unlink($src); @unlink($out);
 
 $bad = false;
 foreach ($checks as $name => $ok) { echo ($ok ? '[PASS] ' : '[FAIL] ').$name.PHP_EOL; $bad = $bad || !$ok; }
