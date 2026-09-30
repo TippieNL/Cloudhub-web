@@ -114,6 +114,36 @@ $pdo->exec("CREATE TABLE IF NOT EXISTS favorites (
  INDEX idx_favorite_path(file_path(190))
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
 
+// Background jobs. Queueing a long file operation, and the worker that runs
+// it, need this; everything else works as before until it exists.
+$pdo->exec("CREATE TABLE IF NOT EXISTS jobs (
+ id CHAR(32) NOT NULL PRIMARY KEY,
+ user_id INT UNSIGNED NOT NULL,
+ type VARCHAR(32) NOT NULL,
+ status ENUM('pending','processing','completed','failed','cancelled') NOT NULL DEFAULT 'pending',
+ label VARCHAR(255) NOT NULL DEFAULT '',
+ target VARCHAR(1024) NOT NULL DEFAULT '',
+ payload MEDIUMTEXT NOT NULL,
+ state MEDIUMTEXT NULL,
+ result MEDIUMTEXT NULL,
+ progress_done BIGINT UNSIGNED NOT NULL DEFAULT 0,
+ progress_total BIGINT UNSIGNED NOT NULL DEFAULT 0,
+ progress_unit VARCHAR(10) NOT NULL DEFAULT 'items',
+ current_item VARCHAR(1024) NULL,
+ error VARCHAR(1000) NULL,
+ attempts INT UNSIGNED NOT NULL DEFAULT 0,
+ cancel_requested TINYINT(1) NOT NULL DEFAULT 0,
+ claim_token CHAR(32) NULL,
+ worker VARCHAR(100) NULL,
+ revision INT UNSIGNED NOT NULL DEFAULT 0,
+ created_at DATETIME NOT NULL,
+ started_at DATETIME NULL,
+ heartbeat_at DATETIME NULL,
+ finished_at DATETIME NULL,
+ INDEX idx_jobs_queue (status, created_at),
+ INDEX idx_jobs_user (user_id, created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
+
 // Upgrade legacy tables in place. No existing columns or rows are removed.
 addColumn($pdo, 'users', 'is_active', 'TINYINT(1) NOT NULL DEFAULT 1');
 addColumn($pdo, 'users', 'created_at', 'TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP');

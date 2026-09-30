@@ -148,9 +148,12 @@ $checks['a partly-failed copy attributes what landed'] =
     str_contains($index, "if (\$verb === 'copy' && \$applied) {")
     && str_contains($index, "\$applied = true;\n            \$apply(\$source, \$target);")
     && str_contains($index, '$target = null; $applied = false;');
+// storage_report() delegates to StorageQuota::report(), which the worker shares.
+$quotaSrc = (string)file_get_contents($root.'/src/Services/StorageQuota.php');
 $checks['the usage cache is written through a temporary file'] =
-    str_contains($index, '$cacheTmp = $cache.\'.\'.bin2hex(random_bytes(4)).\'.tmp\';')
-    && !str_contains($index, '@file_put_contents($cache, json_encode($report, JSON_UNESCAPED_SLASHES));');
+    str_contains($quotaSrc, '$cacheTmp = $cache.\'.\'.bin2hex(random_bytes(4)).\'.tmp\';')
+    && !str_contains($quotaSrc, '@file_put_contents($cache, json_encode($report')
+    && !str_contains($index, '@file_put_contents($cache, json_encode($report');
 
 rmrf25($base);
 @unlink($errorLog);

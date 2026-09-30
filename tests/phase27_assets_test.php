@@ -10,10 +10,13 @@ $checks = [];
 // --- thumbnails keep their alpha ------------------------------------------
 
 $index = (string)file_get_contents($root.'/public/index.php');
+// Generation lives in ImageThumbnailer, shared by the route and the background job.
+$thumbSrc = (string)file_get_contents($root.'/src/Services/ImageThumbnailer.php');
 $checks['the thumbnail canvas is prepared for alpha'] =
-    str_contains($index, 'imagealphablending($im, false);')
-    && str_contains($index, 'imagesavealpha($im, true);')
-    && str_contains($index, 'imagefill($im, 0, 0, imagecolorallocatealpha($im, 0, 0, 0, 127));');
+    str_contains($thumbSrc, 'imagealphablending($im, false);')
+    && str_contains($thumbSrc, 'imagesavealpha($im, true);')
+    && str_contains($thumbSrc, 'imagefill($im, 0, 0, imagecolorallocatealpha($im, 0, 0, 0, 127));')
+    && str_contains($index, 'ImageThumbnailer::generate($f, $cache);');
 
 // Proved against real pixels rather than the API calls: a truecolor canvas
 // starts opaque black, so without this a transparent PNG came out with black

@@ -20,8 +20,12 @@ final class FileService {
   * .uploads holds in-progress upload staging. It lives here for the same
   * reason .trash does: finishing an upload is then a same-filesystem rename
   * rather than a copy of every byte. See UploadService::__construct().
+  *
+  * .jobs holds the background queue's staging and output, for the same
+  * reason: a finished copy or extraction moves into place with one rename.
+  * See CloudHub\Services\Jobs\JobEnvironment.
   */
- public const RESERVED_ROOT_NAMES=['.trash','.thumbnails','.uploads'];
+ public const RESERVED_ROOT_NAMES=['.trash','.thumbnails','.uploads','.jobs'];
 
  /**
   * Whether a top-level name is one of CloudHub's own directories.

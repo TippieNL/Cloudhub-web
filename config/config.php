@@ -51,4 +51,14 @@ return [
  'duplicate_min_bytes'=>(int)env('DUPLICATE_MIN_BYTES',1024),
  'duplicate_scan_seconds'=>(int)env('DUPLICATE_SCAN_SECONDS',8),
  'duplicate_max_files'=>(int)env('DUPLICATE_MAX_FILES',50000),
+ // Background tasks; see .env.example and tools/worker.php.
+ 'queue_runner'=>strtolower((string)env('QUEUE_RUNNER','auto')),
+ 'queue_retention_hours'=>(int)env('QUEUE_RETENTION_HOURS',24),
+ 'queue_max_active_per_user'=>(int)env('QUEUE_MAX_ACTIVE_PER_USER',10),
+ 'queue_stale_seconds'=>(int)env('QUEUE_STALE_SECONDS',120),
+ 'queue_max_attempts'=>(int)env('QUEUE_MAX_ATTEMPTS',3),
+ 'queue_sync_max_files'=>(int)env('QUEUE_SYNC_MAX_FILES',200),
+ 'queue_sync_max_mb'=>(int)env('QUEUE_SYNC_MAX_MB',256),
+ 'queue_extract_max_files'=>(int)env('QUEUE_EXTRACT_MAX_FILES',20000),
+ 'queue_extract_max_gb'=>(float)env('QUEUE_EXTRACT_MAX_GB',20),
 ];

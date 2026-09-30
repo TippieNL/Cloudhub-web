@@ -305,11 +305,12 @@ $checks['every element the script uses exists in the markup'] = $missing === [];
 if ($missing !== []) echo '       missing from app.php: '.implode(', ', $missing).PHP_EOL;
 $checks['the script does reach for those elements'] = count(array_unique($ids[1])) >= 6;
 
-$checks['the page route is served'] = str_contains($index, "'/trash', '/storage', '/duplicates'], true)");
+// Membership rather than the list's end: pages after it (Tasks) are added to it.
+$checks['the page route is served'] = (bool)preg_match("#in_array\(\\\$path, \['/', [^\]]*'/duplicates'[^\]]*\], true\)#", $index);
 $checks['the nav offers it'] = str_contains($markup, 'data-route="/duplicates"');
 $checks['the section exists'] = str_contains($markup, 'id="duplicates-page"');
 $checks['routing hides it with the others'] =
-    str_contains($app, "'trash', 'storage', 'duplicates'].forEach");
+    (bool)preg_match("/'trash', 'storage', 'duplicates'(?:, '[a-z]+')*\\]\\.forEach/", $app);
 $checks['routing shows it'] = str_contains($app, "} else if (p === '/duplicates') {");
 $checks['opening the tab does not start a scan'] =
     str_contains($app, "await api('/api/duplicates/scan')")

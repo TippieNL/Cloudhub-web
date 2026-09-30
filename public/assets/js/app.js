@@ -81,6 +81,7 @@ async function login(u, p) {
     S.role = d.user?.role || 'viewer';
     $('#nav-users').hidden = S.role !== 'admin';
     $('#nav-storage').hidden = S.role !== 'admin';
+    signedIn();
     $('#login').style.display = 'none';
     await openRoute();
 }
@@ -1010,7 +1011,10 @@ async function del(p) {
     const warning = trashed ? 'It can be restored from the trash.' : 'This cannot be undone.';
     if (!await askConfirm('Delete item', `Delete "${name}"? ${warning}`, 'Delete')) return;
     try {
-        const d = await (await api('/api/files/delete', { method: 'DELETE', body: { path: p } })).json();
+        // "auto": a large folder, when the trash is off, is deleted by a task
+        // rather than inside this request. Anything else is as it was.
+        const d = await (await api('/api/files/delete', { method: 'DELETE', body: { path: p, background: 'auto' } })).json();
+        if (d.queued) taskQueued(d.job);
         toast(d.message);
         await loadFiles();
     } catch (e) {
@@ -1074,10 +1078,11 @@ async function deleteSelected() {
     let failed = 0;
     for (const path of files) {
         try {
-            await api('/api/files/delete', {
+            const d = await (await api('/api/files/delete', {
                 method: 'DELETE',
-                body: { path }
-            });
+                body: { path, background: 'auto' }
+            })).json();
+            if (d.queued) taskQueued(d.job);
         } catch {
             failed++;
         }
@@ -1091,10 +1096,18 @@ function showContextMenu(path, x, y) {
     const f = currentEntries().find(item => item.path === path);
     const menu = $('#file-context');
     if (!f) return;
-    menu.innerHTML = `${f.isDirectory ? '<button data-cmd="open">Open</button>' : '<button data-cmd="preview">Preview</button><button data-cmd="download">Download</button><button data-cmd="share">Share</button>'}<button data-cmd="rename">Rename</button><button data-cmd="move">Move to…</button><button data-cmd="copy">Copy to…</button><button data-cmd="delete" class="danger-text">Delete</button>`;
+    const writer = canWrite();
+    const isZip = !f.isDirectory && /\.zip$/i.test(f.name);
+    menu.innerHTML = `${f.isDirectory ? '<button data-cmd="open">Open</button><button data-cmd="zipdown">Download as ZIP</button>' : '<button data-cmd="preview">Preview</button><button data-cmd="download">Download</button><button data-cmd="share">Share</button>'}<button data-cmd="rename">Rename</button><button data-cmd="move">Move to…</button><button data-cmd="copy">Copy to…</button>`
+        + (writer ? '<button data-cmd="compress">Compress to ZIP</button>' : '')
+        + (writer && isZip ? '<button data-cmd="extract">Extract here</button>' : '')
+        + (f.isDirectory ? '' : '<button data-cmd="checksum">Checksum (SHA-256)</button>')
+        + (writer && f.isDirectory ? '<button data-cmd="thumbs">Make thumbnails</button>' : '')
+        + '<button data-cmd="delete" class="danger-text">Delete</button>';
     menu.hidden = false;
     menu.style.left = `${Math.min(x, window.innerWidth - 190)}px`;
-    menu.style.top = `${Math.min(y, window.innerHeight - 240)}px`;
+    // Measured, now that it can hold more or fewer entries per item.
+    menu.style.top = `${Math.max(8, Math.min(y, window.innerHeight - menu.offsetHeight - 8))}px`;
     menu.querySelectorAll('button').forEach(b => b.addEventListener('click', () => {
         menu.hidden = true;
         const c = b.dataset.cmd;
@@ -1105,6 +1118,11 @@ function showContextMenu(path, x, y) {
         if (c === 'rename') ren(path);
         if (c === 'move') relocate([path], 'move');
         if (c === 'copy') relocate([path], 'copy');
+        if (c === 'zipdown') downloadAsArchive([path]);
+        if (c === 'compress') compress([path]);
+        if (c === 'extract') extract(path);
+        if (c === 'checksum') checksum([path]);
+        if (c === 'thumbs') makeThumbnails(path);
         if (c === 'delete') del(path);
     }));
 }
@@ -1257,7 +1275,15 @@ async function relocate(paths, verb) {
         verb === 'move' ? 'Move here' : 'Copy here');
     if (destination === null) return;
     try {
-        const d = await (await api(`/api/files/${verb}`, { method: 'POST', body: { paths, destination } })).json();
+        // A large copy is offered to the server as a task ("auto"): it answers
+        // with the task instead of making this request wait for every byte.
+        const body = verb === 'copy' ? { paths, destination, background: 'auto' } : { paths, destination };
+        const d = await (await api(`/api/files/${verb}`, { method: 'POST', body })).json();
+        if (d.queued) {
+            taskQueued(d.job);
+            toast(`${d.message} — follow it under Tasks`);
+            return;
+        }
         // Per-item failures come back named, so say which ones rather than
         // reporting a bare success over a partial result.
         if (d.failed.length) {
@@ -1277,6 +1303,7 @@ async function relocate(paths, verb) {
 const relocateSelected = verb => relocate([...S.selected], verb);
 $('#selection-move').addEventListener('click', () => relocateSelected('move'));
 $('#selection-copy').addEventListener('click', () => relocateSelected('copy'));
+$('#selection-compress').addEventListener('click', () => compress([...S.selected]));
 
 $('#mkdir').addEventListener('click', makeFolder);
 $('#refresh').addEventListener('click', () => loadFiles());
@@ -1641,6 +1668,13 @@ uploadUI.form.addEventListener('submit', async e => {
 
 async function downloadSelected() {
     if (!S.selected.size) return toast('Select files first');
+    const paths = [...S.selected];
+    const entries = paths.map(p => currentEntries().find(f => f.path === p));
+    const bytes = entries.reduce((n, f) => n + (f?.size || 0), 0);
+    // A folder's size is unknown here and a large selection takes a while to
+    // pack, so those are built by a task and downloaded when ready. A few
+    // small files are still packed while the browser waits, as before.
+    if (entries.some(f => !f || f.isDirectory) || bytes > 100 * 1048576 || paths.length > 50) return downloadAsArchive(paths);
     // Still through a Blob: the archive is built by a POST, which the browser
     // cannot hand to its download manager with the CSRF header attached.
     // Caught here because this runs straight from a click: a refusal (nothing
@@ -1918,7 +1952,8 @@ async function loadTrash() {
     box.querySelectorAll('[data-purge]').forEach(b => b.addEventListener('click', async () => {
         if (!await askConfirm('Delete permanently', 'This item cannot be recovered afterwards.', 'Delete')) return;
         try {
-            const r = await (await api('/api/trash/purge', { method: 'POST', body: { id: b.dataset.purge } })).json();
+            const r = await (await api('/api/trash/purge', { method: 'POST', body: { id: b.dataset.purge, background: 'auto' } })).json();
+            if (r.queued) taskQueued(r.job);
             toast(r.message);
         } catch (e) {
             toast(e.message);
@@ -1930,7 +1965,8 @@ async function loadTrash() {
 $('#empty-trash').addEventListener('click', async () => {
     if (!await askConfirm('Empty trash', 'Everything in the trash is deleted permanently.', 'Empty trash')) return;
     try {
-        const r = await (await api('/api/trash/purge', { method: 'POST', body: { all: true } })).json();
+        const r = await (await api('/api/trash/purge', { method: 'POST', body: { all: true, background: 'auto' } })).json();
+        if (r.queued) taskQueued(r.job);
         toast(r.message);
     } catch (e) {
         toast(e.message);
@@ -2007,9 +2043,11 @@ $('#recalculate-usage').addEventListener('click', () => loadStorage(true));
 
 /* ---- Duplicates ---------------------------------------------------------
  *
- * The scan is a poll loop: each request does a bounded slice of hashing on the
- * server and returns progress, because hashing a media library does not finish
- * inside one request on the device this runs on.
+ * The scan runs as a background task, so it finishes with this page closed.
+ * The page reads the finder's progress (GET /api/duplicates/scan) while the
+ * task runs, which shows the groups as they are confirmed, and "Stop" cancels
+ * the task. POST /api/duplicates/scan -- a slice per request, polled -- is
+ * still there for other clients.
  *
  * Deletion goes through the ordinary /api/files/delete route, once per file,
  * exactly as the file list's bulk delete does. That route already moves items
@@ -2017,7 +2055,7 @@ $('#recalculate-usage').addEventListener('click', () => loadStorage(true));
  * audit entry; a second path to the same dangerous operation is the last thing
  * this feature should add.
  */
-const dupeState = { groups: [], selected: new Set(), scanning: false, cancel: false };
+const dupeState = { groups: [], selected: new Set(), scanning: false, job: null, timer: 0 };
 
 function dupeKept(group) {
     // The copy to keep by default: shallowest path, then oldest, then by name,
@@ -2103,33 +2141,59 @@ function applyDupeProgress(d) {
 }
 
 async function scanDuplicates() {
-    if (dupeState.scanning) { dupeState.cancel = true; return; }
-
-    dupeState.scanning = true;
-    dupeState.cancel = false;
-    dupeState.selected.clear();
-    $('#dupe-scan').textContent = 'Stop';
-    $('#dupe-progress').hidden = false;
-    $('#dupe-groups').innerHTML = '';
-
-    const path = $('#dupe-path').value.trim() || '/';
-    let restart = true;
-    try {
-        for (;;) {
-            const d = await (await api('/api/duplicates/scan', { method: 'POST', body: { path, restart } })).json();
-            restart = false;
-            applyDupeProgress(d);
-            renderDuplicates();
-            if (d.done) break;
-            if (dupeState.cancel) { $('#dupe-status').textContent += ' Stopped.'; break; }
+    if (dupeState.scanning) {
+        if (!dupeState.job) return;
+        try {
+            await api(`/api/jobs/${dupeState.job}/cancel`, { method: 'POST' });
+            $('#dupe-status').textContent += ' Stopping…';
+        } catch (e) {
+            toast(e.message);
         }
-    } catch (e) {
-        $('#dupe-status').textContent = e.message;
-    } finally {
-        dupeState.scanning = false;
-        dupeState.cancel = false;
-        $('#dupe-scan').textContent = 'Scan';
+        return;
     }
+    const path = $('#dupe-path').value.trim() || '/';
+    try {
+        const job = await queueTask('duplicates', { path });
+        dupeState.selected.clear();
+        $('#dupe-groups').innerHTML = '';
+        followDuplicateScan(job.id);
+    } catch (e) {
+        $('#dupe-progress').hidden = false;
+        $('#dupe-status').textContent = e.message;
+    }
+}
+
+/**
+ * Show a running scan until it ends: the finder's state for progress and the
+ * groups found so far, and the task for whether it is still going.
+ */
+function followDuplicateScan(jobId) {
+    dupeState.scanning = true;
+    dupeState.job = jobId;
+    $('#dupe-scan').textContent = jobId ? 'Stop' : 'Scan';
+    $('#dupe-scan').disabled = !jobId;
+    $('#dupe-progress').hidden = false;
+    clearTimeout(dupeState.timer);
+    const step = async () => {
+        let job = null;
+        try {
+            if (jobId) job = (await (await api(`/api/jobs/${jobId}`)).json()).job;
+            const d = await (await api('/api/duplicates/scan')).json();
+            if (d.started !== false) { applyDupeProgress(d); renderDuplicates(); }
+            if (job?.status === 'pending') $('#dupe-status').textContent = 'Waiting to start…';
+            const over = jobId ? !['pending', 'processing'].includes(job?.status) : d.done;
+            if (!over) { dupeState.timer = setTimeout(step, 1500); return; }
+            if (job?.status === 'cancelled') $('#dupe-status').textContent += ' Stopped.';
+            if (job?.status === 'failed') $('#dupe-status').textContent = job.error || 'The scan failed.';
+        } catch (e) {
+            $('#dupe-status').textContent = e.message;
+        }
+        dupeState.scanning = false;
+        dupeState.job = null;
+        $('#dupe-scan').textContent = 'Scan';
+        $('#dupe-scan').disabled = false;
+    };
+    step();
 }
 
 $('#dupe-scan').addEventListener('click', scanDuplicates);
@@ -2183,9 +2247,302 @@ $('#dupe-delete').addEventListener('click', async () => {
     await scanDuplicates();
 });
 
+/* ---- Background tasks -----------------------------------------------------
+ *
+ * Long operations run on the server as tasks, and carry on with this page
+ * closed. The page only watches: while anything is queued or running it asks
+ * how things stand every couple of seconds, and when nothing is, it stops
+ * asking. The Tasks link carries the number still running.
+ *
+ * Where the server has no worker process it runs tasks itself after answering
+ * POST /api/jobs/run, which this page sends whenever something is waiting.
+ * That request is fire-and-forget: the server has already answered it before
+ * the work begins, or is holding it open while it works; nothing here waits.
+ */
+const tasks = {
+    active: 0,
+    runner: '',
+    timer: 0,
+    polling: false,
+    watched: new Set(),
+    jobs: [],
+    kickedAt: 0,
+    onDone: new Map()
+};
+const canWrite = () => S.role === 'editor' || S.role === 'admin';
+
+/** What depends on who signed in: controls only writers can use, and the task indicator. */
+function signedIn() {
+    document.querySelectorAll('[data-writer]').forEach(el => el.hidden = !canWrite());
+    watchTasks();
+}
+const TASK_STATUS = { pending: 'Queued', processing: 'Running', completed: 'Completed', failed: 'Failed', cancelled: 'Cancelled' };
+/** Store-changing types: the folder on screen is reloaded when one finishes. */
+const TASKS_THAT_CHANGE_FILES = new Set(['copy', 'extract', 'archive', 'purge']);
+
+/** Archives to download as soon as they are ready, kept for the life of the tab. */
+const autoDownloads = {
+    read() { try { return JSON.parse(sessionStorage.getItem('cfh_autodl') || '[]'); } catch { return []; } },
+    add(id) { try { sessionStorage.setItem('cfh_autodl', JSON.stringify([...new Set([...this.read(), id])])); } catch {} },
+    take(id) {
+        const ids = this.read();
+        if (!ids.includes(id)) return false;
+        try { sessionStorage.setItem('cfh_autodl', JSON.stringify(ids.filter(x => x !== id))); } catch {}
+        return true;
+    }
+};
+
+function kickQueue(force = false) {
+    if (!force && tasks.runner !== 'inline') return;
+    if (!force && Date.now() - tasks.kickedAt < 5000) return;
+    tasks.kickedAt = Date.now();
+    api('/api/jobs/run', { method: 'POST' }).catch(() => {});
+}
+
+function renderTaskBadge() {
+    const label = `${tasks.active} task${tasks.active === 1 ? '' : 's'} queued or running`;
+    $('#tasks-badge').textContent = tasks.active ? String(tasks.active) : '';
+    $('#tasks-indicator').hidden = !tasks.active;
+    $('#tasks-indicator').title = label;
+    $('#tasks-indicator').setAttribute('aria-label', label);
+}
+
+/** Start watching, or look again now if already watching. */
+function watchTasks() {
+    clearTimeout(tasks.timer);
+    tasks.timer = setTimeout(pollTasks, 0);
+}
+
+async function pollTasks() {
+    // A look asked for while one is in flight happens straight after it, so a
+    // task queued meanwhile is never missed by a poll that had already read
+    // "nothing active".
+    if (tasks.polling) { tasks.again = true; return; }
+    tasks.polling = true;
+    tasks.again = false;
+    const onPage = !$('#tasks-page').hidden;
+    let d;
+    try {
+        d = await (await api('/api/jobs' + (onPage ? '' : '?active=1'))).json();
+    } catch {
+        tasks.polling = false;
+        if (tasks.active || tasks.again) tasks.timer = setTimeout(pollTasks, 10000);
+        return;
+    }
+    tasks.active = d.active;
+    tasks.runner = d.runner;
+    const current = new Set(d.jobs.filter(j => j.status === 'pending' || j.status === 'processing').map(j => j.id));
+    // A task that was running and is not any more has finished: find out how.
+    const finished = [...tasks.watched].filter(id => !current.has(id));
+    tasks.watched = current;
+    if (onPage) { tasks.jobs = d.jobs; renderTasks(); }
+    renderTaskBadge();
+    for (const id of finished) {
+        const job = d.jobs.find(j => j.id === id)
+            || await api(`/api/jobs/${id}`).then(r => r.json()).then(x => x.job).catch(() => null);
+        if (job) taskFinished(job);
+    }
+    // Downloads asked for before a page change, finished while it loaded.
+    if (onPage) for (const job of d.jobs) if (job.hasDownload && autoDownloads.take(job.id)) downloadTaskResult(job);
+
+    if (d.jobs.some(j => j.status === 'pending') && !d.jobs.some(j => j.status === 'processing')) kickQueue();
+    tasks.polling = false;
+    if (d.active || tasks.again) tasks.timer = setTimeout(pollTasks, tasks.again ? 0 : d.runner === 'none' ? 5000 : 1500);
+}
+
+function taskFinished(job) {
+    const done = tasks.onDone.get(job.id);
+    tasks.onDone.delete(job.id);
+    if (job.status === 'completed') {
+        toast(`Done: ${job.label}`);
+        if (job.hasDownload && autoDownloads.take(job.id)) downloadTaskResult(job);
+    } else if (job.status === 'failed') {
+        toast(`Failed: ${job.label}${job.error ? ' — ' + job.error : ''}`);
+    }
+    if (TASKS_THAT_CHANGE_FILES.has(job.type) && !$('#files-page').hidden) loadFiles();
+    if (done) done(job);
+}
+
+function downloadTaskResult(job) {
+    clickDownload(appUrl(`/api/jobs/${job.id}/download`), job.result?.name || 'download.zip');
+}
+
+/** A task the server queued, from /api/jobs or from a route that chose to queue. */
+function taskQueued(job, onDone = null) {
+    if (onDone) tasks.onDone.set(job.id, onDone);
+    tasks.watched.add(job.id);
+    tasks.active++;
+    renderTaskBadge();
+    kickQueue(true);
+    watchTasks();
+}
+
+async function queueTask(type, params, onDone = null) {
+    const d = await (await api('/api/jobs', { method: 'POST', body: { type, params } })).json();
+    taskQueued(d.job, onDone);
+    return d.job;
+}
+
+function taskProgress(j) {
+    const p = j.progress;
+    if (j.status === 'pending') return 'Waiting to start';
+    if (!p.total) return j.status === 'processing' ? 'Starting…' : '';
+    const amount = p.unit === 'bytes' ? `${fmt(p.done)} of ${fmt(p.total)}` : `${p.done} of ${p.total}`;
+    return `${amount}${p.percent !== null ? ` · ${p.percent}%` : ''}`;
+}
+
+function taskResult(j) {
+    const r = j.result || {};
+    const failed = (r.failed || []).map(f => `<li>${esc(f.path)}: ${esc(f.message)}</li>`).join('');
+    const failures = failed ? `<ul class="task-failures">${failed}</ul>` : '';
+    switch (j.type) {
+        case 'copy': return r.copied !== undefined ? `<p>${r.copied} of ${r.of} copied into ${esc(r.destination)}</p>${failures}` : failures;
+        case 'archive': return r.name ? `<p>${esc(r.path || r.name)} · ${fmt(r.bytes)} · ${r.files} file${r.files === 1 ? '' : 's'}</p>` : '';
+        case 'extract': return r.path ? `<p>Extracted ${r.files} file${r.files === 1 ? '' : 's'} into ${esc(r.path)}${r.skipped ? ` · ${r.skipped} link${r.skipped === 1 ? '' : 's'} skipped` : ''}</p>` : '';
+        case 'purge': return r.files !== undefined ? `<p>${r.files} file${r.files === 1 ? '' : 's'} deleted</p>` : '';
+        case 'thumbnails': return r.made !== undefined ? `<p>${r.made} made · ${r.existing} already there${r.skipped ? ` · ${r.skipped} skipped` : ''}</p>` : '';
+        case 'duplicates': return r.groups !== undefined
+            ? `<p>${r.groups} group${r.groups === 1 ? '' : 's'} of duplicates · ${fmt(r.reclaimable)} reclaimable · <a href="${esc(appUrl('/duplicates'))}">Review</a></p>` : '';
+        case 'checksum': return r.files ? `<pre class="task-checksums">${r.files.map(f => `${esc(f.hash)}  ${esc(f.path)}`).join('\n')}</pre>` : '';
+        default: return '';
+    }
+}
+
+function renderTasks() {
+    const box = $('#tasks-list');
+    $('#tasks-note').textContent = tasks.runner === 'none' && tasks.jobs.some(j => j.status === 'pending')
+        ? 'No background worker is running, so queued tasks are waiting. An administrator can start one with: php tools/worker.php'
+        : 'Large copies, archives, extraction and deletions run here, on the server. They carry on if you close this page.';
+    $('#tasks-clear').hidden = !tasks.jobs.some(j => j.canRemove);
+    if (!tasks.jobs.length) {
+        box.innerHTML = '<p class="muted">No background tasks.</p>';
+        return;
+    }
+    box.innerHTML = tasks.jobs.map(j => {
+        const when = [
+            `queued ${new Date(j.createdAt).toLocaleString()}`,
+            j.startedAt ? `started ${new Date(j.startedAt).toLocaleTimeString()}` : '',
+            j.finishedAt ? `finished ${new Date(j.finishedAt).toLocaleTimeString()}` : ''
+        ].filter(Boolean).join(' · ');
+        const running = j.status === 'processing' || j.status === 'pending';
+        // No bar while queued: an indeterminate one would say it is busy.
+        const bar = j.status === 'processing' || j.status === 'completed'
+            ? `<progress max="100"${j.progress.percent !== null ? ` value="${j.progress.percent}"` : ''}></progress>` : '';
+        return `<article class="task task-${esc(j.status)}" data-task="${esc(j.id)}">
+            <div class="task-head">
+                <strong class="task-label">${esc(j.label)}</strong>
+                <span class="task-status">${esc(j.cancelRequested && running ? 'Stopping…' : TASK_STATUS[j.status] || j.status)}</span>
+            </div>
+            ${j.target ? `<div class="muted">in ${esc(j.target)}</div>` : ''}
+            ${bar}
+            <div class="task-progress muted">${esc(taskProgress(j))}${j.currentItem ? ` · <span class="task-current">${esc(j.currentItem)}</span>` : ''}</div>
+            ${j.error ? `<p class="error">${esc(j.error)}</p>` : ''}
+            ${taskResult(j)}
+            <div class="muted">${esc(when)}${j.attempts > 1 ? ` · attempt ${j.attempts}` : ''}</div>
+            <div class="actions">
+                ${j.hasDownload ? `<button data-task-download="${esc(j.id)}" class="primary-button">Download</button>` : ''}
+                ${j.canCancel ? `<button data-task-cancel="${esc(j.id)}">Cancel</button>` : ''}
+                ${j.canRetry ? `<button data-task-retry="${esc(j.id)}">Retry</button>` : ''}
+                ${j.canRemove ? `<button data-task-remove="${esc(j.id)}">Remove</button>` : ''}
+            </div>
+        </article>`;
+    }).join('');
+}
+
+$('#tasks-list').addEventListener('click', async e => {
+    const b = e.target.closest('[data-task-download],[data-task-cancel],[data-task-retry],[data-task-remove]');
+    if (!b) return;
+    const d = b.dataset;
+    try {
+        if (d.taskDownload) {
+            const job = tasks.jobs.find(j => j.id === d.taskDownload);
+            if (job) await saveFromServer(`/api/jobs/${job.id}/download`, job.result?.name || 'download.zip');
+            return;
+        }
+        if (d.taskCancel) {
+            const r = await (await api(`/api/jobs/${d.taskCancel}/cancel`, { method: 'POST' })).json();
+            toast(r.status === 'cancelled' ? 'Cancelled' : 'Stopping…');
+        } else if (d.taskRetry) {
+            const r = await (await api(`/api/jobs/${d.taskRetry}/retry`, { method: 'POST' })).json();
+            taskQueued(r.job);
+        } else if (d.taskRemove) {
+            await api(`/api/jobs/${d.taskRemove}`, { method: 'DELETE' });
+        }
+    } catch (x) {
+        toast(x.message);
+    }
+    watchTasks();
+});
+
+$('#tasks-clear').addEventListener('click', async () => {
+    try {
+        const r = await (await api('/api/jobs/clear', { method: 'POST' })).json();
+        toast(`${r.removed} task${r.removed === 1 ? '' : 's'} removed`);
+    } catch (x) {
+        toast(x.message);
+    }
+    watchTasks();
+});
+
+/** Compress items into a ZIP saved beside them. */
+async function compress(paths) {
+    if (!paths.length) return;
+    const suggested = paths.length === 1 ? paths[0].split('/').pop().replace(/\.[^./]+$/, '') || 'Archive' : 'Archive';
+    const name = await askInput('Compress to ZIP', 'Archive name', `${suggested}.zip`);
+    if (!name) return;
+    try {
+        const job = await queueTask('archive', { paths, mode: 'save', name });
+        toast(`Queued: ${job.label}`);
+    } catch (x) {
+        toast(x.message);
+    }
+}
+
+async function extract(path) {
+    try {
+        const job = await queueTask('extract', { path });
+        toast(`Queued: ${job.label}`);
+    } catch (x) {
+        toast(x.message);
+    }
+}
+
+async function checksum(paths) {
+    try {
+        const job = await queueTask('checksum', { paths, algorithm: 'sha256' }, j => {
+            if (j.status === 'completed' && j.result?.files?.length === 1) {
+                toast(`SHA-256 ${j.result.files[0].hash}`);
+            }
+        });
+        toast(`Queued: ${job.label} — the result appears under Tasks`);
+    } catch (x) {
+        toast(x.message);
+    }
+}
+
+async function makeThumbnails(path) {
+    try {
+        const job = await queueTask('thumbnails', { path });
+        toast(`Queued: ${job.label}`);
+    } catch (x) {
+        toast(x.message);
+    }
+}
+
+/** A ZIP of items, built by the server and downloaded once it is ready. */
+async function downloadAsArchive(paths) {
+    try {
+        const job = await queueTask('archive', { paths, mode: 'download' });
+        autoDownloads.add(job.id);
+        toast('Preparing the archive in the background; it downloads when ready (see Tasks)');
+    } catch (x) {
+        toast(x.message);
+    }
+}
+
 async function route() {
     const p = window.CLOUDHUB_ROUTE || new URLSearchParams(location.search).get('route') || '/';
-    ['files', 'servers', 'browse', 'users', 'trash', 'storage', 'duplicates'].forEach(x => $(`#${x}-page`).hidden = true);
+    ['files', 'servers', 'browse', 'users', 'trash', 'storage', 'duplicates', 'tasks'].forEach(x => $(`#${x}-page`).hidden = true);
     document.querySelectorAll('nav a').forEach(a => a.classList.toggle('active', (a.dataset.route || '/') === p));
     if (p === '/trash') {
         $('#trash-page').hidden = false;
@@ -2196,11 +2553,17 @@ async function route() {
     } else if (p === '/duplicates') {
         $('#duplicates-page').hidden = false;
         // Show whatever the last scan found without starting a new one: a scan
-        // reads files, and opening a tab should not.
+        // reads files, and opening a tab should not. A scan still running --
+        // this account's task, or anyone's -- is followed until it ends.
         try {
             const d = await (await api('/api/duplicates/scan')).json();
             if (d.started !== false) { applyDupeProgress(d); renderDuplicates(); }
+            const mine = (await (await api('/api/jobs?active=1')).json()).jobs.find(j => j.type === 'duplicates');
+            if (mine || (d.started !== false && !d.done)) followDuplicateScan(mine?.id || null);
         } catch { /* nothing scanned yet */ }
+    } else if (p === '/tasks') {
+        $('#tasks-page').hidden = false;
+        await pollTasks();
     } else if (p === '/users') {
         $('#users-page').hidden = false;
         await users();
@@ -2254,6 +2617,7 @@ async function openRoute() {
     // Convenience only: /api/users is administrator-gated server-side.
     $('#nav-users').hidden = S.role !== 'admin';
     $('#nav-storage').hidden = S.role !== 'admin';
+    signedIn();
     $('#login').style.display = 'none';
     await openRoute();
 })();
