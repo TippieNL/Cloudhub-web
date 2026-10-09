@@ -462,7 +462,12 @@ scenario('two requests with the right code at once: one signs in', function () u
 
 /* ---- the gateway misbehaving ------------------------------------------------------ */
 
-scenario('a gateway that fails, refuses, stalls or mumbles never lets anyone in', function () use ($base, $db, $editor, $editorPass, $ids) {
+scenario('a gateway that fails, refuses, stalls or mumbles never lets anyone in', function () use ($base, $db, $editor, $editorPass, $ids, $root) {
+    // config/bootstrap.php sends PHP's error log to logs/php-error.log; what
+    // this scenario adds to it is read at the end.
+    $errorLog = $root.'/logs/php-error.log';
+    clearstatcache();
+    $logFrom = is_file($errorLog) ? (int)filesize($errorLog) : 0;
     $c = new Client($base);
     $c->signIn($editor, $editorPass);
     // Each try waits out the resend cooldown rather than sixty real seconds.
@@ -490,7 +495,12 @@ scenario('a gateway that fails, refuses, stalls or mumbles never lets anyone in'
     gateway('ok');
     check('none of it signed the session in', $c->get('/api/files/list', ['path' => '/'])->status === 401);
     $log = (string)@file_get_contents($GLOBALS['work'].'/app.log');
-    check('nothing about it reached the server output', !str_contains($log, 'two-step') && !preg_match('/\+319\d{8}/', $log));
+    check('no number reached the server output', !preg_match('/\+319\d{8}/', $log));
+    // The operator is told the gateway failed -- which also proves this is the
+    // log PHP writes to -- and never told the number.
+    $errors = (string)@file_get_contents($errorLog, false, null, $logFrom);
+    check('the error log says the text was not sent, and why', str_contains($errors, 'two-step code not sent: webhook: HTTP 500'));
+    check('but not to which number', !preg_match('/\+319\d{8}/', $errors));
 });
 
 scenario('a server with no SMS gateway asks for a recovery code instead', function () use ($quiet, $editor, $editorPass, &$recovery) {
@@ -622,6 +632,7 @@ scenario('codes and numbers stay out of the logs and the trail', function () use
     $trail = json_encode($db->query("SELECT context_json FROM security_events WHERE event_type LIKE '%two_factor%' OR event_type LIKE 'auth.%' ORDER BY id DESC LIMIT 500")->fetchAll());
     check('there were codes to look for', count($codes) >= 10);
     check('no number in the error log', !str_contains($logs, substr($editorPhone, 3)));
+    check('no code in the error log', array_filter($codes, static fn(string $c): bool => (bool)preg_match('/(?<![0-9A-Za-z])'.$c.'(?![0-9A-Za-z])/', $logs)) === []);
     check('no code in the audit trail', array_filter($codes, static fn(string $c): bool => str_contains((string)$trail, '"'.$c.'"')) === []);
     check('no number in the audit trail', !str_contains((string)$trail, substr($editorPhone, 3)));
 });

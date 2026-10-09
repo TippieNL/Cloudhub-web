@@ -504,11 +504,11 @@ the same guard as every other route. Refusals carry stable codes —
 answers name at most a number's last two digits. The Users list
 (`GET /api/users`) gains `twoFactorEnabled`, never a number.
 
-**The Android app** (Cloudhub-2) shows the server's message for a sign-in
-answer it does not understand, so with two-step verification on it reports
-*"This account uses two-step verification…"* instead of signing in, and costs
-no text message. Until it learns the code step, accounts that turn this on sign
-in from the web app.
+**The Android app** (Cloudhub-2) asks for the code too, from version 4.3,
+and manages it under **Settings** → **Two-step verification**. Version 4.2 and
+earlier show the server's message for a sign-in answer they do not understand
+— *"This account uses two-step verification…"* — instead of signing in, and
+cost no text message: an account that turns this on needs the web app or 4.3.
 
 ## Storage and quotas
 
