@@ -262,16 +262,6 @@ final class TwoFactorRepository
         return $stmt->rowCount() === 1;
     }
 
-    /** Drop the account's challenges, or only those for one purpose. */
-    public function forgetChallenges(int $userId, ?string $purpose = null): void
-    {
-        if ($purpose === null) {
-            $this->db->prepare('DELETE FROM two_factor_challenges WHERE user_id = ?')->execute([$userId]);
-        } else {
-            $this->db->prepare('DELETE FROM two_factor_challenges WHERE user_id = ? AND purpose = ?')->execute([$userId, $purpose]);
-        }
-    }
-
     /**
      * Abandoned challenges -- a sign-in nobody finished -- are deleted once a
      * day old, sampled the way LoginRateLimiter prunes its table, so nothing

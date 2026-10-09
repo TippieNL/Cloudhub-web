@@ -12,9 +12,6 @@ declare(strict_types=1);
 require dirname(__DIR__).'/src/Services/FileService.php';
 require dirname(__DIR__).'/src/Services/DuplicateFinder.php';
 
-use CloudHub\Services\FileService;
-use CloudHub\Services\DuplicateFinder;
-
 function rmrf29(string $p): void {
     if (is_link($p) || is_file($p)) { @unlink($p); return; }
     if (is_dir($p)) { foreach (scandir($p) ?: [] as $n) if ($n !== '.' && $n !== '..') rmrf29($p.'/'.$n); @rmdir($p); }

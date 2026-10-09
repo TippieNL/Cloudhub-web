@@ -79,12 +79,6 @@ final class TwoFactor
         return ($this->clock)();
     }
 
-    /** Whether this server can send email at all. */
-    public function emailAvailable(): bool
-    {
-        return $this->mailer !== null;
-    }
-
     /** What GET /api/users/me/two-factor answers: the account's settings, and what this server can do. */
     public function overview(int $userId): array
     {

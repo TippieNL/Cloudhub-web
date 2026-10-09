@@ -544,14 +544,16 @@ the same guard as every other route. Refusals carry stable codes —
 show at most a masked address (`k•••@example.com`). The Users list
 (`GET /api/users`) gains `twoFactorEnabled`, never an address.
 
-**The Android app** (Cloudhub-2) 4.3 was built for text-message codes. Against
-this server it can still sign in to an account with two-step verification —
-it asks the server to send the code and checks it — but its wording says
-"text" and "phone", and its **Settings** → **Two-step verification** screen
-cannot turn it on or change the address (it asks for a phone number): use the
-web app for that. Version 4.2 and earlier show the server's message for a
-sign-in answer they do not understand — *"This account uses two-step
-verification…"* — instead of signing in, and cost no email.
+**The Android app** (Cloudhub-2) asks for the emailed code too, from version
+4.4: after a right password it has the code sent, takes it (or a recovery
+code), and keeps the same limits and countdowns as the web app; **Settings** →
+**Two-step verification** turns it on and off, changes the address and makes
+new recovery codes. Version 4.3 was built for text-message codes: it can still
+finish a sign-in — it asks the server to send the code and checks it — but
+speaks of texts, and cannot turn it on or change the address (it asks for a
+phone number). Version 4.2 and earlier show the server's message — *"This
+account uses two-step verification…"* — instead of signing in, and cost no
+email.
 
 ## Storage and quotas
 

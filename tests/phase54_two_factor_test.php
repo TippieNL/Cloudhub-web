@@ -344,7 +344,7 @@ $checks['a challenge is used once: the second of two racing callers loses'] = $r
 $checks['the old purpose for a new number is gone'] = (function () use ($repo): bool {
     try { $repo->createChallenge(1, 'phone'); return false; } catch (InvalidArgumentException) { return true; }
 })();
-$repo->forgetChallenges(1);
+$db->exec('DELETE FROM two_factor_challenges WHERE user_id = 1');
 $repo->replaceRecoveryCodes(1, ['h1', 'h2']);
 $checks['a recovery code is spent once'] = $repo->useRecoveryCode(1, 'h1') && !$repo->useRecoveryCode(1, 'h1') && $repo->recoveryCodesLeft(1) === 1;
 $checks["and only by its own account"] = !$repo->useRecoveryCode(2, 'h2') && $repo->recoveryCodesLeft(1) === 1;
