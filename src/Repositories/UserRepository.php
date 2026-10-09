@@ -51,15 +51,25 @@ final class UserRepository
     /**
      * Live account state, used by the throttled session revalidation.
      *
-     * Returns null when the account has been deleted.
+     * Returns null when the account has been deleted. twoFactor says whether
+     * SMS two-step verification is on; a database migrate.php has not yet
+     * given the column to cannot have it on, so that reads as false, while any
+     * other database error propagates as it always did.
      */
     public function status(int $id): ?array
     {
-        $stmt = $this->db->prepare('SELECT role, is_active FROM users WHERE id = ?');
-        $stmt->execute([$id]);
+        try {
+            $stmt = $this->db->prepare('SELECT role, is_active, two_factor_enabled_at FROM users WHERE id = ?');
+            $stmt->execute([$id]);
+        } catch (\PDOException $e) {
+            if (!TwoFactorRepository::missingSchema($e)) throw $e;
+            $stmt = $this->db->prepare('SELECT role, is_active, NULL AS two_factor_enabled_at FROM users WHERE id = ?');
+            $stmt->execute([$id]);
+        }
         $row = $stmt->fetch(PDO::FETCH_ASSOC);
         if (!$row) return null;
-        return ['role' => self::normaliseRole((string)$row['role']), 'isActive' => (bool)$row['is_active']];
+        return ['role' => self::normaliseRole((string)$row['role']), 'isActive' => (bool)$row['is_active'],
+            'twoFactor' => $row['two_factor_enabled_at'] !== null];
     }
 
     public function create(string $username, string $password, string $role): array

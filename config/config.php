@@ -61,4 +61,23 @@ return [
  'queue_sync_max_mb'=>(int)env('QUEUE_SYNC_MAX_MB',256),
  'queue_extract_max_files'=>(int)env('QUEUE_EXTRACT_MAX_FILES',20000),
  'queue_extract_max_gb'=>(float)env('QUEUE_EXTRACT_MAX_GB',20),
+ // SMS two-step verification; see .env.example and SECURITY.md. With no
+ // SMS_DRIVER nobody can turn it on, and nothing about signing in changes.
+ 'sms_driver'=>strtolower(trim((string)env('SMS_DRIVER',''))),
+ 'sms_from'=>trim((string)env('SMS_FROM','')),
+ 'sms_app_name'=>trim((string)env('SMS_APP_NAME','CloudHub')),
+ 'sms_timeout_seconds'=>(int)env('SMS_TIMEOUT_SECONDS',10),
+ 'twilio_account_sid'=>trim((string)env('TWILIO_ACCOUNT_SID','')),
+ 'twilio_auth_token'=>trim((string)env('TWILIO_AUTH_TOKEN','')),
+ 'twilio_messaging_service_sid'=>trim((string)env('TWILIO_MESSAGING_SERVICE_SID','')),
+ 'sms_webhook_url'=>trim((string)env('SMS_WEBHOOK_URL','')),
+ 'sms_webhook_token'=>trim((string)env('SMS_WEBHOOK_TOKEN','')),
+ 'two_factor_secret'=>(string)env('TWO_FACTOR_SECRET',''),
+ 'two_factor_code_ttl_seconds'=>(int)env('TWO_FACTOR_CODE_TTL_SECONDS',300),
+ 'two_factor_max_attempts'=>(int)env('TWO_FACTOR_MAX_ATTEMPTS',5),
+ 'two_factor_resend_seconds'=>(int)env('TWO_FACTOR_RESEND_SECONDS',60),
+ 'two_factor_sms_per_hour'=>(int)env('TWO_FACTOR_SMS_PER_HOUR',5),
+ 'two_factor_sms_ip_per_hour'=>(int)env('TWO_FACTOR_SMS_IP_PER_HOUR',20),
+ 'two_factor_failures_per_hour'=>(int)env('TWO_FACTOR_FAILURES_PER_HOUR',10),
+ 'two_factor_ip_failures_per_hour'=>(int)env('TWO_FACTOR_IP_FAILURES_PER_HOUR',30),
 ];

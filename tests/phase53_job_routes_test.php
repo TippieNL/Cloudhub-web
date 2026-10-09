@@ -19,7 +19,11 @@ $worker = (string)file_get_contents($root.'/tools/worker.php');
 $checks = [];
 
 // --- the guard --------------------------------------------------------------------
-$guard = substr($index, (int)strpos($index, '$isProtectedApi && $method'), 3000);
+// The guard, from its opening to the cache hook that follows it. This was a
+// fixed 3000-character window, which cut the guard short once the write-exempt
+// list gained the two-step verification routes.
+$guardAt = (int)strpos($index, '$isProtectedApi && $method');
+$guard = substr($index, $guardAt, (int)strpos($index, '$cacheNeutralWrites = [', $guardAt) - $guardAt);
 $checks['task routes still need a session'] = str_contains($guard, 'Authorization::requireRead();');
 $checks['and a CSRF token for anything but a read'] =
     strpos($guard, 'Auth::verifyCsrf();') !== false && strpos($guard, 'Auth::verifyCsrf();') < strpos($guard, '!$isJobRoute');

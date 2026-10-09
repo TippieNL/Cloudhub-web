@@ -9,13 +9,20 @@ CREATE TABLE IF NOT EXISTS users (
  role ENUM('viewer','editor','admin') NOT NULL DEFAULT 'viewer',
  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
- last_login_at TIMESTAMP NULL DEFAULT NULL
+ last_login_at TIMESTAMP NULL DEFAULT NULL,
+ -- SMS two-step verification. NULL two_factor_enabled_at means off, which
+ -- every account is until its owner turns it on. The number is E.164.
+ two_factor_phone VARCHAR(20) NULL,
+ two_factor_enabled_at DATETIME NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 
+-- Throttle events: password failures ('user', 'ip'), and for two-step
+-- verification the codes checked ('verify_*') and text messages sent ('sms_*').
+-- attempt_key is an HMAC, never a raw username, address or phone number.
 CREATE TABLE IF NOT EXISTS login_attempts (
  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
- scope ENUM('user','ip') NOT NULL,
+ scope ENUM('user','ip','verify_user','verify_ip','sms_user','sms_ip','sms_phone') NOT NULL,
  attempt_key CHAR(64) NOT NULL,
  attempted_at DATETIME NOT NULL,
  INDEX idx_login_attempt_lookup(scope, attempt_key, attempted_at),
@@ -37,6 +44,36 @@ CREATE TABLE IF NOT EXISTS security_events (
  INDEX idx_security_events_created(created_at),
  INDEX idx_security_events_user(user_id,created_at),
  INDEX idx_security_events_type(event_type,created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- An SMS code waiting to be entered. One row per account and purpose
+-- ('login', 'confirm' for proving the current phone before a change, 'phone'
+-- for proving a new number): asking again replaces it, which is what makes an
+-- older code stop working, and using it deletes it. code_hash is an HMAC of the
+-- code under a server secret, never the code itself. id is random and is what
+-- the session holds. Times are UTC, written by PHP.
+CREATE TABLE IF NOT EXISTS two_factor_challenges (
+ id CHAR(32) NOT NULL PRIMARY KEY,
+ user_id INT UNSIGNED NOT NULL,
+ purpose VARCHAR(16) NOT NULL,
+ code_hash CHAR(64) NULL,
+ attempts INT UNSIGNED NOT NULL DEFAULT 0,
+ created_at DATETIME NOT NULL,
+ sent_at DATETIME NULL,
+ expires_at DATETIME NULL,
+ UNIQUE KEY uq_two_factor_challenge(user_id, purpose),
+ INDEX idx_two_factor_challenge_created(created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- One-time recovery codes for an account whose phone is lost. Only a SHA-256
+-- of each is kept; used_at marks the one that has been spent.
+CREATE TABLE IF NOT EXISTS two_factor_recovery_codes (
+ id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+ user_id INT UNSIGNED NOT NULL,
+ code_hash CHAR(64) NOT NULL,
+ created_at DATETIME NOT NULL,
+ used_at DATETIME NULL,
+ UNIQUE KEY uq_two_factor_recovery(user_id, code_hash)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS storage_servers (
