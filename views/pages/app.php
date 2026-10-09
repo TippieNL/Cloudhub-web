@@ -37,10 +37,10 @@ $uploadSizeHelp = $maxUploadMb >= 1024
             <p id="login-error" class="error"></p>
             <button>Sign In</button>
         </form>
-        <?php /* The second step for an account with SMS two-step verification, shown once its password was right. */ ?>
+        <?php /* The second step for an account with two-step verification, shown once its password was right. */ ?>
         <form id="two-factor-form" class="dialog" hidden novalidate>
             <h2>Two-step verification</h2>
-            <p id="two-factor-intro">Enter the code we sent to your phone.</p>
+            <p id="two-factor-intro">Enter the code we sent to your email.</p>
             <label id="two-factor-code-label">Verification code
                 <input id="two-factor-code" class="code-input" inputmode="numeric" autocomplete="one-time-code" maxlength="6" spellcheck="false">
             </label>
@@ -247,21 +247,21 @@ $uploadSizeHelp = $maxUploadMb >= 1024
                     <p id="tf-summary" class="muted">Loading…</p>
                     <div id="tf-actions" class="tf-actions">
                         <button id="tf-enable" type="button" class="primary-button" hidden>Turn on</button>
-                        <button id="tf-change" type="button" hidden>Change number</button>
+                        <button id="tf-change" type="button" hidden>Change email</button>
                         <button id="tf-codes" type="button" hidden>New recovery codes</button>
                         <button id="tf-disable" type="button" class="danger-text" hidden>Turn off</button>
                     </div>
 
                     <form id="tf-start" class="tf-step" hidden novalidate>
                         <p id="tf-start-intro"></p>
-                        <label id="tf-phone-label" class="share-field">Mobile number, with country code
-                            <input id="tf-phone" type="tel" inputmode="tel" autocomplete="tel" placeholder="+31 6 12345678" spellcheck="false">
+                        <label id="tf-email-label" class="share-field">Email address for your codes
+                            <input id="tf-email" type="email" inputmode="email" autocomplete="email" autocapitalize="off" maxlength="254" placeholder="name@example.com" spellcheck="false">
                         </label>
                         <label class="share-field">Current password
                             <input id="tf-password" type="password" autocomplete="current-password">
                         </label>
                         <div class="tf-links">
-                            <button id="tf-start-recovery" type="button" class="link-button" hidden>No access to your phone? Use a recovery code</button>
+                            <button id="tf-start-recovery" type="button" class="link-button" hidden>No access to your email? Use a recovery code</button>
                         </div>
                         <div class="modal-actions tf-buttons">
                             <button id="tf-start-cancel" type="button">Cancel</button>
@@ -271,7 +271,7 @@ $uploadSizeHelp = $maxUploadMb >= 1024
 
                     <form id="tf-verify" class="tf-step" hidden novalidate>
                         <p id="tf-verify-intro"></p>
-                        <label id="tf-code-label" class="share-field">Code from the text message
+                        <label id="tf-code-label" class="share-field">Code from the email
                             <input id="tf-code" class="code-input" inputmode="numeric" autocomplete="one-time-code" maxlength="6" spellcheck="false">
                         </label>
                         <label id="tf-recovery-label" class="share-field" hidden>Recovery code
@@ -288,7 +288,7 @@ $uploadSizeHelp = $maxUploadMb >= 1024
                     </form>
 
                     <div id="tf-codes-step" class="tf-step" hidden>
-                        <p><strong>Save your recovery codes.</strong> If you lose your phone, each one signs you in once in place of a texted code. They are not shown again.</p>
+                        <p><strong>Save your recovery codes.</strong> If you lose access to your email, each one signs you in once in place of an emailed code. They are not shown again.</p>
                         <ol id="tf-code-list" class="recovery-codes"></ol>
                         <div class="modal-actions tf-buttons">
                             <button id="tf-codes-copy" type="button">Copy</button>
@@ -298,7 +298,7 @@ $uploadSizeHelp = $maxUploadMb >= 1024
                     </div>
 
                     <div id="tf-message" class="status-message" role="status" aria-live="polite" hidden></div>
-                    <p class="muted tf-note">Codes come by text message. That protects your account from a stolen password, but not from someone who takes over your phone number, so keep your recovery codes somewhere safe.</p>
+                    <p class="muted tf-note">Codes come by email. That protects your account from a stolen password, but not from someone who can read your email, so secure your mailbox too and keep your recovery codes somewhere safe.</p>
                 </section>
             </div>
         </div>

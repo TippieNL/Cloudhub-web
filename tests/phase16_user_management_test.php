@@ -46,7 +46,7 @@ $checks['changing your own password needs only a session'] = (function () use ($
 // file is the caller's own preference and a viewer has to be able to do it; so
 // did the caller's own two-step verification routes, deliberately, because a
 // viewer has to be able to secure their own account -- each change asks for the
-// password again and a texted code, and none touches the file store.
+// password again and an emailed code, and none touches the file store.
 $checks['self-service password is exempt from the write check'] =
     str_contains($index, "\$writeExemptPost = ['/api/files/download-zip', '/api/thumbnail/video', '/api/users/me/password', '/api/favorites', '/api/users/me/two-factor/start', '/api/users/me/two-factor/resend', '/api/users/me/two-factor/confirm', '/api/users/me/two-factor/cancel'];");
 $checks['the exempt list still verifies CSRF'] =

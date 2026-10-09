@@ -275,7 +275,7 @@ header>nav a{padding:8px 12px;white-space:nowrap;flex:0 0 auto}
 .task-checksums{margin:0;padding:8px 10px;border-radius:7px;background:var(--bg);font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;overflow:auto;white-space:pre}
 .task .actions{margin-top:2px}
 
-/* Security: password and SMS two-step verification. Built from the share and
+/* Security: password and two-step verification. Built from the share and
    task patterns -- the share dialog's fields, the task status pill -- so it
    reads as part of the same app in both themes. */
 .security-dialog{width:min(520px,100%);max-height:min(780px,92vh);overflow:auto}

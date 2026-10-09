@@ -7,8 +7,8 @@ use PDO;
 use PDOException;
 
 /**
- * Storage for SMS two-step verification: an account's number and switch, the
- * codes waiting to be entered, and recovery codes.
+ * Storage for two-step verification by email: an account's address and
+ * switch, the codes waiting to be entered, and recovery codes.
  *
  * Every change that matters is a compare-and-set -- an UPDATE or DELETE whose
  * WHERE names the state it expects, and which counts only if it changed a row
@@ -24,7 +24,7 @@ use PDOException;
  */
 final class TwoFactorRepository
 {
-    public const PURPOSES = ['login', 'confirm', 'phone'];
+    public const PURPOSES = ['login', 'confirm', 'email'];
 
     /** @var \Closure(): int */
     private \Closure $clock;
@@ -70,7 +70,7 @@ final class TwoFactorRepository
     {
         if ($this->ready !== null) return $this->ready;
         try {
-            $this->db->query('SELECT two_factor_phone, two_factor_enabled_at FROM users WHERE 1 = 0');
+            $this->db->query('SELECT two_factor_email, two_factor_enabled_at FROM users WHERE 1 = 0');
             $this->db->query('SELECT id FROM two_factor_challenges WHERE 1 = 0');
             $this->db->query('SELECT id FROM two_factor_recovery_codes WHERE 1 = 0');
             return $this->ready = true;
@@ -83,24 +83,35 @@ final class TwoFactorRepository
     /**
      * An account's two-step state, or null when the account does not exist.
      *
-     * @return array{enabled: bool, phone: ?string, enabledAt: ?int}|null
+     * Whether it is on rests on two_factor_enabled_at alone, which databases
+     * set up for text-message codes have as well. One that has not had the
+     * email column added yet still asks those accounts for a code -- which
+     * then only a recovery code can answer -- instead of letting them in on
+     * the password: a missing column narrows what can be read, never what is
+     * required.
+     *
+     * @return array{enabled: bool, email: ?string, enabledAt: ?int}|null
      */
     public function state(int $userId): ?array
     {
-        try {
-            $stmt = $this->db->prepare('SELECT two_factor_phone, two_factor_enabled_at FROM users WHERE id = ?');
-            $stmt->execute([$userId]);
-        } catch (PDOException $e) {
-            if (!self::missingSchema($e)) throw $e;
-            $stmt = $this->db->prepare('SELECT NULL AS two_factor_phone, NULL AS two_factor_enabled_at FROM users WHERE id = ?');
-            $stmt->execute([$userId]);
+        $row = null;
+        foreach (['two_factor_email, two_factor_enabled_at',
+                  'NULL AS two_factor_email, two_factor_enabled_at',
+                  'NULL AS two_factor_email, NULL AS two_factor_enabled_at'] as $columns) {
+            try {
+                $stmt = $this->db->prepare("SELECT $columns FROM users WHERE id = ?");
+                $stmt->execute([$userId]);
+                $row = $stmt->fetch(PDO::FETCH_ASSOC);
+                break;
+            } catch (PDOException $e) {
+                if (!self::missingSchema($e)) throw $e;
+            }
         }
-        $row = $stmt->fetch(PDO::FETCH_ASSOC);
         if (!$row) return null;
-        $phone = $row['two_factor_phone'];
+        $email = $row['two_factor_email'];
         return [
             'enabled' => $row['two_factor_enabled_at'] !== null,
-            'phone' => is_string($phone) && $phone !== '' ? $phone : null,
+            'email' => is_string($email) && $email !== '' ? $email : null,
             'enabledAt' => self::time($row['two_factor_enabled_at']),
         ];
     }
@@ -124,28 +135,28 @@ final class TwoFactorRepository
     }
 
     /**
-     * Point the account's two-step verification at $phone, turning it on if
+     * Point the account's two-step verification at $email, turning it on if
      * it was off. Returns whether this call turned it on.
      *
      * The off-to-on step is a compare-and-set, so two confirmations racing to
      * turn it on agree on which one did -- and only that one hands out
      * recovery codes.
      */
-    public function enable(int $userId, string $phone): bool
+    public function enable(int $userId, string $email): bool
     {
-        $stmt = $this->db->prepare('UPDATE users SET two_factor_phone = ?, two_factor_enabled_at = ? WHERE id = ? AND two_factor_enabled_at IS NULL');
-        $stmt->execute([$phone, $this->stamp($this->now()), $userId]);
+        $stmt = $this->db->prepare('UPDATE users SET two_factor_email = ?, two_factor_enabled_at = ? WHERE id = ? AND two_factor_enabled_at IS NULL');
+        $stmt->execute([$email, $this->stamp($this->now()), $userId]);
         if ($stmt->rowCount() === 1) return true;
-        $this->db->prepare('UPDATE users SET two_factor_phone = ? WHERE id = ?')->execute([$phone, $userId]);
+        $this->db->prepare('UPDATE users SET two_factor_email = ? WHERE id = ?')->execute([$email, $userId]);
         return false;
     }
 
-    /** Turn it off: the number, its recovery codes and any code in flight all go. */
+    /** Turn it off: the address, its recovery codes and any code in flight all go. */
     public function disable(int $userId): void
     {
         $this->db->beginTransaction();
         try {
-            $this->db->prepare('UPDATE users SET two_factor_phone = NULL, two_factor_enabled_at = NULL WHERE id = ?')->execute([$userId]);
+            $this->db->prepare('UPDATE users SET two_factor_email = NULL, two_factor_enabled_at = NULL WHERE id = ?')->execute([$userId]);
             $this->db->prepare('DELETE FROM two_factor_recovery_codes WHERE user_id = ?')->execute([$userId]);
             $this->db->prepare('DELETE FROM two_factor_challenges WHERE user_id = ?')->execute([$userId]);
             $this->db->commit();
@@ -249,16 +260,6 @@ final class TwoFactorRepository
         $stmt = $this->db->prepare('DELETE FROM two_factor_challenges WHERE id = ?');
         $stmt->execute([$id]);
         return $stmt->rowCount() === 1;
-    }
-
-    /** Drop the account's challenges, or only those for one purpose. */
-    public function forgetChallenges(int $userId, ?string $purpose = null): void
-    {
-        if ($purpose === null) {
-            $this->db->prepare('DELETE FROM two_factor_challenges WHERE user_id = ?')->execute([$userId]);
-        } else {
-            $this->db->prepare('DELETE FROM two_factor_challenges WHERE user_id = ? AND purpose = ?')->execute([$userId, $purpose]);
-        }
     }
 
     /**

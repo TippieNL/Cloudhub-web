@@ -22,7 +22,6 @@ spl_autoload_register(static function (string $class): void {
 use CloudHub\Repositories\JobRepository;
 use CloudHub\Services\FileService;
 use CloudHub\Services\Jobs\BaseJobType;
-use CloudHub\Services\Jobs\CopyJob;
 use CloudHub\Services\Jobs\ExtractJob;
 use CloudHub\Services\Jobs\JobContext;
 use CloudHub\Services\Jobs\JobEnvironment;

@@ -76,7 +76,7 @@ $pdo->exec("CREATE TABLE IF NOT EXISTS share_links (
 // PDOException surfacing as HTTP 500 rather than a friendly error.
 $pdo->exec("CREATE TABLE IF NOT EXISTS login_attempts (
  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
- scope ENUM('user','ip','verify_user','verify_ip','sms_user','sms_ip','sms_phone') NOT NULL,
+ scope ENUM('user','ip','verify_user','verify_ip','email_user','email_ip','email_address') NOT NULL,
  attempt_key CHAR(64) NOT NULL,
  attempted_at DATETIME NOT NULL,
  INDEX idx_login_attempt_lookup(scope, attempt_key, attempted_at),
@@ -144,7 +144,7 @@ $pdo->exec("CREATE TABLE IF NOT EXISTS jobs (
  INDEX idx_jobs_user (user_id, created_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
 
-// SMS two-step verification: codes waiting to be entered, and the one-time
+// Two-step verification: codes waiting to be entered, and the one-time
 // recovery codes of accounts that have it on. Nothing reads these until an
 // account turns the feature on, and every account starts with it off.
 $pdo->exec("CREATE TABLE IF NOT EXISTS two_factor_challenges (
@@ -187,24 +187,58 @@ if (!$hadRole) {
     if ($promoted->rowCount()) echo "Promoted existing admin account to the admin role.\n";
 }
 
-// SMS two-step verification, off (NULL) for every existing account. Both are
-// nullable and appended, which MySQL and MariaDB add without rewriting rows.
-addColumn($pdo, 'users', 'two_factor_phone', 'VARCHAR(20) NULL');
+// Two-step verification by email, off (NULL) for every existing account. Both
+// are nullable and appended, which MySQL and MariaDB add without rewriting rows.
+addColumn($pdo, 'users', 'two_factor_email', 'VARCHAR(254) NULL');
 addColumn($pdo, 'users', 'two_factor_enabled_at', 'DATETIME NULL');
 
 /*
- * Two-step verification throttles codes checked and text messages sent in
- * login_attempts, beside the password failures it already holds.
- *
- * Values are only appended to the ENUM, so every existing row keeps its
- * meaning. Until this runs, those inserts fail and every two-step request is
+ * Two-step verification throttles codes checked ('verify_*') and code emails
+ * sent ('email_*') in login_attempts, beside the password failures it already
+ * holds. Until this runs, those inserts fail and every two-step request is
  * refused -- closed, not open -- while sign-in for everyone else is unchanged.
+ *
+ * A database set up for text-message codes has 'sms_*' values instead. The
+ * email ones are appended first, so nothing is refused while this runs; then
+ * the text-message rows -- an hour of throttle history, nothing else -- and
+ * their values go. Should that last step fail (strict mode, and a text-message
+ * row written meanwhile by a server still running the old code), the extra
+ * values simply stay until this is run again; they do no harm.
  */
+$scopes = "'user','ip','verify_user','verify_ip','email_user','email_ip','email_address'";
 $scopeType = $pdo->query("SELECT COLUMN_TYPE FROM information_schema.COLUMNS
     WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'login_attempts' AND COLUMN_NAME = 'scope'")->fetchColumn();
-if (is_string($scopeType) && !str_contains($scopeType, "'sms_phone'")) {
-    $pdo->exec("ALTER TABLE login_attempts MODIFY scope ENUM('user','ip','verify_user','verify_ip','sms_user','sms_ip','sms_phone') NOT NULL");
+if (is_string($scopeType) && str_contains($scopeType, "'sms_")) {
+    if (!str_contains($scopeType, "'email_address'")) {
+        $pdo->exec("ALTER TABLE login_attempts MODIFY scope ENUM('user','ip','verify_user','verify_ip','sms_user','sms_ip','sms_phone','email_user','email_ip','email_address') NOT NULL");
+    }
+    $pdo->exec("DELETE FROM login_attempts WHERE scope IN ('sms_user','sms_ip','sms_phone')");
+    try {
+        $pdo->exec("ALTER TABLE login_attempts MODIFY scope ENUM($scopes) NOT NULL");
+        echo "Moved login_attempts.scope from text-message to email two-step verification\n";
+    } catch (PDOException $e) {
+        echo "login_attempts.scope keeps its old text-message values for now (".$e->getMessage()."); run this script again to remove them.\n";
+    }
+} elseif (is_string($scopeType) && !str_contains($scopeType, "'email_address'")) {
+    $pdo->exec("ALTER TABLE login_attempts MODIFY scope ENUM($scopes) NOT NULL");
     echo "Extended login_attempts.scope for two-step verification\n";
+}
+
+/*
+ * Left by the text-message version of two-step verification, and no longer
+ * read. Kept, so this script deletes nothing; SECURITY.md has the statement
+ * that removes it. An account that had codes texted keeps two-step
+ * verification on -- turning it off here would quietly drop a protection its
+ * owner chose -- and, having no address yet, finishes signing in with a
+ * recovery code until it adds one, or an administrator resets it.
+ */
+if (columnExists($pdo, 'users', 'two_factor_phone')) {
+    $waiting = (int)$pdo->query('SELECT COUNT(*) FROM users WHERE two_factor_enabled_at IS NOT NULL AND two_factor_email IS NULL')->fetchColumn();
+    echo "users.two_factor_phone, from text-message codes, is no longer used and can be dropped (see SECURITY.md).\n";
+    if ($waiting > 0) {
+        echo "$waiting account(s) have two-step verification on from then, with no email address yet: they sign in with a\n";
+        echo "recovery code and add one under Security, or an administrator resets it (Users screen, or tools/reset-two-factor.php).\n";
+    }
 }
 
 addColumn($pdo, 'storage_servers', 'is_active', 'TINYINT(1) NOT NULL DEFAULT 1');

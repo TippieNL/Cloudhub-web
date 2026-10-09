@@ -54,7 +54,7 @@ final class LoginRateLimiter {
  /**
   * Take one of the $max slots $scope allows $value in the last $window seconds.
   *
-  * Used by two-step verification for every code checked and every text sent.
+  * Used by two-step verification for every code checked and every email sent.
   * The slot is inserted first and counted after, so requests arriving together
   * cannot all see room and all go ahead: each one counts the others too, and
   * at worst one is refused that need not have been -- never one let through

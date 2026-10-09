@@ -150,11 +150,13 @@ A listing entry holds names, sizes and times, which every signed-in account can
 already list — CloudHub has no per-folder permissions — and a favorites entry is
 keyed to its account. Nothing is cached for public share links.
 
-## SMS two-step verification
+## Two-step verification by email
 
-An account can require, after its password, a six-digit code texted to its
-owner's phone. It is off until the owner turns it on; accounts that leave it
-off sign in exactly as before. README.md describes the feature and its setup.
+An account can require, after its password, a six-digit code emailed to an
+address its owner has proven. It is off until the owner turns it on; accounts
+that leave it off sign in exactly as before. README.md describes the feature
+and its setup. It replaced the earlier text-message codes: see **Moving from
+text-message codes** below.
 
 ### Where it is enforced
 
@@ -168,24 +170,29 @@ off sign in exactly as before. README.md describes the feature and its setup.
   or a recovery code is checked, sets it — and it can only upgrade a session
   that proved the password in the last 15 minutes, re-reads the account (one
   disabled meanwhile is not signed in), and regenerates the ID again.
-- **There is no other way in.** CloudHub has no remember-me token, API key or
-  Basic authentication; WebDAV uses the session; share links never sign anyone
-  in. Sessions are long-lived instead, so when an account turns two-step
-  verification on, every one of its sessions that did not pass a second factor
-  is ended at its next account re-check (within a minute) — another browser,
-  the Android app, or whoever else had the password. A session records
-  `two_factor_verified_at` when it passes a code, a recovery code, or proves the
-  phone while turning the feature on.
+- **There is no other way in.** CloudHub has no remember-me token, password
+  reset by email, API key or Basic authentication; WebDAV uses the session;
+  share links never sign anyone in. Sessions are long-lived instead, so when an
+  account turns two-step verification on, every one of its sessions that did
+  not pass a second factor is ended at its next account re-check (within a
+  minute) — another browser, the Android app, or whoever else had the
+  password. A session records `two_factor_verified_at` when it passes a code, a
+  recovery code, or proves the address while turning the feature on. A
+  password change by an administrator does not turn two-step verification off.
 - **CSRF.** `/api/auth/two-factor/*` sit outside the signed-in guard, as login
   does, and check the session's CSRF token and Fetch Metadata themselves. The
   settings routes are behind the guard like every other change.
 - **Failing closed.** A database error while reading whether an account needs a
-  code fails the sign-in. Only a database without the columns at all — one
-  `migrate.php` has not updated, where nobody can have turned it on — reads as
-  "off". With no working SMS gateway, a code cannot be sent and the account can
-  finish signing in only with a recovery code. A throttle that cannot record
-  its own event (an unmigrated `login_attempts` ENUM under MySQL's non-strict
-  mode) refuses rather than waving requests through.
+  code fails the sign-in. Whether a code is needed rests on
+  `users.two_factor_enabled_at` alone, so an account that turned on text-message
+  codes still needs a second step on a server that has the new code but has
+  not run the migration yet. Only a database without that column at all —
+  where nobody can have turned it on — reads as "off". With no working mail
+  server, a code cannot be sent and the account can finish signing in only
+  with a recovery code; a failed or timed-out email never signs anyone in. A
+  throttle that cannot record its own event (an unmigrated `login_attempts`
+  ENUM under MySQL's non-strict mode) refuses rather than waving requests
+  through.
 
 ### Codes
 
@@ -194,8 +201,8 @@ off sign in exactly as before. README.md describes the feature and its setup.
   live code. Without `TWO_FACTOR_SECRET` the key is derived from
   `RATE_LIMIT_SECRET`, or failing that from `APP_URL` — still outside the
   database, but set a real one.
-- One challenge per account and purpose (sign-in; proving the current phone;
-  proving a new number). Asking for a new code replaces the old one, and a
+- One challenge per account and purpose (sign-in; proving the current address;
+  proving a new address). Asking for a new code replaces the old one, and a
   later sign-in replaces an earlier one's code. The session holds the
   challenge's random id, so one session's code is no use to another.
 - Valid for `TWO_FACTOR_CODE_TTL_SECONDS` (300 by default).
@@ -205,11 +212,9 @@ off sign in exactly as before. README.md describes the feature and its setup.
 - Used once: using it deletes the row in one compare-and-set, so of several
   requests racing with the right code exactly one succeeds (tested with five
   concurrent requests over HTTP).
-- Each message says what the code is for ("sign-in code", "code to turn off
-  two-step verification"), so a code nobody asked for stands out. When
-  `APP_URL` is an https domain the message ends with the WebOTP origin-bound
-  line `@host #code`, which lets Android Chrome offer it to that site only; the
-  host never comes from the request.
+- Each email says what the code is for ("to finish signing in", "to turn off
+  two-step verification"), so a code nobody asked for stands out. The code is
+  in the body only, never the subject, which phones show on a locked screen.
 
 ### Rate limits
 
@@ -220,93 +225,127 @@ extend the wait.
 
 | Limit | Default |
 |---|---|
-| texts per account, per number (each) | 5 per hour |
-| texts per client address | 20 per hour |
-| a new code for the same challenge | 60 s after the last |
+| code emails per account, per address (each) | 5 per hour |
+| code emails per client address | 20 per hour |
+| a new code for the same challenge | 60 s after the last (a compare-and-set: five requests at once send one email) |
 | wrong codes or recovery codes per account | 10 per hour |
 | wrong codes or recovery codes per client address | 30 per hour |
 | wrong guesses per code | 5 |
 | wrong current password when changing settings | counts against the password throttle |
 
-A text the gateway refused gives its slots back (nothing was sent); a gateway
-outage keeps them, since a timeout can follow a message that was in fact sent.
+An email the server refused gives its slots back (nothing was sent); an outage
+keeps them, since a timeout can follow a message that was in fact accepted.
 With these defaults an attacker who already has the password can test at most
-ten codes an hour — and each code they cause goes to the owner's phone.
+ten codes an hour — and each code they cause goes to the owner's mailbox.
 
 ### Changing it, and recovery
 
 - Every change asks for the current password, throttled like a sign-in, so a
   borrowed session cannot be used to guess it.
-- Turning it on, or moving to a new number, proves the new number with a code
+- Turning it on, or moving to a new address, proves the new address with a code
   sent to it; a recovery code cannot stand in for that.
-- Turning it off and replacing the recovery codes also need the current phone
-  (or a recovery code). So does a change of number, unless this session proved
-  the phone in the last ten minutes — otherwise "change the number, then turn
-  it off" would make the phone optional for turning it off. A change begun while
-  the feature was off cannot complete if it was turned on elsewhere meanwhile.
-- The old number is texted when the number changes or the feature is turned off.
+- Turning it off and replacing the recovery codes also need the current address
+  (or a recovery code). So does a change of address, unless this session proved
+  the current one in the last ten minutes — otherwise "change the address, then
+  turn it off" would make the mailbox optional for turning it off. A change
+  begun while the feature was off cannot complete if it was turned on elsewhere
+  meanwhile.
+- The old address is emailed when the address changes or the feature is turned
+  off.
 - Recovery codes: ten, 16 characters from a 31-letter alphabet (79 bits), shown
   once, stored as SHA-256 bound to the account, each spent by one
   compare-and-set. Replacing them retires the old ones.
 - An administrator can reset another account's two-step verification after
-  re-entering their own password; it is audited and texted to the owner. Not
-  their own: that would bypass the phone. `tools/reset-two-factor.php` is the
+  re-entering their own password; it is audited and emailed to the owner. Not
+  their own: that would bypass the mailbox. `tools/reset-two-factor.php` is the
   server operator's last resort.
 
 ### Enumeration and privacy
 
 Nothing about two-step verification is revealed before a correct password: an
 unknown account, a disabled one and a wrong password all get the same answer,
-as before. Several accounts may share a number, so enrolling reveals nothing
-about who else uses it. Answers, messages and the audit trail show at most the
-last two digits of a number.
+as before. Several accounts may share an address, so enrolling reveals nothing
+about who else uses it. Answers, emails about changes and the audit trail show
+at most a masked address, `k•••@example.com`.
 
-The number itself is stored in E.164 in `users.two_factor_phone` — CloudHub
-needs it to send codes — and is never returned by any API, written to a log or
-put in the audit trail. Treat database backups as personal data. Challenge
-rows hold no number; they are deleted when used and pruned after a day.
+The address itself is stored in `users.two_factor_email` — CloudHub needs it to
+send codes — and is never returned in full by any API, written to a log or put
+in the audit trail. Treat database backups as personal data. Challenge rows
+hold no address; they are deleted when used and pruned after a day.
 
-Codes, recovery codes and numbers never reach `logs/php-error.log`: gateway
-failures are logged by gateway, HTTP status and the gateway's own error code
-only (Twilio's error text quotes the destination number, so it is dropped). The
-audit trail records `auth.login` (`second_factor`, then `success` with the
-method), `auth.two_factor` failures, `two_factor.sms`, `two_factor.enable`,
-`.phone_change`, `.disable`, `.recovery_codes`, `.reauth` and `.admin_reset`.
+Codes, recovery codes, addresses and SMTP credentials never reach
+`logs/php-error.log`: a failed email is logged by step and SMTP status only
+(`smtp: RCPT TO refused (550 5.1.x)`) — a server's own reply text often quotes
+the address, so it is dropped — and a bad setting by its name, never its
+value. There is no development outbox that writes codes to a file; to try the
+feature locally, point it at a local catcher such as Mailpit. The audit trail
+records `auth.login` (`second_factor`, then `success` with the method),
+`auth.two_factor` failures, `two_factor.email`, `two_factor.enable`,
+`.email_change`, `.disable`, `.recovery_codes`, `.reauth` and `.admin_reset`.
 
-### The SMS gateway
+### The mail server
 
-Credentials live in `.env` only and never reach a browser. Requests verify TLS,
-never follow redirects (which would carry the credentials and the code
-elsewhere) and give up after `SMS_TIMEOUT_SECONDS`. A webhook over plain HTTP
-is refused unless it is on this machine or a private network. The development
-outbox (`SMS_DRIVER=log`) writes working codes to `logs/sms-outbox.log` and is
-refused unless `APP_ENV=development`.
+`SMTP_*` settings live in `.env` only and never reach a browser. The connection
+uses TLS 1.2 or later — STARTTLS on 587 (`SMTP_ENCRYPTION=tls`) or TLS from the
+first byte on 465 (`ssl`) — and always verifies the certificate against
+`SMTP_HOST`; there is no setting that turns verification off. A server that
+does not offer STARTTLS when it was asked for gets nothing: not the
+credentials, not the message. `SMTP_ENCRYPTION=none` is accepted only for a
+relay on this machine or a private network. PHP builds without a CA bundle
+(common on Android/KSWEB) need `SMTP_CA_FILE`; without it, verification fails
+and nothing is sent. Addresses are validated and refused if they carry line
+breaks or angle brackets, so none can add an SMTP command or a header, and
+every message is plain text.
 
-### What SMS does not protect against
+Your mail provider, and anyone who can read the mailbox, sees every code. Use
+an account dedicated to sending, with an app password rather than the main
+password, and keep `.env` readable by the web server only.
 
-SMS is the weakest common second factor. It stops someone who has only the
-password. It does not stop:
+### What email does not protect against
 
-- **SIM swapping and number porting** — whoever controls the number receives the
-  codes;
-- **interception** of the text in the network (SS7) or by malware on the phone;
+An emailed code stops someone who has only the password. It does not stop:
+
+- **someone who can read the mailbox** — a reused or phished email password, a
+  shared or synced device, an auto-forwarding rule. Email is often protected
+  less well than the account it guards: turn on the mail provider's own
+  two-step verification;
 - **real-time phishing**, where a fake sign-in page relays the password and the
-  code as the victim types them (the WebOTP line helps only where the browser
-  fills the code itself);
-- **someone with the phone unlocked**, or a stolen session cookie (a second
-  factor protects signing in, not a session that already exists);
+  code as the victim types them;
+- **a stolen session cookie** (a second factor protects signing in, not a
+  session that already exists);
 - an **administrator** or the server's operator, who can reset it.
 
 Keep recovery codes offline, and consider an authenticator app or passkeys in a
-future version for accounts that need more. SMS also costs money: the limits
-above bound what one account, number or address can make the server send.
+future version for accounts that need more.
+
+### Moving from text-message codes
+
+`php database/migrate.php` (or `database/migrations/20261009_two_factor_email.sql`)
+adds `users.two_factor_email`, and swaps the `sms_*` throttle values of
+`login_attempts.scope` for `email_*` ones after deleting their rows — an hour
+of throttle history, nothing else. It deletes no account data and turns no
+account's two-step verification off: an account that had text-message codes on
+stays on with no address, so it can only finish signing in with a recovery
+code, then add an address under **Security** — or an administrator resets it.
+The script lists how many such accounts there are.
+
+`users.two_factor_phone` is left in place, unused, so the update deletes
+nothing. The numbers are personal data with no purpose left; once every such
+account has an address (or was reset), remove them:
+
+```sql
+SELECT username FROM users WHERE two_factor_enabled_at IS NOT NULL AND two_factor_email IS NULL;
+ALTER TABLE users DROP COLUMN two_factor_phone;   -- cannot be undone
+```
 
 ### Production checklist
 
 - Run `php database/migrate.php`.
 - Serve over HTTPS with `REQUIRE_HTTPS=true`; set `APP_URL` to the https address.
 - Set `TWO_FACTOR_SECRET` (and `RATE_LIMIT_SECRET`) to long random values.
-- Configure the gateway; with Twilio, allow only the destination countries you
-  need, and set a spending alert.
-- Review the defaults in `.env.example`; watch `two_factor.sms` and
-  `auth.two_factor` events in the audit trail.
+- Configure `SMTP_*` and `MAIL_FROM_ADDRESS`; send a test by turning two-step
+  verification on for your own account. Set up SPF/DKIM for the sender's
+  domain, or codes land in spam.
+- Review the defaults in `.env.example`; watch `two_factor.email` and
+  `auth.two_factor` events in the audit trail, and `[mail]` lines in
+  `logs/php-error.log`.

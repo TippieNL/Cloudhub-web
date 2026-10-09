@@ -23,7 +23,7 @@ use CloudHub\Services\MediaProbe;
 use CloudHub\Services\AuditLog;
 use CloudHub\Services\TwoFactor;
 use CloudHub\Services\TwoFactorError;
-use CloudHub\Services\Sms\Sms;
+use CloudHub\Services\Mail\Mail;
 use CloudHub\Repositories\TwoFactorRepository;
 use CloudHub\Repositories\JobRepository;
 use CloudHub\Services\Jobs\JobEnvironment;
@@ -463,13 +463,13 @@ function db(): PDO {
     return \CloudHub\Helpers\Db::connection();
 }
 /**
-* SMS two-step verification, built on first use: only its own routes and a
-* sign-in that needs it pay for the SMS gateway's configuration.
+* Two-step verification by email, built on first use: only its own routes and
+* a sign-in that needs it pay for reading the mail server's configuration.
 */
 function two_factor(): TwoFactor {
     static $service = null; global $config;
     return $service ??= new TwoFactor(db(), new TwoFactorRepository(db()), new LoginRateLimiter(db(), $config),
-        Sms::fromConfig($config, dirname(__DIR__)), $config);
+        Mail::fromConfig($config), $config);
 }
 /**
 * api_try() for the two-step routes. Their refusals carry a stable code of
@@ -838,11 +838,11 @@ if ($path === '/api/auth/login' && $method === 'POST') api_try(function()use($co
     $limiter = new LoginRateLimiter(db(), $config); $limiter->assertAllowed($u);
     if (!Auth::login(db(), $u, $p)) {
         /*
-         * The password was right, but the account wants its SMS code too: the
-         * session is waiting for it and is not signed in. 401, because it is
-         * not -- a client that knows nothing of two-step verification shows
+         * The password was right, but the account wants its emailed code too:
+         * the session is waiting for it and is not signed in. 401, because it
+         * is not -- a client that knows nothing of two-step verification shows
          * the message rather than mistaking this for a success or for a wrong
-         * password. No text is sent until the client asks for one
+         * password. No email is sent until the client asks for one
          * (/api/auth/two-factor/send), so such a client never costs a message.
          */
         if (($pending = Auth::pendingSecondFactor()) !== null) {
@@ -851,7 +851,7 @@ if ($path === '/api/auth/login' && $method === 'POST') api_try(function()use($co
             AuditLog::write(db(), 'auth.login', 'second_factor', [], ['id' => (int)$pending['user'], 'username' => (string)$pending['username']]);
             Http::json(['success' => false,
                 'error' => ['code' => 'TWO_FACTOR_REQUIRED',
-                    'message' => 'This account uses two-step verification. Enter the code sent to your phone; if this app cannot ask for it, sign in from the web app.'],
+                    'message' => 'This account uses two-step verification. Enter the code sent to your email; if this app cannot ask for it, sign in from the web app.'],
                 'requestId' => Http::requestId(),
                 'twoFactor' => $twoFactor,
                 'csrfToken' => $_SESSION['csrf']], 401);
@@ -920,10 +920,10 @@ if ($isProtectedApi && $method !== 'OPTIONS') {
      *                    rotate their own credentials
      *   favorites        stars and unstars a file for the caller alone (POST
      *                    and DELETE); a preference, never a change to a file
-     *   users/me/two-factor/*  the caller's own SMS two-step verification;
+     *   users/me/two-factor/*  the caller's own two-step verification;
      *                    like the password, a viewer must be able to secure
      *                    their own account, and each change asks for the
-     *                    password again and a texted code
+     *                    password again and an emailed code
      *
      * POST /api/duplicates/scan is deliberately NOT on this list, though it
      * writes nothing to the file store either. Starting a scan walks the whole
@@ -2224,9 +2224,9 @@ if ($path === '/api/files/upload' && $method === 'POST') api_try(function()use($
     });
 
     /*
-     * The caller's own SMS two-step verification: what it is set to, and
-     * changes to it. Each change is start (current password, and for 'phone'
-     * the new number) -> confirm (the texted code, or for the current phone a
+     * The caller's own two-step verification: what it is set to, and changes
+     * to it. Each change is start (current password, and for 'email' the new
+     * address) -> confirm (the emailed code, or for the current address a
      * recovery code), with resend and cancel in between. The guard above has
      * verified CSRF for the POSTs; see TwoFactor for what each change asks.
      */
@@ -2242,9 +2242,9 @@ if ($path === '/api/files/upload' && $method === 'POST') api_try(function()use($
             $b = Http::body(16384);
             $action = Http::string($b, 'action', 1, 20);
             $password = Http::string($b, 'currentPassword', 1, 4096);
-            $phone = array_key_exists('phone', $b) ? Http::string($b, 'phone', 1, 40) : null;
-            $how = array_key_exists('method', $b) ? Http::string($b, 'method', 1, 20) : 'sms';
-            return two_factor()->startAction($id, (string)$user['username'], $action, $password, $phone, $how);
+            $email = array_key_exists('email', $b) ? Http::string($b, 'email', 1, 254) : null;
+            $how = array_key_exists('method', $b) ? Http::string($b, 'method', 1, 20) : 'email';
+            return two_factor()->startAction($id, (string)$user['username'], $action, $password, $email, $how);
         }
         if ($path === '/api/users/me/two-factor/resend') return two_factor()->resendAction($id);
         if ($path === '/api/users/me/two-factor/cancel') { two_factor()->cancelAction($id); return ['success' => true]; }
@@ -2260,7 +2260,7 @@ if ($path === '/api/files/upload' && $method === 'POST') api_try(function()use($
         Authorization::requireAdmin();
         release_session_lock();
         // Whether each account has two-step verification on, so an
-        // administrator can tell who a reset would apply to. Never the number.
+        // administrator can tell who a reset would apply to. Never the address.
         $twoFactor = (new TwoFactorRepository(db()))->enabledUserIds();
         return array_map(static fn(array $u): array => $u + ['twoFactorEnabled' => isset($twoFactor[$u['id']])],
             (new UserRepository(db()))->all());
@@ -2268,21 +2268,21 @@ if ($path === '/api/files/upload' && $method === 'POST') api_try(function()use($
 
     /*
      * An administrator turns two-step verification off for someone who has
-     * lost both their phone and their recovery codes. It asks for the
-     * administrator's own password, is audited, and texts the owner's phone.
-     * Not for one's own account: that goes through Security, which asks for
-     * the phone -- otherwise this would be a way round it.
+     * lost access to both their mailbox and their recovery codes. It asks for
+     * the administrator's own password, is audited, and emails the owner's
+     * address. Not for one's own account: that goes through Security, which
+     * asks for the emailed code -- otherwise this would be a way round it.
      */
     if (preg_match('#^/api/users/(\d+)/two-factor$#', $path, $m) && $method === 'DELETE') two_factor_try(function() use ($m) {
         Authorization::requireAdmin();
         $id = (int)$m[1];
         $self = Auth::user();
-        if ($id === (int)$self['id']) throw new RuntimeException('Turn off your own two-step verification from Security, which asks for your phone', 409);
+        if ($id === (int)$self['id']) throw new RuntimeException('Turn off your own two-step verification from Security, which asks for the code from your email', 409);
         $target = (new UserRepository(db()))->get($id) ?? throw new RuntimeException('Account not found', 404);
         $b = Http::body(16384);
         $password = Http::string($b, 'currentPassword', 1, 4096);
         $reset = two_factor()->adminReset((int)$self['id'], (string)$self['username'], $password, $id);
-        AuditLog::write(db(), 'two_factor.admin_reset', 'success', ['target' => $target['username'], 'phoneEnding' => $reset['phoneEnding']]);
+        AuditLog::write(db(), 'two_factor.admin_reset', 'success', ['target' => $target['username'], 'emailHint' => $reset['emailHint']]);
         return ['success' => true, 'message' => 'Two-step verification is off for '.$target['username']];
     });
 

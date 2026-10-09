@@ -161,7 +161,7 @@ final class Auth {
          * enough for this account, so it is no longer enough to stay signed in
          * either: the session ends as a disabled account's does, and signing in
          * again asks for the code. The session that turned it on proved the
-         * phone while doing so and is marked as verified.
+         * address while doing so and is marked as verified.
          */
         if(!empty($status['twoFactor'])&&empty($_SESSION['two_factor_verified_at'])){
             self::destroySession();
@@ -195,7 +195,7 @@ final class Auth {
     public static function verifyCsrf(): void {Security::verifyCsrfRequest();}
 
     /**
-     * How long a sign-in whose password was right waits for its SMS code
+     * How long a sign-in whose password was right waits for its emailed code
      * before the password has to be entered again.
      */
     public const SECOND_FACTOR_WINDOW = 900;
@@ -205,7 +205,7 @@ final class Auth {
      * all it takes.
      *
      * True means the session is now signed in. False means it is not -- which
-     * is also the answer for an account with SMS two-step verification whose
+     * is also the answer for an account with two-step verification whose
      * password was right: the session then gets a fresh ID and CSRF token and
      * remembers which account is waiting for its code (pendingSecondFactor()),
      * but holds no user_id, so every route, WebDAV included, still treats it
@@ -259,7 +259,7 @@ final class Auth {
 
     /**
      * The sign-in in this session that has proven its password and is waiting
-     * for its SMS code, or null. Lapses after SECOND_FACTOR_WINDOW.
+     * for its emailed code, or null. Lapses after SECOND_FACTOR_WINDOW.
      *
      * @return array{user:int,username:string,at:int,challenge?:string}|null
      */
