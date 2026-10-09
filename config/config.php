@@ -72,6 +72,7 @@ return [
  'twilio_messaging_service_sid'=>trim((string)env('TWILIO_MESSAGING_SERVICE_SID','')),
  'sms_webhook_url'=>trim((string)env('SMS_WEBHOOK_URL','')),
  'sms_webhook_token'=>trim((string)env('SMS_WEBHOOK_TOKEN','')),
+ 'sms_webhook_format'=>strtolower(trim((string)env('SMS_WEBHOOK_FORMAT','cloudhub'))),
  'two_factor_secret'=>(string)env('TWO_FACTOR_SECRET',''),
  'two_factor_code_ttl_seconds'=>(int)env('TWO_FACTOR_CODE_TTL_SECONDS',300),
  'two_factor_max_attempts'=>(int)env('TWO_FACTOR_MAX_ATTEMPTS',5),

@@ -7,8 +7,9 @@ namespace CloudHub\Services\Sms;
  * The gateway .env asks for, built once per request.
  *
  * A driver that is named but cannot work -- missing credentials, the
- * development outbox in production, a webhook over plain HTTP to the internet
- * -- is logged once and treated as no gateway at all. Two-step verification
+ * development outbox in production, a webhook over plain HTTP to the internet,
+ * a gateway app's format without its key -- is logged once and treated as no
+ * gateway at all. Two-step verification
  * then cannot be turned on, and accounts that already have it can only finish
  * signing in with a recovery code. Sign-in never falls back to the password
  * alone.
@@ -35,7 +36,7 @@ final class Sms
             'twilio' => new TwilioSms((string)$config['twilio_account_sid'], (string)$config['twilio_auth_token'],
                 (string)($config['sms_from'] ?? ''), (string)($config['twilio_messaging_service_sid'] ?? ''), $http, $timeout),
             'webhook' => new WebhookSms((string)$config['sms_webhook_url'], (string)($config['sms_webhook_token'] ?? ''),
-                (string)($config['sms_from'] ?? ''), $http, $timeout),
+                (string)($config['sms_from'] ?? ''), $http, $timeout, self::webhookFormat($config)),
             'log' => new LogSms(rtrim($projectRoot, '/').'/logs/sms-outbox.log'),
         };
     }
@@ -73,8 +74,26 @@ final class Sms
             if ($scheme === 'http' && !self::isLocalHost((string)$parts['host'])) {
                 return 'SMS_WEBHOOK_URL may use plain http:// only for a gateway on this machine or the local network; text messages are off';
             }
+            $format = self::webhookFormat($config);
+            $token = (string)($config['sms_webhook_token'] ?? '');
+            if (!in_array($format, WebhookSms::FORMATS, true)) {
+                return 'SMS_WEBHOOK_FORMAT must be one of '.implode(', ', WebhookSms::FORMATS).'; text messages are off';
+            }
+            if ($format === 'traccar' && $token === '') {
+                return 'SMS_WEBHOOK_FORMAT=traccar needs the API key the app shows, in SMS_WEBHOOK_TOKEN; text messages are off';
+            }
+            if ($format === 'smsgate' && !preg_match('/^[^:]+:.+$/', $token)) {
+                return 'SMS_WEBHOOK_FORMAT=smsgate needs the username:password the app shows, in SMS_WEBHOOK_TOKEN; text messages are off';
+            }
         }
         return null;
+    }
+
+    /** The webhook's request format; unset means CloudHub's own. */
+    private static function webhookFormat(array $config): string
+    {
+        $format = strtolower(trim((string)($config['sms_webhook_format'] ?? '')));
+        return $format === '' ? 'cloudhub' : $format;
     }
 
     /**

@@ -51,6 +51,8 @@ $accounts = [
     'viewer' => [$tag.'_vi', 'viewer-pass-12345', 'viewer'],
     'admin' => [$tag.'_ad', 'admin-pass-123456', 'admin'],
     'second' => [$tag.'_se', 'second-pass-12345', 'editor'],
+    'traccar' => [$tag.'_tr', 'traccar-pass-1234', 'viewer'],
+    'smsgate' => [$tag.'_sg', 'smsgate-pass-1234', 'viewer'],
 ];
 $ids = [];
 foreach ($accounts as $key => [$name, $password, $role]) $ids[$key] = $repo->create($name, $password, $role)['id'];
@@ -100,6 +102,17 @@ $quietPort = $freePort();
 $serve([PHP_BINARY, '-S', '127.0.0.1:'.$quietPort, 'router.php'], $common + ['SMS_DRIVER' => ''], $work.'/quiet.log');
 $outboxPort = $freePort();
 $serve([PHP_BINARY, '-S', '127.0.0.1:'.$outboxPort, 'router.php'], $common + ['SMS_DRIVER' => 'log'], $work.'/outbox.log');
+// The same stand-in, spoken to as the two SMS gateway apps are.
+$traccarPort = $freePort();
+$serve([PHP_BINARY, '-S', '127.0.0.1:'.$traccarPort, 'router.php'], $common + [
+    'SMS_DRIVER' => 'webhook', 'SMS_WEBHOOK_FORMAT' => 'traccar',
+    'SMS_WEBHOOK_URL' => 'http://127.0.0.1:'.$gatewayPort.'/', 'SMS_WEBHOOK_TOKEN' => 'traccar-test-key',
+], $work.'/traccar.log');
+$smsgatePort = $freePort();
+$serve([PHP_BINARY, '-S', '127.0.0.1:'.$smsgatePort, 'router.php'], $common + [
+    'SMS_DRIVER' => 'webhook', 'SMS_WEBHOOK_FORMAT' => 'smsgate',
+    'SMS_WEBHOOK_URL' => 'http://127.0.0.1:'.$gatewayPort.'/message', 'SMS_WEBHOOK_TOKEN' => 'gw-user:gw-pass',
+], $work.'/smsgate.log');
 
 register_shutdown_function(static function () use (&$processes, $db, $ids, $work): void {
     foreach ($processes as $process) { if (is_resource($process)) { proc_terminate($process); proc_close($process); } }
@@ -115,7 +128,8 @@ register_shutdown_function(static function () use (&$processes, $db, $ids, $work
 $base = 'http://127.0.0.1:'.$appPort;
 $quiet = 'http://127.0.0.1:'.$quietPort;
 $outbox = 'http://127.0.0.1:'.$outboxPort;
-foreach ([$base, $quiet, $outbox, 'http://127.0.0.1:'.$gatewayPort] as $server) {
+$gatewayApps = ['traccar' => 'http://127.0.0.1:'.$traccarPort, 'smsgate' => 'http://127.0.0.1:'.$smsgatePort];
+foreach ([$base, $quiet, $outbox, ...array_values($gatewayApps), 'http://127.0.0.1:'.$gatewayPort] as $server) {
     $probe = str_ends_with($server, (string)$gatewayPort) ? $server.'/' : $server.'/?route='.rawurlencode('/api/auth/status');
     if (!$up($probe)) { fwrite(STDERR, "$server never answered.\n"); exit(1); }
 }
@@ -165,7 +179,10 @@ function last_text(): array
 
 function code_of(array $text): string
 {
-    return preg_match('/^(\d{6}) /', (string)($text['body']['message'] ?? ''), $m) ? $m[1] : '';
+    // CloudHub's own format and Traccar's carry "message"; sms-gate.app's
+    // carries textMessage.text.
+    $message = $text['body']['message'] ?? $text['body']['textMessage']['text'] ?? '';
+    return preg_match('/^(\d{6}) /', (string)$message, $m) ? $m[1] : '';
 }
 
 /**
@@ -626,6 +643,52 @@ foreach (array_merge(texts(), [['body' => ['message' => 'end']]]) as $text) {
     // Every code the gateway saw, to look for in places codes must never be.
     $GLOBALS['allCodes'][] = code_of($text);
 }
+scenario('a phone running an SMS gateway app is spoken to in its own format', function () use ($base, $gatewayApps, $accounts, $phone) {
+    // First, that the stand-in is as strict as the apps: CloudHub's own format
+    // -- a Bearer token, a "from" field -- is refused by the Traccar app.
+    gateway('traccar');
+    [$name, $password] = $accounts['traccar'];
+    $c = new Client($base);
+    $c->signIn($name, $password);
+    $wrong = $c->post('/api/users/me/two-factor/start', ['action' => 'phone', 'currentPassword' => $password, 'phone' => $phone()]);
+    check('the wrong format does not get a text through', ($wrong->json['sent'] ?? null) === false
+        && ($wrong->json['error']['code'] ?? '') === 'SMS_UNAVAILABLE', $wrong->describe());
+    $c->post('/api/users/me/two-factor/cancel');
+
+    foreach ($gatewayApps as $app => $server) {
+        gateway($app);
+        [$name, $password] = $accounts[$app];
+        $number = $phone();
+        $c = new Client($server);
+        $c->signIn($name, $password);
+        $before = count(texts());
+        $start = $c->post('/api/users/me/two-factor/start', ['action' => 'phone', 'currentPassword' => $password, 'phone' => $number]);
+        check("$app: the code to confirm the number is sent", ($start->json['sent'] ?? false) === true, $start->describe());
+        $sent = texts()[$before] ?? [];
+        if ($app === 'traccar') {
+            check('traccar: to and message, and nothing else', array_keys($sent['body'] ?? []) === ['to', 'message']
+                && ($sent['body']['to'] ?? '') === $number);
+            check('traccar: the key as Authorization, with no Bearer', ($sent['authorization'] ?? '') === 'traccar-test-key');
+        } else {
+            check('smsgate: textMessage and phoneNumbers', ($sent['body']['phoneNumbers'] ?? null) === [$number]
+                && is_string($sent['body']['textMessage']['text'] ?? null));
+            check('smsgate: basic authentication', ($sent['authorization'] ?? '') === 'Basic '.base64_encode('gw-user:gw-pass'));
+        }
+        $done = $c->post('/api/users/me/two-factor/confirm', ['code' => code_of($sent)]);
+        check("$app: its code turns two-step verification on", $done->ok() && ($done->json['enabled'] ?? false) === true, $done->describe());
+
+        $d = new Client($server);
+        $login = $d->signIn($name, $password);
+        check("$app: signing in then asks for a code", $login->errorCode() === 'TWO_FACTOR_REQUIRED', $login->describe());
+        $before = count(texts());
+        $send = $d->post('/api/auth/two-factor/send');
+        check("$app: which the app is asked to send", $send->ok(), $send->describe());
+        $verify = $d->post('/api/auth/two-factor/verify', ['code' => code_of(texts()[$before] ?? [])]);
+        check("$app: and which signs in", $verify->ok() && ($verify->json['user']['username'] ?? '') === $name, $verify->describe());
+    }
+    gateway('ok');
+});
+
 scenario('codes and numbers stay out of the logs and the trail', function () use ($root, $db, $editorPhone) {
     $codes = array_values(array_filter($GLOBALS['allCodes'] ?? []));
     $logs = (string)@file_get_contents($root.'/logs/php-error.log');

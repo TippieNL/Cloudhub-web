@@ -470,17 +470,36 @@ app — are signed out within a minute; the session that turned it on carries on
    **Webhook**: anything that takes `POST {"to", "from", "message"}` as JSON
    with an optional `Authorization: Bearer <SMS_WEBHOOK_TOKEN>`, and answers
    2xx when it accepted the message (400/422: the number was refused; anything
-   else: unavailable). That fronts a provider there is no driver for, or an SMS
-   gateway app on the phone CloudHub runs on. Plain `http://` is accepted only
-   for this machine or a private network address.
+   else: unavailable). That fronts a provider there is no driver for. Plain
+   `http://` is accepted only for this machine or a private network address.
+
+   **An Android phone with a SIM** sends the texts for free with an SMS
+   gateway app — on the phone CloudHub runs on, if it has a SIM, or any phone
+   on the same network. `SMS_WEBHOOK_FORMAT` speaks the two common apps'
+   own APIs:
+
+   | App | In the app | `.env` |
+   |---|---|---|
+   | Traccar SMS Gateway | enable the HTTP API; note the address (port 8082) and the API key | `SMS_DRIVER=webhook`<br>`SMS_WEBHOOK_FORMAT=traccar`<br>`SMS_WEBHOOK_URL=http://<phone-ip>:8082/`<br>`SMS_WEBHOOK_TOKEN=<API key>` |
+   | SMS Gateway for Android ([sms-gate.app](https://sms-gate.app)) | start the Local Server; note the address (port 8080) and the username and password | `SMS_DRIVER=webhook`<br>`SMS_WEBHOOK_FORMAT=smsgate`<br>`SMS_WEBHOOK_URL=http://<phone-ip>:8080/message`<br>`SMS_WEBHOOK_TOKEN=<username>:<password>` |
+
+   Use `127.0.0.1` as `<phone-ip>` when the app runs on the same phone as
+   CloudHub; otherwise give that phone a fixed address on the network. Let the
+   app run in the background (exempt it from battery optimisation), and mind
+   that the texts are paid for by that SIM's plan. Both formats are built to
+   the apps' published APIs and tested against stand-ins as strict as the
+   apps (Traccar's refuses a `Bearer` prefix and any extra field).
 
    **Development**: `SMS_DRIVER=log` with `APP_ENV=development` writes each
    message, code included, to `logs/sms-outbox.log` instead of sending it. With
    any other `APP_ENV` it is refused and texts are off.
 
    A driver that is named but cannot work — missing credentials, the outbox in
-   production, a plain-HTTP webhook to the internet — is logged once to
-   `logs/php-error.log` and treated as no gateway. That never opens a way round
+   production, a plain-HTTP webhook to the internet, a gateway app's format
+   without its key — is logged once to `logs/php-error.log`, as `[sms] …`
+   naming the setting at fault, and treated as no gateway: the web page and
+   the Android app then say *"no text-message service is set up on this
+   server"*. That never opens a way round
    the code: accounts that have it on can then only finish signing in with a
    recovery code. The same holds when the gateway is down or slow; the person
    is told the text could not be sent and can try again or use a recovery code.

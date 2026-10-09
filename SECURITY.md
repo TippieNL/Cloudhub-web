@@ -278,7 +278,11 @@ method), `auth.two_factor` failures, `two_factor.sms`, `two_factor.enable`,
 Credentials live in `.env` only and never reach a browser. Requests verify TLS,
 never follow redirects (which would carry the credentials and the code
 elsewhere) and give up after `SMS_TIMEOUT_SECONDS`. A webhook over plain HTTP
-is refused unless it is on this machine or a private network. The development
+is refused unless it is on this machine or a private network — which is where
+an SMS gateway app on an Android phone sits (`SMS_WEBHOOK_FORMAT=traccar` or
+`smsgate`). Such a phone sees every code it sends, as any SMS provider does;
+keep it on a network you control, and its API key or password in `.env`
+only. The development
 outbox (`SMS_DRIVER=log`) writes working codes to `logs/sms-outbox.log` and is
 refused unless `APP_ENV=development`.
 

@@ -225,6 +225,38 @@ $checks['webhook: 400 and 422 refuse the number'] = $hookKind([400, '']) === Sms
 $checks['webhook: anything else is an outage'] = $hookKind([401, '']) === SmsException::UNAVAILABLE && $hookKind([500, '']) === SmsException::UNAVAILABLE
     && $hookKind([302, '']) === SmsException::UNAVAILABLE && $hookKind(new RuntimeException('refused')) === SmsException::UNAVAILABLE;
 
+// The two SMS gateway apps, spoken to as their own servers expect. Traccar's
+// compares the Authorization header with its key as it stands and fails on a
+// field it does not know; sms-gate.app's local server takes basic auth.
+$t = new FakeTransport([200, '']);
+(new WebhookSms('http://192.168.1.20:8082/', 'traccar-key', 'CloudHub', $t, 5, 'traccar'))->send('+31612345678', 'hi');
+$checks['webhook, traccar: to and message, and nothing else'] = $t->requests[0]['body'] === '{"to":"+31612345678","message":"hi"}';
+$checks['webhook, traccar: the key as the Authorization header, with no Bearer'] = in_array('Authorization: traccar-key', $t->requests[0]['headers'], true)
+    && !preg_grep('/Bearer/', $t->requests[0]['headers']);
+$t = new FakeTransport([202, '{"id":"Pq8x-1","state":"Pending"}']);
+$smsgateId = (new WebhookSms('http://127.0.0.1:8080/message', 'gw-user:gw pass', 'CloudHub', $t, 5, 'smsgate'))->send('+31612345678', 'hi');
+$checks['webhook, smsgate: textMessage and phoneNumbers'] = json_decode($t->requests[0]['body'], true) === ['textMessage' => ['text' => 'hi'], 'phoneNumbers' => ['+31612345678']];
+$checks['webhook, smsgate: basic authentication with the app\'s username and password'] =
+    in_array('Authorization: Basic '.base64_encode('gw-user:gw pass'), $t->requests[0]['headers'], true);
+$checks['webhook, smsgate: the id it answers with is kept'] = $smsgateId === 'Pq8x-1';
+$checks['webhook, smsgate: a refused number is a refusal'] =
+    (static function (): ?string {
+        try { (new WebhookSms('http://127.0.0.1:8080/message', 'u:p', '', new FakeTransport([400, '{"message":"invalid phone"}']), 5, 'smsgate'))->send('+31612345678', 'x'); return null; }
+        catch (SmsException $e) { return $e->kind; }
+    })() === SmsException::REJECTED;
+$hookConfig = static fn(string $url, string $format, string $token): array =>
+    ['sms_driver' => 'webhook', 'sms_webhook_url' => $url, 'sms_webhook_format' => $format, 'sms_webhook_token' => $token];
+$checks['a gateway app\'s format is refused without the credentials the app shows'] =
+    Sms::fromConfig($hookConfig('http://127.0.0.1:8082/', 'traccar', ''), $scratch) === null
+    && Sms::fromConfig($hookConfig('http://127.0.0.1:8080/message', 'smsgate', 'no-colon'), $scratch) === null
+    && Sms::fromConfig($hookConfig('http://127.0.0.1:8080/message', 'smsgate', ':password-only'), $scratch) === null
+    && Sms::fromConfig($hookConfig('http://127.0.0.1:8080/message', 'pigeon', 'x'), $scratch) === null
+    && str_contains((string)Sms::problem($hookConfig('http://127.0.0.1:8082/', 'traccar', '')), 'SMS_WEBHOOK_TOKEN');
+$checks['and works with them, as does a format left unset'] =
+    Sms::fromConfig($hookConfig('http://127.0.0.1:8082/', 'traccar', 'key'), $scratch) instanceof WebhookSms
+    && Sms::fromConfig($hookConfig('http://192.168.1.20:8080/message', 'SMSGate', 'u:p'), $scratch) instanceof WebhookSms
+    && Sms::fromConfig($hookConfig('https://sms.example.com/x', '', ''), $scratch) instanceof WebhookSms;
+
 $outbox = $scratch.'/logs/sms-outbox.log';
 (new LogSms($outbox))->send('+31612345678', '123456 is your code');
 $checks['the development outbox gets the message, with the number masked'] = str_contains((string)@file_get_contents($outbox), 'to ••78: 123456 is your code')
