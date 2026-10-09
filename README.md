@@ -446,7 +446,10 @@ app — are signed out within a minute; the session that turned it on carries on
    tables `two_factor_challenges` and `two_factor_recovery_codes`, and new
    values to `login_attempts.scope`. Nothing is dropped or rewritten, and every
    account starts with it off. Until it has run, sign-in works exactly as
-   before and the settings panel says the database needs updating.
+   before and the settings panel says the database needs updating. Without a
+   PHP command line (phpMyAdmin or Adminer only), run
+   `database/migrations/20261009_two_factor.sql` against the CloudHub database
+   instead: the same changes as plain SQL, and safe to run again.
 2. An SMS gateway in `.env` (examples in `.env.example`):
 
    | Setting | |
