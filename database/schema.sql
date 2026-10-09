@@ -10,19 +10,20 @@ CREATE TABLE IF NOT EXISTS users (
  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
  last_login_at TIMESTAMP NULL DEFAULT NULL,
- -- SMS two-step verification. NULL two_factor_enabled_at means off, which
- -- every account is until its owner turns it on. The number is E.164.
- two_factor_phone VARCHAR(20) NULL,
+ -- Two-step verification by email. NULL two_factor_enabled_at means off,
+ -- which every account is until its owner turns it on; two_factor_email is
+ -- the address its codes go to.
+ two_factor_email VARCHAR(254) NULL,
  two_factor_enabled_at DATETIME NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 
 -- Throttle events: password failures ('user', 'ip'), and for two-step
--- verification the codes checked ('verify_*') and text messages sent ('sms_*').
--- attempt_key is an HMAC, never a raw username, address or phone number.
+-- verification the codes checked ('verify_*') and code emails sent ('email_*').
+-- attempt_key is an HMAC, never a raw username, IP address or email address.
 CREATE TABLE IF NOT EXISTS login_attempts (
  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
- scope ENUM('user','ip','verify_user','verify_ip','sms_user','sms_ip','sms_phone') NOT NULL,
+ scope ENUM('user','ip','verify_user','verify_ip','email_user','email_ip','email_address') NOT NULL,
  attempt_key CHAR(64) NOT NULL,
  attempted_at DATETIME NOT NULL,
  INDEX idx_login_attempt_lookup(scope, attempt_key, attempted_at),
@@ -46,9 +47,9 @@ CREATE TABLE IF NOT EXISTS security_events (
  INDEX idx_security_events_type(event_type,created_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
--- An SMS code waiting to be entered. One row per account and purpose
--- ('login', 'confirm' for proving the current phone before a change, 'phone'
--- for proving a new number): asking again replaces it, which is what makes an
+-- An emailed code waiting to be entered. One row per account and purpose
+-- ('login', 'confirm' for proving the current address before a change, 'email'
+-- for proving a new address): asking again replaces it, which is what makes an
 -- older code stop working, and using it deletes it. code_hash is an HMAC of the
 -- code under a server secret, never the code itself. id is random and is what
 -- the session holds. Times are UTC, written by PHP.
@@ -65,8 +66,8 @@ CREATE TABLE IF NOT EXISTS two_factor_challenges (
  INDEX idx_two_factor_challenge_created(created_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
--- One-time recovery codes for an account whose phone is lost. Only a SHA-256
--- of each is kept; used_at marks the one that has been spent.
+-- One-time recovery codes for an account whose mailbox is out of reach. Only
+-- a SHA-256 of each is kept; used_at marks the one that has been spent.
 CREATE TABLE IF NOT EXISTS two_factor_recovery_codes (
  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
  user_id INT UNSIGNED NOT NULL,

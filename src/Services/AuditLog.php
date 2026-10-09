@@ -53,9 +53,9 @@ final class AuditLog {
   }
  }
  private static function sanitize(array $context): array {
-  // Verification codes, recovery codes and phone numbers never reach the trail
-  // either; two-step events record at most a number's last two digits.
-  $blocked=['password','password_hash','csrf','token','apiKey','privateKey','secret','authorization','code','recoveryCode','recoveryCodes','phone'];
+  // Verification codes, recovery codes and email addresses never reach the
+  // trail either; two-step events record at most a masked one, k•••@example.com.
+  $blocked=['password','password_hash','csrf','token','apiKey','privateKey','secret','authorization','code','recoveryCode','recoveryCodes','email'];
   $out=[];
   foreach($context as $k=>$v){
    if(in_array((string)$k,$blocked,true))continue;

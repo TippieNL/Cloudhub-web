@@ -2,17 +2,18 @@
 declare(strict_types=1);
 
 /**
- * Turn SMS two-step verification off for an account, from the server.
+ * Turn two-step verification off for an account, from the server.
  *
  *   php tools/reset-two-factor.php <username>
  *
- * For when nobody can do it from the web: the owner has lost both their phone
- * and their recovery codes and no other administrator can reset it from the
- * Users screen -- typically because it is the only administrator's own
- * account. Whoever can run this already holds the server, so it asks for
- * nothing more. The number, the recovery codes and any code in flight are
- * removed, the account signs in with its password alone until its owner turns
- * two-step verification on again, and the reset goes in the audit trail.
+ * For when nobody can do it from the web: the owner has lost access to both
+ * their mailbox and their recovery codes and no other administrator can reset
+ * it from the Users screen -- typically because it is the only
+ * administrator's own account. Whoever can run this already holds the
+ * server, so it asks for nothing more. The address, the recovery codes and
+ * any code in flight are removed, the account signs in with its password
+ * alone until its owner turns two-step verification on again, and the reset
+ * goes in the audit trail.
  */
 if (PHP_SAPI !== 'cli') { http_response_code(404); exit; }
 
@@ -37,7 +38,7 @@ if ($account === null) {
 }
 $twoFactor = new TwoFactorRepository($db);
 if (!$twoFactor->schemaReady()) {
-    fwrite(STDERR, "This database has no two-step verification yet: run php database/migrate.php.\n");
+    fwrite(STDERR, "This database needs the two-step verification update first: run php database/migrate.php.\n");
     exit(1);
 }
 if (!$twoFactor->requiredFor($account['id'])) {

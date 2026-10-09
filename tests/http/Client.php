@@ -41,6 +41,11 @@ final class Client
         return $this->send('DELETE', $route, [], $body);
     }
 
+    public function patch(string $route, array $body = []): Response
+    {
+        return $this->send('PATCH', $route, [], $body);
+    }
+
     /** One chunk of a resumable upload; the offset travels in X-Upload-Offset. */
     public function putChunk(string $id, int $offset, string $bytes): Response
     {

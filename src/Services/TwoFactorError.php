@@ -3,7 +3,7 @@ declare(strict_types=1);
 
 namespace CloudHub\Services;
 
-use CloudHub\Services\Sms\SmsException;
+use CloudHub\Services\Mail\MailException;
 
 /**
  * Why a two-step verification request was refused, in terms a client acts on.
@@ -11,10 +11,10 @@ use CloudHub\Services\Sms\SmsException;
  * The HTTP status is the exception code, so anything that only knows
  * RuntimeException still answers sensibly; two_factor_try() in the front
  * controller additionally sends the stable error code, the details (attempts
- * left, which number a code went to) and a Retry-After when there is a wait.
+ * left, how long to wait) and a Retry-After when there is a wait.
  *
  * Every message here is written for the person at the keyboard, and none of
- * them says whether an account or a phone number exists: they are only ever
+ * them says whether an account or an email address exists: they are only ever
  * reached by a session that has already proven the account's password.
  */
 final class TwoFactorError extends \RuntimeException
@@ -71,7 +71,7 @@ final class TwoFactorError extends \RuntimeException
 
     public static function malformedCode(int $length): self
     {
-        return new self('VALIDATION_FAILED', 'Enter the '.$length.'-digit code from the text message.', 422);
+        return new self('VALIDATION_FAILED', 'Enter the '.$length.'-digit code from the email.', 422);
     }
 
     public static function recoveryWrong(): self
@@ -81,7 +81,7 @@ final class TwoFactorError extends \RuntimeException
 
     public static function recoveryNotAllowed(): self
     {
-        return new self('TWO_FACTOR_RECOVERY_NOT_ALLOWED', 'A new number can only be confirmed with the code sent to it.', 422);
+        return new self('TWO_FACTOR_RECOVERY_NOT_ALLOWED', 'A new email address can only be confirmed with the code sent to it.', 422);
     }
 
     public static function locked(int $retryAfter): self
@@ -96,23 +96,31 @@ final class TwoFactorError extends \RuntimeException
             ['retryAfter' => $retryAfter], $retryAfter);
     }
 
-    public static function smsLimit(int $retryAfter): self
+    public static function emailLimit(int $retryAfter): self
     {
-        return new self('TWO_FACTOR_SMS_LIMIT', 'Too many text messages were sent. Try again in '.self::wait($retryAfter).', or use a recovery code.', 429,
+        return new self('TWO_FACTOR_EMAIL_LIMIT', 'Too many codes were emailed. Try again in '.self::wait($retryAfter).', or use a recovery code.', 429,
             ['retryAfter' => $retryAfter], $retryAfter);
     }
 
-    public static function smsNotConfigured(): self
+    public static function emailNotConfigured(): self
     {
-        return new self('SMS_NOT_CONFIGURED', 'This server cannot send text messages, so no code can be sent. Use a recovery code, or ask your administrator.', 503);
+        return new self('EMAIL_NOT_CONFIGURED', 'This server cannot send email, so no code can be sent. Use a recovery code, or ask your administrator.', 503);
     }
 
-    public static function fromSms(SmsException $e, int $retryAfter): self
+    /**
+     * Two-step verification is on for this account but there is no address
+     * to send its code to: it was turned on when codes went by text message.
+     */
+    public static function noEmailAddress(): self
+    {
+        return new self('TWO_FACTOR_NO_EMAIL', 'Sign-in codes now go by email, and this account has no address for them yet. Use a recovery code, or ask your administrator.', 409);
+    }
+
+    public static function fromMail(MailException $e, int $retryAfter): self
     {
         return match ($e->kind) {
-            SmsException::REJECTED => new self('SMS_REJECTED', 'That number cannot receive text messages from this server. Check the number and try again.', 422),
-            SmsException::NOT_CONFIGURED => self::smsNotConfigured(),
-            default => new self('SMS_UNAVAILABLE', 'The text message could not be sent just now. If a code arrives anyway it will work; otherwise try again in '
+            MailException::REJECTED => new self('EMAIL_REJECTED', 'The mail server refused that address. Check it and try again.', 422),
+            default => new self('EMAIL_UNAVAILABLE', 'The email could not be sent just now. If a code arrives anyway it will work; otherwise try again in '
                 .self::wait($retryAfter).', or use a recovery code.', 503, ['retryAfter' => $retryAfter], $retryAfter),
         };
     }
@@ -122,14 +130,14 @@ final class TwoFactorError extends \RuntimeException
         return new self('FORBIDDEN', 'The current password is incorrect', 403);
     }
 
-    public static function phoneInvalid(): self
+    public static function emailInvalid(): self
     {
-        return new self('VALIDATION_FAILED', 'Enter the number in international format: + and the country code, for example +31 6 12345678.', 422);
+        return new self('VALIDATION_FAILED', 'Enter a valid email address, for example name@example.com.', 422);
     }
 
-    public static function samePhone(): self
+    public static function sameEmail(): self
     {
-        return new self('VALIDATION_FAILED', 'That is already the number codes are sent to.', 422);
+        return new self('VALIDATION_FAILED', 'That is already the address codes are sent to.', 422);
     }
 
     public static function notEnabled(): self
@@ -139,7 +147,7 @@ final class TwoFactorError extends \RuntimeException
 
     public static function unknownAction(): self
     {
-        return new self('VALIDATION_FAILED', 'action must be one of phone, disable, recovery', 422);
+        return new self('VALIDATION_FAILED', 'action must be one of email, disable, recovery', 422);
     }
 
     public static function notMigrated(): self

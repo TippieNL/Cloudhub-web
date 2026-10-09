@@ -52,9 +52,9 @@ final class UserRepository
      * Live account state, used by the throttled session revalidation.
      *
      * Returns null when the account has been deleted. twoFactor says whether
-     * SMS two-step verification is on; a database migrate.php has not yet
-     * given the column to cannot have it on, so that reads as false, while any
-     * other database error propagates as it always did.
+     * two-step verification is on; a database migrate.php has not yet given
+     * the column to cannot have it on, so that reads as false, while any other
+     * database error propagates as it always did.
      */
     public function status(int $id): ?array
     {
