@@ -154,6 +154,21 @@ final class Auth {
             $_SESSION['created_at']=$now;$_SESSION['last_seen_at']=$now;$_SESSION['csrf']=bin2hex(random_bytes(32));
             return;
         }
+        /*
+         * Two-step verification was turned on after this session signed in
+         * with a password alone -- on another device, typically, or before the
+         * owner noticed someone else had the password. A password is no longer
+         * enough for this account, so it is no longer enough to stay signed in
+         * either: the session ends as a disabled account's does, and signing in
+         * again asks for the code. The session that turned it on proved the
+         * phone while doing so and is marked as verified.
+         */
+        if(!empty($status['twoFactor'])&&empty($_SESSION['two_factor_verified_at'])){
+            self::destroySession();
+            session_start();
+            $_SESSION['created_at']=$now;$_SESSION['last_seen_at']=$now;$_SESSION['csrf']=bin2hex(random_bytes(32));
+            return;
+        }
 
         $_SESSION['role']=$status['role'];
         $_SESSION['account_checked_at']=$now;
@@ -178,7 +193,29 @@ final class Auth {
     public static function user(): ?array {return isset($_SESSION['user_id'])?['id'=>(int)$_SESSION['user_id'],'username'=>(string)($_SESSION['username']??''),'role'=>(string)($_SESSION['role']??'viewer')]:null;}
     public static function requireUser(): void {if(!self::user())Http::error(401,'UNAUTHORIZED','Authentication required');}
     public static function verifyCsrf(): void {Security::verifyCsrfRequest();}
+
+    /**
+     * How long a sign-in whose password was right waits for its SMS code
+     * before the password has to be entered again.
+     */
+    public const SECOND_FACTOR_WINDOW = 900;
+
+    /**
+     * Check a username and password, and sign the account in when that is
+     * all it takes.
+     *
+     * True means the session is now signed in. False means it is not -- which
+     * is also the answer for an account with SMS two-step verification whose
+     * password was right: the session then gets a fresh ID and CSRF token and
+     * remembers which account is waiting for its code (pendingSecondFactor()),
+     * but holds no user_id, so every route, WebDAV included, still treats it
+     * as signed out. Only finishSecondFactor(), after the code has been
+     * checked, signs it in. A caller that reads false as "refused" is
+     * therefore never wrong in the dangerous direction.
+     */
     public static function login(PDO $pdo,string $username,string $password): bool {
+        // A new attempt abandons any sign-in still waiting for its code.
+        unset($_SESSION['two_factor_login']);
         try {
             $stmt=$pdo->prepare('SELECT id, username, password_hash, is_active, role FROM users WHERE username = ? LIMIT 1');
             $stmt->execute([$username]);
@@ -195,11 +232,81 @@ final class Auth {
         // at all told a stopwatch which usernames exist.
         if(!$user){self::hashPassword($password);return false;}
         if(!(bool)$user['is_active']||!password_verify($password,(string)$user['password_hash']))return false;
-        session_regenerate_id(true);$now=time();$_SESSION['user_id']=(int)$user['id'];$_SESSION['username']=(string)$user['username'];$_SESSION['role']=(string)($user['role']??'viewer');$_SESSION['created_at']=$now;$_SESSION['last_seen_at']=$now;$_SESSION['rotated_at']=$now;$_SESSION['account_checked_at']=$now;$_SESSION['csrf']=bin2hex(random_bytes(32));
+        // The password is proven either way, so its hash can be upgraded now.
         if(password_needs_rehash((string)$user['password_hash'],self::passwordAlgorithm())){
             $hash=self::hashPassword($password);$q=$pdo->prepare('UPDATE users SET password_hash = ? WHERE id = ?');$q->execute([$hash,(int)$user['id']]);
         }
-        $pdo->prepare('UPDATE users SET last_login_at = CURRENT_TIMESTAMP WHERE id = ?')->execute([(int)$user['id']]);return true;
+        /*
+         * Half-way, for an account with two-step verification. The session is
+         * emptied and given a new ID before it remembers anything: whatever it
+         * held before -- another account's sign-in, a fixated ID -- is not
+         * carried into a session that has proven a password.
+         *
+         * A database error here propagates and the sign-in fails. Only a
+         * database without the columns at all reads as "off" (see
+         * TwoFactorRepository::state()), because nobody could have turned it
+         * on there.
+         */
+        if((new \CloudHub\Repositories\TwoFactorRepository($pdo))->requiredFor((int)$user['id'])){
+            session_regenerate_id(true);$now=time();
+            $_SESSION=['created_at'=>$now,'last_seen_at'=>$now,'rotated_at'=>$now,'csrf'=>bin2hex(random_bytes(32)),
+                'two_factor_login'=>['user'=>(int)$user['id'],'username'=>(string)$user['username'],'at'=>$now]];
+            return false;
+        }
+        self::establish($pdo,$user,false);
+        return true;
+    }
+
+    /**
+     * The sign-in in this session that has proven its password and is waiting
+     * for its SMS code, or null. Lapses after SECOND_FACTOR_WINDOW.
+     *
+     * @return array{user:int,username:string,at:int,challenge?:string}|null
+     */
+    public static function pendingSecondFactor(): ?array {
+        $pending=$_SESSION['two_factor_login']??null;
+        if(!is_array($pending)||!isset($pending['user'],$pending['at']))return null;
+        if(time()-(int)$pending['at']>self::SECOND_FACTOR_WINDOW){unset($_SESSION['two_factor_login']);return null;}
+        return $pending;
+    }
+
+    /** Forget the sign-in waiting for its code. */
+    public static function abandonSecondFactor(): void {unset($_SESSION['two_factor_login']);}
+
+    /**
+     * Sign in the account whose second factor the caller has just verified.
+     *
+     * This can only ever finish what login() started: with no pending sign-in
+     * -- no password proven in this session, or proven too long ago -- it does
+     * nothing and returns null. The account is read again, so one disabled in
+     * the meantime is not signed in, and the role is the current one.
+     */
+    public static function finishSecondFactor(PDO $pdo): ?array {
+        $pending=self::pendingSecondFactor();
+        if($pending===null)return null;
+        unset($_SESSION['two_factor_login']);
+        $stmt=$pdo->prepare('SELECT id, username, is_active, role FROM users WHERE id = ?');
+        $stmt->execute([(int)$pending['user']]);
+        $user=$stmt->fetch(PDO::FETCH_ASSOC);
+        if(!$user||!(bool)$user['is_active'])return null;
+        self::establish($pdo,$user,true);
+        return self::user();
+    }
+
+    /**
+     * Make this session the account's: a new ID, a new CSRF token, and the
+     * account's identity and role.
+     *
+     * two_factor_verified_at records that this session passed a second
+     * factor. When an account turns two-step verification on, it is what
+     * decides which of its sessions keep going (see revalidateAccount()).
+     */
+    private static function establish(PDO $pdo,array $user,bool $secondFactor): void {
+        session_regenerate_id(true);$now=time();
+        unset($_SESSION['two_factor_login'],$_SESSION['two_factor_action']);
+        $_SESSION['user_id']=(int)$user['id'];$_SESSION['username']=(string)$user['username'];$_SESSION['role']=(string)($user['role']??'viewer');$_SESSION['created_at']=$now;$_SESSION['last_seen_at']=$now;$_SESSION['rotated_at']=$now;$_SESSION['account_checked_at']=$now;$_SESSION['csrf']=bin2hex(random_bytes(32));
+        if($secondFactor)$_SESSION['two_factor_verified_at']=$now;else unset($_SESSION['two_factor_verified_at']);
+        $pdo->prepare('UPDATE users SET last_login_at = CURRENT_TIMESTAMP WHERE id = ?')->execute([(int)$user['id']]);
     }
     public static function logout(): void {self::destroySession();}
     private static function destroySession(): void {

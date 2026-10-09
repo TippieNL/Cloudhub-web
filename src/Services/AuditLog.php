@@ -12,10 +12,15 @@ use PDO;
  * storage credentials.
  */
 final class AuditLog {
- public static function write(PDO $pdo,string $event,string $outcome='success',array $context=[]): void {
+ /**
+  * @param array{id:int,username:string}|null $actor who the event is about when
+  *        the session does not say: a sign-in still waiting for its second
+  *        factor has proven a password but holds no user_id yet
+  */
+ public static function write(PDO $pdo,string $event,string $outcome='success',array $context=[],?array $actor=null): void {
   try {
-   $uid=isset($_SESSION['user_id'])?(int)$_SESSION['user_id']:null;
-   $username=isset($_SESSION['username'])?(string)$_SESSION['username']:null;
+   $uid=isset($_SESSION['user_id'])?(int)$_SESSION['user_id']:(isset($actor['id'])?(int)$actor['id']:null);
+   $username=isset($_SESSION['username'])?(string)$_SESSION['username']:(isset($actor['username'])?(string)$actor['username']:null);
    $ip=(string)($_SERVER['REMOTE_ADDR']??'');
    $ua=substr((string)($_SERVER['HTTP_USER_AGENT']??''),0,255);
    $requestId=\CloudHub\Helpers\Http::requestId();
@@ -48,7 +53,9 @@ final class AuditLog {
   }
  }
  private static function sanitize(array $context): array {
-  $blocked=['password','password_hash','csrf','token','apiKey','privateKey','secret','authorization'];
+  // Verification codes, recovery codes and phone numbers never reach the trail
+  // either; two-step events record at most a number's last two digits.
+  $blocked=['password','password_hash','csrf','token','apiKey','privateKey','secret','authorization','code','recoveryCode','recoveryCodes','phone'];
   $out=[];
   foreach($context as $k=>$v){
    if(in_array((string)$k,$blocked,true))continue;

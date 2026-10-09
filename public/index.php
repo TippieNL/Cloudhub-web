@@ -21,6 +21,10 @@ use CloudHub\Services\StorageQuota;
 use CloudHub\Services\ImageThumbnailer;
 use CloudHub\Services\MediaProbe;
 use CloudHub\Services\AuditLog;
+use CloudHub\Services\TwoFactor;
+use CloudHub\Services\TwoFactorError;
+use CloudHub\Services\Sms\Sms;
+use CloudHub\Repositories\TwoFactorRepository;
 use CloudHub\Repositories\JobRepository;
 use CloudHub\Services\Jobs\JobEnvironment;
 use CloudHub\Services\Jobs\JobType;
@@ -459,6 +463,36 @@ function db(): PDO {
     return \CloudHub\Helpers\Db::connection();
 }
 /**
+* SMS two-step verification, built on first use: only its own routes and a
+* sign-in that needs it pay for the SMS gateway's configuration.
+*/
+function two_factor(): TwoFactor {
+    static $service = null; global $config;
+    return $service ??= new TwoFactor(db(), new TwoFactorRepository(db()), new LoginRateLimiter(db(), $config),
+        Sms::fromConfig($config, dirname(__DIR__)), $config);
+}
+/**
+* api_try() for the two-step routes. Their refusals carry a stable code of
+* their own -- a client tells "wrong code" from "expired" from "wait" by it --
+* with details such as the attempts left, and a Retry-After when there is a
+* wait. A 503 raised underneath (a database migrate.php has not updated) keeps
+* its message, which says what to run.
+*/
+function two_factor_try(callable $fn): never {
+    api_try(function () use ($fn) {
+        try {
+            return $fn();
+        } catch (TwoFactorError $e) {
+            if ($e->retryAfter > 0) header('Retry-After: '.$e->retryAfter);
+            Http::error($e->getCode(), $e->errorCode, $e->getMessage(), $e->details);
+        } catch (RuntimeException $e) {
+            if ($e->getCode() !== 503 || $e instanceof PDOException) throw $e;
+            error_log('['.Http::requestId().'] '.$e->getMessage());
+            Http::error(503, 'NOT_AVAILABLE', $e->getMessage());
+        }
+    });
+}
+/**
 * The background queue and what its jobs work with, built on first use and
 * sharing the request's connection. See CloudHub\Services\Jobs.
 */
@@ -803,6 +837,25 @@ if ($path === '/api/auth/login' && $method === 'POST') api_try(function()use($co
     $b = Http::body(16384); $u = Http::string($b, 'username', 1, 100); $p = Http::string($b, 'password', 1, 4096);
     $limiter = new LoginRateLimiter(db(), $config); $limiter->assertAllowed($u);
     if (!Auth::login(db(), $u, $p)) {
+        /*
+         * The password was right, but the account wants its SMS code too: the
+         * session is waiting for it and is not signed in. 401, because it is
+         * not -- a client that knows nothing of two-step verification shows
+         * the message rather than mistaking this for a success or for a wrong
+         * password. No text is sent until the client asks for one
+         * (/api/auth/two-factor/send), so such a client never costs a message.
+         */
+        if (($pending = Auth::pendingSecondFactor()) !== null) {
+            $limiter->clearUserFailures($u);
+            $twoFactor = two_factor()->beginLogin();
+            AuditLog::write(db(), 'auth.login', 'second_factor', [], ['id' => (int)$pending['user'], 'username' => (string)$pending['username']]);
+            Http::json(['success' => false,
+                'error' => ['code' => 'TWO_FACTOR_REQUIRED',
+                    'message' => 'This account uses two-step verification. Enter the code sent to your phone; if this app cannot ask for it, sign in from the web app.'],
+                'requestId' => Http::requestId(),
+                'twoFactor' => $twoFactor,
+                'csrfToken' => $_SESSION['csrf']], 401);
+        }
         $limiter->recordFailure($u); AuditLog::write(db(), 'auth.login', 'failure', ['username' => $u]); throw new RuntimeException('Invalid username or password', 401);
     }
     $limiter->clearUserFailures($u);
@@ -811,7 +864,41 @@ if ($path === '/api/auth/login' && $method === 'POST') api_try(function()use($co
         'user' => Auth::user(),
         'csrfToken' => $_SESSION['csrf']];
 });
-if ($path === '/api/auth/status' && $method === 'GET') Http::json(['authenticated' => Auth::user() !== null, 'user' => Auth::user(), 'csrfToken' => $_SESSION['csrf']]);
+if ($path === '/api/auth/status' && $method === 'GET') {
+    $status = ['authenticated' => Auth::user() !== null, 'user' => Auth::user(), 'csrfToken' => $_SESSION['csrf']];
+    // A session whose password was right and whose code is still awaited, so
+    // a reload lands back on the code rather than on the password.
+    if (Auth::user() === null && Auth::pendingSecondFactor() !== null) {
+        try {
+            $twoFactor = two_factor()->loginStatus();
+            if ($twoFactor !== null) $status['twoFactor'] = $twoFactor;
+        } catch (Throwable $e) {
+            error_log('['.Http::requestId().'] two-step status unavailable: '.$e->getMessage());
+        }
+    }
+    Http::json($status);
+}
+/*
+ * The second step of signing in, for a session whose password was right.
+ * These sit with the other /api/auth routes, outside the guard below that
+ * needs a signed-in session, so each checks CSRF itself; the session's
+ * pending sign-in is what they act on, and without one they answer 401.
+ */
+if (str_starts_with($path, '/api/auth/two-factor/') && $method === 'POST') two_factor_try(function () use ($path) {
+    Auth::verifyCsrf();
+    if ($path === '/api/auth/two-factor/send') return two_factor()->sendLoginCode();
+    if ($path === '/api/auth/two-factor/cancel') { two_factor()->cancelLogin(); return ['success' => true]; }
+    if ($path !== '/api/auth/two-factor/verify') throw new RuntimeException('API endpoint not found', 404);
+    $b = Http::body(4096);
+    $code = array_key_exists('code', $b) ? Http::string($b, 'code', 1, 32) : null;
+    $recovery = array_key_exists('recoveryCode', $b) ? Http::string($b, 'recoveryCode', 1, 64) : null;
+    if (($code === null) === ($recovery === null)) Http::error(422, 'VALIDATION_FAILED', 'Send either code or recoveryCode');
+    $signedIn = two_factor()->verifyLogin($code, $recovery);
+    AuditLog::write(db(), 'auth.login', 'success', ['secondFactor' => $signedIn['method']]);
+    $answer = ['success' => true, 'user' => $signedIn['user'], 'csrfToken' => $_SESSION['csrf']];
+    if ($signedIn['recoveryCodesLeft'] !== null) $answer['recoveryCodesLeft'] = $signedIn['recoveryCodesLeft'];
+    return $answer;
+});
 if ($path === '/api/auth/logout' && $method === 'POST') {
     Authorization::requireRead(); Auth::verifyCsrf(); AuditLog::write(db(), 'auth.logout'); Auth::logout(); Http::json(['success' => true]);
 }
@@ -833,6 +920,10 @@ if ($isProtectedApi && $method !== 'OPTIONS') {
      *                    rotate their own credentials
      *   favorites        stars and unstars a file for the caller alone (POST
      *                    and DELETE); a preference, never a change to a file
+     *   users/me/two-factor/*  the caller's own SMS two-step verification;
+     *                    like the password, a viewer must be able to secure
+     *                    their own account, and each change asks for the
+     *                    password again and a texted code
      *
      * POST /api/duplicates/scan is deliberately NOT on this list, though it
      * writes nothing to the file store either. Starting a scan walks the whole
@@ -841,7 +932,7 @@ if ($isProtectedApi && $method !== 'OPTIONS') {
      * ?refresh. Reading the last result is a GET and needs only read, so a
      * viewer can see what a scan found without being able to start one.
      */
-    $writeExemptPost = ['/api/files/download-zip', '/api/thumbnail/video', '/api/users/me/password', '/api/favorites'];
+    $writeExemptPost = ['/api/files/download-zip', '/api/thumbnail/video', '/api/users/me/password', '/api/favorites', '/api/users/me/two-factor/start', '/api/users/me/two-factor/resend', '/api/users/me/two-factor/confirm', '/api/users/me/two-factor/cancel'];
     /*
      * Background tasks decide per task, not per route: a checksum or an
      * archive to download is reading, cancelling or removing your own task
@@ -2132,10 +2223,67 @@ if ($path === '/api/files/upload' && $method === 'POST') api_try(function()use($
         return ['success' => true, 'message' => 'Password changed'];
     });
 
+    /*
+     * The caller's own SMS two-step verification: what it is set to, and
+     * changes to it. Each change is start (current password, and for 'phone'
+     * the new number) -> confirm (the texted code, or for the current phone a
+     * recovery code), with resend and cancel in between. The guard above has
+     * verified CSRF for the POSTs; see TwoFactor for what each change asks.
+     */
+    if ($path === '/api/users/me/two-factor' && $method === 'GET') two_factor_try(function() {
+        Authorization::requireRead();
+        return two_factor()->overview((int)Auth::user()['id']);
+    });
+    if (str_starts_with($path, '/api/users/me/two-factor/') && $method === 'POST') two_factor_try(function() use ($path) {
+        Authorization::requireRead();
+        $user = Auth::user();
+        $id = (int)$user['id'];
+        if ($path === '/api/users/me/two-factor/start') {
+            $b = Http::body(16384);
+            $action = Http::string($b, 'action', 1, 20);
+            $password = Http::string($b, 'currentPassword', 1, 4096);
+            $phone = array_key_exists('phone', $b) ? Http::string($b, 'phone', 1, 40) : null;
+            $how = array_key_exists('method', $b) ? Http::string($b, 'method', 1, 20) : 'sms';
+            return two_factor()->startAction($id, (string)$user['username'], $action, $password, $phone, $how);
+        }
+        if ($path === '/api/users/me/two-factor/resend') return two_factor()->resendAction($id);
+        if ($path === '/api/users/me/two-factor/cancel') { two_factor()->cancelAction($id); return ['success' => true]; }
+        if ($path !== '/api/users/me/two-factor/confirm') throw new RuntimeException('API endpoint not found', 404);
+        $b = Http::body(4096);
+        $code = array_key_exists('code', $b) ? Http::string($b, 'code', 1, 32) : null;
+        $recovery = array_key_exists('recoveryCode', $b) ? Http::string($b, 'recoveryCode', 1, 64) : null;
+        if (($code === null) === ($recovery === null)) Http::error(422, 'VALIDATION_FAILED', 'Send either code or recoveryCode');
+        return two_factor()->confirmAction($id, $code, $recovery);
+    });
+
     if ($path === '/api/users' && $method === 'GET') api_try(function() {
         Authorization::requireAdmin();
         release_session_lock();
-        return (new UserRepository(db()))->all();
+        // Whether each account has two-step verification on, so an
+        // administrator can tell who a reset would apply to. Never the number.
+        $twoFactor = (new TwoFactorRepository(db()))->enabledUserIds();
+        return array_map(static fn(array $u): array => $u + ['twoFactorEnabled' => isset($twoFactor[$u['id']])],
+            (new UserRepository(db()))->all());
+    });
+
+    /*
+     * An administrator turns two-step verification off for someone who has
+     * lost both their phone and their recovery codes. It asks for the
+     * administrator's own password, is audited, and texts the owner's phone.
+     * Not for one's own account: that goes through Security, which asks for
+     * the phone -- otherwise this would be a way round it.
+     */
+    if (preg_match('#^/api/users/(\d+)/two-factor$#', $path, $m) && $method === 'DELETE') two_factor_try(function() use ($m) {
+        Authorization::requireAdmin();
+        $id = (int)$m[1];
+        $self = Auth::user();
+        if ($id === (int)$self['id']) throw new RuntimeException('Turn off your own two-step verification from Security, which asks for your phone', 409);
+        $target = (new UserRepository(db()))->get($id) ?? throw new RuntimeException('Account not found', 404);
+        $b = Http::body(16384);
+        $password = Http::string($b, 'currentPassword', 1, 4096);
+        $reset = two_factor()->adminReset((int)$self['id'], (string)$self['username'], $password, $id);
+        AuditLog::write(db(), 'two_factor.admin_reset', 'success', ['target' => $target['username'], 'phoneEnding' => $reset['phoneEnding']]);
+        return ['success' => true, 'message' => 'Two-step verification is off for '.$target['username']];
     });
 
     if ($path === '/api/users' && $method === 'POST') api_try(function() {

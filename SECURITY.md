@@ -149,3 +149,164 @@ written to a temporary file and renamed into place.
 A listing entry holds names, sizes and times, which every signed-in account can
 already list — CloudHub has no per-folder permissions — and a favorites entry is
 keyed to its account. Nothing is cached for public share links.
+
+## SMS two-step verification
+
+An account can require, after its password, a six-digit code texted to its
+owner's phone. It is off until the owner turns it on; accounts that leave it
+off sign in exactly as before. README.md describes the feature and its setup.
+
+### Where it is enforced
+
+- **Signing in.** `Auth::login()` signs a session in only for an account
+  without two-step verification. For one with it, a correct password empties
+  the session, gives it a new ID and CSRF token, and records which account is
+  waiting for a code — but sets no `user_id`. Every route decides "signed in"
+  from `user_id` alone (`Auth::user()`), so the API, WebDAV, the player, share
+  management and logout answer such a session `401` exactly as they answer one
+  that never signed in. Only `Auth::finishSecondFactor()`, called after the code
+  or a recovery code is checked, sets it — and it can only upgrade a session
+  that proved the password in the last 15 minutes, re-reads the account (one
+  disabled meanwhile is not signed in), and regenerates the ID again.
+- **There is no other way in.** CloudHub has no remember-me token, API key or
+  Basic authentication; WebDAV uses the session; share links never sign anyone
+  in. Sessions are long-lived instead, so when an account turns two-step
+  verification on, every one of its sessions that did not pass a second factor
+  is ended at its next account re-check (within a minute) — another browser,
+  the Android app, or whoever else had the password. A session records
+  `two_factor_verified_at` when it passes a code, a recovery code, or proves the
+  phone while turning the feature on.
+- **CSRF.** `/api/auth/two-factor/*` sit outside the signed-in guard, as login
+  does, and check the session's CSRF token and Fetch Metadata themselves. The
+  settings routes are behind the guard like every other change.
+- **Failing closed.** A database error while reading whether an account needs a
+  code fails the sign-in. Only a database without the columns at all — one
+  `migrate.php` has not updated, where nobody can have turned it on — reads as
+  "off". With no working SMS gateway, a code cannot be sent and the account can
+  finish signing in only with a recovery code. A throttle that cannot record
+  its own event (an unmigrated `login_attempts` ENUM under MySQL's non-strict
+  mode) refuses rather than waving requests through.
+
+### Codes
+
+- Six digits from `random_int()`. Stored as `HMAC-SHA256(TWO_FACTOR_SECRET,
+  challenge id | code)`: a copy of the database alone is not enough to recover a
+  live code. Without `TWO_FACTOR_SECRET` the key is derived from
+  `RATE_LIMIT_SECRET`, or failing that from `APP_URL` — still outside the
+  database, but set a real one.
+- One challenge per account and purpose (sign-in; proving the current phone;
+  proving a new number). Asking for a new code replaces the old one, and a
+  later sign-in replaces an earlier one's code. The session holds the
+  challenge's random id, so one session's code is no use to another.
+- Valid for `TWO_FACTOR_CODE_TTL_SECONDS` (300 by default).
+- `TWO_FACTOR_MAX_ATTEMPTS` (5) wrong guesses spend it. The attempt is a
+  compare-and-set taken *before* the code is compared, so parallel guesses can
+  never compare more codes than the limit.
+- Used once: using it deletes the row in one compare-and-set, so of several
+  requests racing with the right code exactly one succeeds (tested with five
+  concurrent requests over HTTP).
+- Each message says what the code is for ("sign-in code", "code to turn off
+  two-step verification"), so a code nobody asked for stands out. When
+  `APP_URL` is an https domain the message ends with the WebOTP origin-bound
+  line `@host #code`, which lets Android Chrome offer it to that site only; the
+  host never comes from the request.
+
+### Rate limits
+
+Kept in `login_attempts`, keyed by HMAC as the password throttle is. A slot is
+inserted and then counted, so concurrent requests cannot all slip under a limit;
+a refused request gives its slot back, so asking again while refused does not
+extend the wait.
+
+| Limit | Default |
+|---|---|
+| texts per account, per number (each) | 5 per hour |
+| texts per client address | 20 per hour |
+| a new code for the same challenge | 60 s after the last |
+| wrong codes or recovery codes per account | 10 per hour |
+| wrong codes or recovery codes per client address | 30 per hour |
+| wrong guesses per code | 5 |
+| wrong current password when changing settings | counts against the password throttle |
+
+A text the gateway refused gives its slots back (nothing was sent); a gateway
+outage keeps them, since a timeout can follow a message that was in fact sent.
+With these defaults an attacker who already has the password can test at most
+ten codes an hour — and each code they cause goes to the owner's phone.
+
+### Changing it, and recovery
+
+- Every change asks for the current password, throttled like a sign-in, so a
+  borrowed session cannot be used to guess it.
+- Turning it on, or moving to a new number, proves the new number with a code
+  sent to it; a recovery code cannot stand in for that.
+- Turning it off and replacing the recovery codes also need the current phone
+  (or a recovery code). So does a change of number, unless this session proved
+  the phone in the last ten minutes — otherwise "change the number, then turn
+  it off" would make the phone optional for turning it off. A change begun while
+  the feature was off cannot complete if it was turned on elsewhere meanwhile.
+- The old number is texted when the number changes or the feature is turned off.
+- Recovery codes: ten, 16 characters from a 31-letter alphabet (79 bits), shown
+  once, stored as SHA-256 bound to the account, each spent by one
+  compare-and-set. Replacing them retires the old ones.
+- An administrator can reset another account's two-step verification after
+  re-entering their own password; it is audited and texted to the owner. Not
+  their own: that would bypass the phone. `tools/reset-two-factor.php` is the
+  server operator's last resort.
+
+### Enumeration and privacy
+
+Nothing about two-step verification is revealed before a correct password: an
+unknown account, a disabled one and a wrong password all get the same answer,
+as before. Several accounts may share a number, so enrolling reveals nothing
+about who else uses it. Answers, messages and the audit trail show at most the
+last two digits of a number.
+
+The number itself is stored in E.164 in `users.two_factor_phone` — CloudHub
+needs it to send codes — and is never returned by any API, written to a log or
+put in the audit trail. Treat database backups as personal data. Challenge
+rows hold no number; they are deleted when used and pruned after a day.
+
+Codes, recovery codes and numbers never reach `logs/php-error.log`: gateway
+failures are logged by gateway, HTTP status and the gateway's own error code
+only (Twilio's error text quotes the destination number, so it is dropped). The
+audit trail records `auth.login` (`second_factor`, then `success` with the
+method), `auth.two_factor` failures, `two_factor.sms`, `two_factor.enable`,
+`.phone_change`, `.disable`, `.recovery_codes`, `.reauth` and `.admin_reset`.
+
+### The SMS gateway
+
+Credentials live in `.env` only and never reach a browser. Requests verify TLS,
+never follow redirects (which would carry the credentials and the code
+elsewhere) and give up after `SMS_TIMEOUT_SECONDS`. A webhook over plain HTTP
+is refused unless it is on this machine or a private network. The development
+outbox (`SMS_DRIVER=log`) writes working codes to `logs/sms-outbox.log` and is
+refused unless `APP_ENV=development`.
+
+### What SMS does not protect against
+
+SMS is the weakest common second factor. It stops someone who has only the
+password. It does not stop:
+
+- **SIM swapping and number porting** — whoever controls the number receives the
+  codes;
+- **interception** of the text in the network (SS7) or by malware on the phone;
+- **real-time phishing**, where a fake sign-in page relays the password and the
+  code as the victim types them (the WebOTP line helps only where the browser
+  fills the code itself);
+- **someone with the phone unlocked**, or a stolen session cookie (a second
+  factor protects signing in, not a session that already exists);
+- an **administrator** or the server's operator, who can reset it.
+
+Keep recovery codes offline, and consider an authenticator app or passkeys in a
+future version for accounts that need more. SMS also costs money: the limits
+above bound what one account, number or address can make the server send.
+
+### Production checklist
+
+- Run `php database/migrate.php`.
+- Serve over HTTPS with `REQUIRE_HTTPS=true`; set `APP_URL` to the https address.
+- Set `TWO_FACTOR_SECRET` (and `RATE_LIMIT_SECRET`) to long random values.
+- Configure the gateway; with Twilio, allow only the destination countries you
+  need, and set a spending alert.
+- Review the defaults in `.env.example`; watch `two_factor.sms` and
+  `auth.two_factor` events in the audit trail.

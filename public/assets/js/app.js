@@ -26,7 +26,7 @@ const S = {
 };
 const $ = s => document.querySelector(s);
 let toastTimer = 0;
-const toast = m => {
+const toast = (m, ms = 2200) => {
     const t = $('#toast');
     t.textContent = m;
     t.style.display = 'block';
@@ -34,7 +34,7 @@ const toast = m => {
     // used to hide the one that replaced it, so "Preparing…" cut a quick
     // error short.
     clearTimeout(toastTimer);
-    toastTimer = setTimeout(() => t.style.display = 'none', 2200);
+    toastTimer = setTimeout(() => t.style.display = 'none', ms);
 };
 
 async function api(url, opt = {}) {
@@ -52,20 +52,38 @@ async function api(url, opt = {}) {
         throw Error('Authentication required');
     }
     if (!r.ok) {
-        let m = `HTTP ${r.status}`, code = 'HTTP_ERROR', requestId = '';
+        let m = `HTTP ${r.status}`, code = 'HTTP_ERROR', requestId = '', details = null;
         try {
             const d = await r.json();
             m = d.error?.message || m;
             code = d.error?.code || code;
             requestId = d.requestId || '';
+            details = d.error?.details || null;
         } catch {}
         const e = Error(m);
         e.code = code;
         e.status = r.status;
         e.requestId = requestId;
+        // What a refusal adds, such as how long to wait before asking again.
+        e.details = details;
         throw e;
     }
     return r;
+}
+
+/**
+ * Make the page the signed-in account's: its token, its role's navigation,
+ * and the sign-in overlay put away -- back on its password step for next time.
+ */
+function applySignIn(d) {
+    S.csrf = d.csrfToken || '';
+    S.role = d.user?.role || 'viewer';
+    S.user = d.user || null;
+    $('#nav-users').hidden = S.role !== 'admin';
+    $('#nav-storage').hidden = S.role !== 'admin';
+    signedIn();
+    showPasswordStep();
+    $('#login').style.display = 'none';
 }
 
 async function login(u, p) {
@@ -76,13 +94,15 @@ async function login(u, p) {
         body: JSON.stringify({ username: u, password: p })
     });
     const d = await r.json().catch(() => ({}));
+    // The password was right; the account wants a texted code as well. The
+    // session is not signed in until that is checked.
+    if (d.error?.code === 'TWO_FACTOR_REQUIRED') {
+        S.csrf = d.csrfToken || '';
+        showTwoFactorStep(d.twoFactor || {});
+        return;
+    }
     if (!r.ok) throw Error(d.error?.message || 'Sign in failed');
-    S.csrf = d.csrfToken || '';
-    S.role = d.user?.role || 'viewer';
-    $('#nav-users').hidden = S.role !== 'admin';
-    $('#nav-storage').hidden = S.role !== 'admin';
-    signedIn();
-    $('#login').style.display = 'none';
+    applySignIn(d);
     await openRoute();
 }
 
@@ -102,7 +122,213 @@ $('#logout').addEventListener('click', async () => {
         await api('/api/auth/logout', { method: 'POST' });
     } catch {}
     S.csrf = '';
+    showPasswordStep();
     $('#login').style.display = 'flex';
+});
+
+/* ---- two-step verification: shared pieces ---------------------------------- */
+
+/** A button that stays disabled, counting down, until a wait is over. */
+function countdownButton(control, label) {
+    let timer = 0;
+    const stop = () => {
+        clearInterval(timer);
+        timer = 0;
+        control.disabled = false;
+        control.textContent = label;
+    };
+    return {
+        start(seconds) {
+            clearInterval(timer);
+            const until = Date.now() + Math.max(0, Number(seconds) || 0) * 1000;
+            const tick = () => {
+                const left = Math.ceil((until - Date.now()) / 1000);
+                if (left <= 0) return stop();
+                control.disabled = true;
+                control.textContent = `${label} (${left} s)`;
+            };
+            tick();
+            if (until > Date.now()) timer = setInterval(tick, 1000);
+        },
+        stop
+    };
+}
+
+/**
+ * Android Chrome can hand the code from the text message to this page
+ * (WebOTP) when the message ends with this site's origin-bound line, which the
+ * server adds when APP_URL is an https address. Anywhere else this does
+ * nothing, and the code is typed or taken from the keyboard's suggestion.
+ */
+function listenForOtp(holder, input, form) {
+    stopOtp(holder);
+    if (!('OTPCredential' in window) || !window.isSecureContext) return;
+    const ac = new AbortController();
+    holder.otp = ac;
+    navigator.credentials.get({ otp: { transport: ['sms'] }, signal: ac.signal })
+        .then(otp => {
+            if (!otp?.code || input.value || input.closest('[hidden]')) return;
+            input.value = otp.code;
+            form.requestSubmit();
+        })
+        .catch(() => {});
+}
+
+function stopOtp(holder) {
+    holder.otp?.abort();
+    holder.otp = null;
+}
+
+/* ---- two-step verification at sign-in -------------------------------------- */
+
+/**
+ * The second step for an account with SMS two-step verification, once its
+ * password was right. Until the code is checked the session counts as signed
+ * out everywhere else. These calls go to /api/auth directly rather than
+ * through api(): a 401 here means "start again with the password", not the
+ * expired session api() takes it for.
+ */
+const signInCode = { info: null, recovery: false, otp: null, resend: null };
+
+async function authPost(route, body = {}) {
+    const r = await fetch(appUrl(route), {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': S.csrf || '' },
+        body: JSON.stringify(body)
+    });
+    return { ok: r.ok, status: r.status, data: await r.json().catch(() => ({})) };
+}
+
+function showPasswordStep() {
+    stopOtp(signInCode);
+    signInCode.resend?.stop();
+    $('#two-factor-form').hidden = true;
+    $('#login-form').hidden = false;
+}
+
+function showTwoFactorStep(info) {
+    signInCode.info = info;
+    // With nothing to text, a recovery code is the only way in.
+    signInCode.recovery = !info.smsAvailable;
+    signInCode.resend ??= countdownButton($('#two-factor-resend'), 'Send a new code');
+    $('#login-form').hidden = true;
+    $('#two-factor-form').hidden = false;
+    $('#two-factor-code').value = '';
+    $('#two-factor-recovery').value = '';
+    $('#two-factor-error').textContent = '';
+    $('#login-error').textContent = '';
+    $('#login').style.display = 'flex';
+    renderSignInCode();
+    if (!info.smsAvailable) {
+        signInStatus('This server cannot send text messages right now. Use one of your recovery codes, or ask your administrator.');
+    } else if (info.codeSent) {
+        // Back on this step after a reload: the code already sent still works.
+        signInStatus('A code was already sent, and still works.');
+        signInCode.resend.start(info.resendIn);
+        listenForOtp(signInCode, $('#two-factor-code'), $('#two-factor-form'));
+    } else {
+        sendSignInCode();
+    }
+}
+
+function renderSignInCode() {
+    const recovery = signInCode.recovery;
+    const info = signInCode.info || {};
+    $('#two-factor-code-label').hidden = recovery;
+    $('#two-factor-recovery-label').hidden = !recovery;
+    $('#two-factor-resend').hidden = recovery || !info.smsAvailable;
+    $('#two-factor-switch').hidden = recovery && !info.smsAvailable;
+    $('#two-factor-switch').textContent = recovery ? 'Use a texted code instead' : 'Use a recovery code instead';
+    $('#two-factor-intro').textContent = recovery
+        ? 'Enter one of the recovery codes you saved when you turned on two-step verification. Each one works once.'
+        : `Enter the ${info.codeLength || 6}-digit code we sent to your phone number ending in ${info.phoneEnding || '••'}.`;
+    setTimeout(() => (recovery ? $('#two-factor-recovery') : $('#two-factor-code')).focus(), 0);
+}
+
+function signInStatus(text) {
+    $('#two-factor-status').textContent = text || '';
+}
+
+async function sendSignInCode() {
+    $('#two-factor-error').textContent = '';
+    signInStatus('Sending a code…');
+    $('#two-factor-resend').disabled = true;
+    let answer;
+    try {
+        answer = await authPost('/api/auth/two-factor/send');
+    } catch {
+        signInStatus('');
+        $('#two-factor-error').textContent = 'Could not reach the server.';
+        signInCode.resend.start(0);
+        return;
+    }
+    const { ok, status, data } = answer;
+    if (status === 401) return signInCodeExpired(data);
+    if (ok) {
+        const minutes = Math.max(1, Math.round((data.expiresIn || 300) / 60));
+        signInStatus(`Code sent. It works for ${minutes} minute${minutes === 1 ? '' : 's'}.`);
+        signInCode.resend.start(data.resendIn);
+        listenForOtp(signInCode, $('#two-factor-code'), $('#two-factor-form'));
+        return;
+    }
+    signInStatus('');
+    $('#two-factor-error').textContent = data.error?.message || 'The code could not be sent.';
+    signInCode.resend.start(data.error?.details?.retryAfter || 0);
+}
+
+function signInCodeExpired(data) {
+    showPasswordStep();
+    $('#login-error').textContent = data?.error?.message || 'Your sign-in timed out. Enter your password again.';
+    $('#password').focus();
+}
+
+$('#two-factor-resend').addEventListener('click', () => sendSignInCode());
+$('#two-factor-switch').addEventListener('click', () => {
+    signInCode.recovery = !signInCode.recovery;
+    $('#two-factor-error').textContent = '';
+    renderSignInCode();
+});
+$('#two-factor-back').addEventListener('click', async () => {
+    showPasswordStep();
+    // The code that was sent stops working.
+    try { await authPost('/api/auth/two-factor/cancel'); } catch {}
+    $('#password').value = '';
+    $('#password').focus();
+});
+$('#two-factor-form').addEventListener('submit', async e => {
+    e.preventDefault();
+    const recovery = signInCode.recovery;
+    const input = recovery ? $('#two-factor-recovery') : $('#two-factor-code');
+    const error = $('#two-factor-error');
+    const value = input.value.trim();
+    if (!value) {
+        error.textContent = recovery ? 'Enter a recovery code.' : 'Enter the code from the text message.';
+        return;
+    }
+    const submit = $('#two-factor-submit');
+    submit.disabled = true;
+    submit.textContent = 'Verifying…';
+    error.textContent = '';
+    try {
+        const { ok, status, data } = await authPost('/api/auth/two-factor/verify', recovery ? { recoveryCode: value } : { code: value });
+        if (ok) {
+            applySignIn(data);
+            if (typeof data.recoveryCodesLeft === 'number') {
+                toast(`Signed in with a recovery code; ${data.recoveryCodesLeft} left. If your phone is gone, change the number under Security.`, 8000);
+            }
+            await openRoute();
+            return;
+        }
+        if (status === 401) return signInCodeExpired(data);
+        error.textContent = data.error?.message || 'That did not work.';
+        input.select();
+    } catch {
+        error.textContent = 'Could not reach the server.';
+    } finally {
+        submit.disabled = false;
+        submit.textContent = 'Verify';
+    }
 });
 
 $('#theme').addEventListener('click', () => {
@@ -1003,6 +1229,23 @@ function askInput(title, label, value = '') {
     });
 }
 
+/**
+ * askInput() for a password: masked, offered to password managers, and not
+ * left behind in the field once answered.
+ */
+async function askPassword(title, label) {
+    const input = $('#dialog-input');
+    input.type = 'password';
+    input.autocomplete = 'current-password';
+    try {
+        return await askInput(title, label, '');
+    } finally {
+        input.value = '';
+        input.type = 'text';
+        input.removeAttribute('autocomplete');
+    }
+}
+
 async function del(p) {
     const name = p.split('/').pop();
     // The wording depends on where the item actually goes, which the server
@@ -1784,10 +2027,11 @@ async function users() {
 
     $('#user-list').innerHTML = list.map(u => `<div class="server">
         <strong>${esc(u.username)}</strong>
-        <small>${esc(ROLE_LABELS[u.role] || u.role)}${u.isActive ? '' : ' · disabled'} · last signed in ${esc(when(u.lastLoginAt))}</small>
+        <small>${esc(ROLE_LABELS[u.role] || u.role)}${u.isActive ? '' : ' · disabled'}${u.twoFactorEnabled ? ' · two-step on' : ''} · last signed in ${esc(when(u.lastLoginAt))}</small>
         <div class="actions">
             <button data-uedit="${u.id}">Edit</button>
             <button data-utoggle="${u.id}">${u.isActive ? 'Disable' : 'Enable'}</button>
+            ${u.twoFactorEnabled && u.id !== S.user?.id ? `<button data-utf="${u.id}">Reset two-step</button>` : ''}
             <button data-udel="${u.id}" class="danger-text">Delete</button>
         </div>
     </div>`).join('');
@@ -1795,6 +2039,23 @@ async function users() {
     const byId = id => list.find(u => String(u.id) === String(id));
 
     document.querySelectorAll('[data-uedit]').forEach(b => b.addEventListener('click', () => openUserForm(byId(b.dataset.uedit))));
+
+    // For someone who has lost their phone and their recovery codes. Asks for
+    // the administrator's own password; the server texts the owner's phone.
+    document.querySelectorAll('[data-utf]').forEach(b => b.addEventListener('click', async () => {
+        const u = byId(b.dataset.utf);
+        if (!u) return;
+        if (!await askConfirm('Reset two-step verification',
+            `Turn off two-step verification for "${u.username}"? They will sign in with their password alone until they turn it on again, and their phone gets a text saying so.`,
+            'Continue')) return;
+        const password = await askPassword('Confirm it is you', 'Your password');
+        if (!password) return;
+        try {
+            const d = await (await api(`/api/users/${u.id}/two-factor`, { method: 'DELETE', body: { currentPassword: password } })).json();
+            toast(d.message || 'Two-step verification reset');
+            await users();
+        } catch (e) { toast(e.message, 5000); }
+    }));
 
     document.querySelectorAll('[data-utoggle]').forEach(b => b.addEventListener('click', async () => {
         const u = byId(b.dataset.utoggle);
@@ -1876,6 +2137,293 @@ $('#password-dialog').addEventListener('submit', async e => {
         box.textContent = err.message;
         box.hidden = false;
     }
+});
+
+/* ---- Security: two-step verification settings ------------------------------ */
+
+/**
+ * The account's own two-step verification. A change is two calls the server
+ * answers: start (the password, and for 'phone' the new number) and confirm
+ * (the texted code, or for the current phone a recovery code). Moving to a
+ * new number can take two codes -- the current phone's first -- and the
+ * server's answer says which phone it is waiting on.
+ */
+const security = { overview: null, flow: null, recovery: false, codes: null, otp: null, resend: null };
+
+function securityMessage(type, text) {
+    const box = $('#tf-message');
+    box.hidden = !text;
+    box.className = `status-message ${type || ''}`;
+    box.textContent = text || '';
+}
+
+/** Show one step of a change (or none: the summary and its buttons). */
+function securityStep(visible) {
+    ['#tf-start', '#tf-verify', '#tf-codes-step'].forEach(id => $(id).hidden = id !== visible);
+    $('#tf-actions').hidden = visible !== null;
+    if (visible !== '#tf-verify') {
+        stopOtp(security);
+        security.resend?.stop();
+    }
+}
+
+async function openSecurity() {
+    security.resend ??= countdownButton($('#tf-resend'), 'Send a new code');
+    security.flow = null;
+    security.codes = null;
+    securityMessage(null);
+    securityStep(null);
+    $('#security-overlay').hidden = false;
+    await loadSecurity();
+}
+
+async function closeSecurity() {
+    if (security.codes && !await askConfirm('Close without saving?',
+        'Your new recovery codes will not be shown again. You can create new ones later under Security.', 'Close')) return;
+    backToSecurity();
+    security.codes = null;
+    $('#tf-code-list').innerHTML = '';
+    $('#security-overlay').hidden = true;
+}
+
+/** Leave a change half-way. The server forgets it too, so its code stops working. */
+function backToSecurity(cancelOnServer = true) {
+    if (cancelOnServer && security.flow) api('/api/users/me/two-factor/cancel', { method: 'POST' }).catch(() => {});
+    security.flow = null;
+    securityStep(null);
+}
+
+async function loadSecurity() {
+    $('#tf-summary').textContent = 'Loading…';
+    try {
+        security.overview = await (await api('/api/users/me/two-factor')).json();
+    } catch (e) {
+        $('#tf-summary').textContent = '';
+        securityMessage('error', e.message);
+        return;
+    }
+    renderSecurity();
+}
+
+function renderSecurity() {
+    const o = security.overview || {};
+    $('#tf-badge').textContent = o.enabled ? 'On' : 'Off';
+    $('#tf-badge').classList.toggle('on', !!o.enabled);
+    let summary;
+    if (o.enabled) {
+        const left = o.recoveryCodesLeft;
+        summary = `Signing in asks for a code texted to your phone number ending in ${o.phoneEnding}. ${left} recovery code${left === 1 ? '' : 's'} left.`;
+        if (!o.smsAvailable) summary += ' This server cannot send text messages right now: sign in with a recovery code until it can.';
+        else if (left <= 2) summary += ' Create new ones soon.';
+    } else if (!o.schemaReady) {
+        summary = 'Not available yet: the server’s database needs updating (php database/migrate.php).';
+    } else if (!o.smsAvailable) {
+        summary = 'Not available: no text-message service is set up on this server. An administrator can configure one.';
+    } else {
+        summary = 'Off. Turn it on to be asked, after your password, for a code texted to your phone.';
+    }
+    $('#tf-summary').textContent = summary;
+    $('#tf-enable').hidden = !!o.enabled || !o.available;
+    $('#tf-change').hidden = !o.enabled;
+    $('#tf-change').disabled = !o.smsAvailable;
+    $('#tf-codes').hidden = !o.enabled;
+    $('#tf-disable').hidden = !o.enabled;
+}
+
+function startSecurityChange(action) {
+    const o = security.overview || {};
+    security.flow = { action };
+    security.recovery = false;
+    securityMessage(null);
+    const ending = o.phoneEnding || '••';
+    $('#tf-start-intro').textContent = {
+        phone: o.enabled
+            ? 'Enter your new mobile number and your password. We will text a code to the new number, and first to your current one unless you have just used it.'
+            : 'Enter the mobile number to send codes to, and your password. We will text a code to that number to make sure it is yours.',
+        disable: `Enter your password. We will text a code to your phone number ending in ${ending} to confirm it is you.`,
+        recovery: `Enter your password. We will text a code to your phone number ending in ${ending}. Your current recovery codes then stop working.`
+    }[action];
+    $('#tf-phone-label').hidden = action !== 'phone';
+    $('#tf-phone').value = '';
+    $('#tf-password').value = '';
+    // Phone gone: the current phone is answered with a recovery code, and nothing is texted to it.
+    $('#tf-start-recovery').hidden = !o.enabled;
+    securityStep('#tf-start');
+    setTimeout(() => (action === 'phone' ? $('#tf-phone') : $('#tf-password')).focus(), 0);
+}
+
+async function submitSecurityStart(method) {
+    const flow = security.flow;
+    if (!flow) return;
+    const body = { action: flow.action, currentPassword: $('#tf-password').value, method };
+    if (flow.action === 'phone') {
+        body.phone = $('#tf-phone').value.trim();
+        if (!body.phone) return securityMessage('error', 'Enter your mobile number, starting with + and the country code.');
+    }
+    if (!body.currentPassword) return securityMessage('error', 'Enter your current password.');
+    const button = method === 'recovery' ? $('#tf-start-recovery') : $('#tf-start-submit');
+    const label = button.textContent;
+    $('#tf-start-submit').disabled = $('#tf-start-recovery').disabled = true;
+    button.textContent = method === 'recovery' ? 'Checking…' : 'Sending…';
+    securityMessage(null);
+    try {
+        const d = await (await api('/api/users/me/two-factor/start', { method: 'POST', body })).json();
+        $('#tf-password').value = '';
+        showSecurityCode(d, method === 'recovery');
+    } catch (e) {
+        securityMessage('error', e.message);
+    } finally {
+        $('#tf-start-submit').disabled = $('#tf-start-recovery').disabled = false;
+        button.textContent = label;
+    }
+}
+
+/** The code step, for whichever phone the server is waiting on. */
+function showSecurityCode(d, recovery = false) {
+    security.flow = { ...security.flow, ...d };
+    security.recovery = recovery && !!d.recoveryAllowed;
+    $('#tf-code').value = '';
+    $('#tf-recovery').value = '';
+    securityStep('#tf-verify');
+    renderSecurityCode();
+    if (d.error) securityMessage('error', d.error.message);
+    if (!security.recovery) {
+        security.resend.start(d.sent ? d.resendIn : (d.error?.retryAfter || 0));
+        if (d.sent) listenForOtp(security, $('#tf-code'), $('#tf-verify'));
+    }
+}
+
+function renderSecurityCode() {
+    const d = security.flow || {};
+    const recovery = security.recovery;
+    $('#tf-code-label').hidden = recovery;
+    $('#tf-recovery-label').hidden = !recovery;
+    $('#tf-resend').hidden = recovery;
+    $('#tf-switch').hidden = !d.recoveryAllowed;
+    $('#tf-switch').textContent = recovery ? 'Use a texted code instead' : 'Use a recovery code instead';
+    $('#tf-verify-intro').textContent = recovery
+        ? 'Enter one of your recovery codes in place of a code from your current phone.'
+        : d.stage === 'current'
+            ? `Enter the code we sent to your current phone number, ending in ${d.phoneEnding}.`
+            : `Enter the code we sent to the number ending in ${d.phoneEnding}.`;
+    setTimeout(() => (recovery ? $('#tf-recovery') : $('#tf-code')).focus(), 0);
+}
+
+async function resendSecurityCode() {
+    $('#tf-resend').disabled = true;
+    securityMessage(null);
+    try {
+        const d = await (await api('/api/users/me/two-factor/resend', { method: 'POST' })).json();
+        security.flow = { ...security.flow, ...d };
+        security.resend.start(d.resendIn);
+        securityMessage('success', `A new code is on its way to the number ending in ${d.phoneEnding}.`);
+        listenForOtp(security, $('#tf-code'), $('#tf-verify'));
+    } catch (e) {
+        securityMessage('error', e.message);
+        if (e.code === 'TWO_FACTOR_NO_PENDING_CHANGE') return backToSecurity(false);
+        security.resend.start(e.details?.retryAfter || 0);
+    }
+}
+
+async function submitSecurityCode() {
+    const recovery = security.recovery;
+    const input = recovery ? $('#tf-recovery') : $('#tf-code');
+    const value = input.value.trim();
+    if (!value) return securityMessage('error', recovery ? 'Enter a recovery code.' : 'Enter the code from the text message.');
+    const submit = $('#tf-verify-submit');
+    submit.disabled = true;
+    submit.textContent = 'Verifying…';
+    securityMessage(null);
+    try {
+        const d = await (await api('/api/users/me/two-factor/confirm', {
+            method: 'POST', body: recovery ? { recoveryCode: value } : { code: value }
+        })).json();
+        if (!d.done) {
+            // The current phone is proven; now the new number's own code.
+            showSecurityCode(d);
+            if (!d.error) securityMessage('success', `Thanks. Now enter the code we sent to your new number ending in ${d.phoneEnding}.`);
+            return;
+        }
+        const wasOn = !!security.overview?.enabled;
+        security.flow = null;
+        await loadSecurity();
+        if (d.recoveryCodes) {
+            showRecoveryCodes(d.recoveryCodes);
+            securityMessage('success', wasOn ? 'New recovery codes are ready. The old ones no longer work.'
+                : 'Two-step verification is on. Signing in will now ask for a code texted to your phone.');
+        } else {
+            securityStep(null);
+            securityMessage('success', d.enabled
+                ? `Done. Codes now go to your phone number ending in ${d.phoneEnding}.`
+                : 'Two-step verification is off. Signing in takes your password only.');
+        }
+    } catch (e) {
+        securityMessage('error', e.message);
+        if (e.code === 'TWO_FACTOR_NO_PENDING_CHANGE') backToSecurity(false);
+        else input.select();
+    } finally {
+        submit.disabled = false;
+        submit.textContent = 'Verify';
+    }
+}
+
+function showRecoveryCodes(codes) {
+    security.codes = codes;
+    $('#tf-code-list').innerHTML = codes.map(c => `<li><code>${esc(c)}</code></li>`).join('');
+    securityStep('#tf-codes-step');
+}
+
+$('#account-security').addEventListener('click', openSecurity);
+$('#security-close').addEventListener('click', closeSecurity);
+$('#security-overlay').addEventListener('click', e => {
+    if (e.target === $('#security-overlay')) closeSecurity();
+});
+document.addEventListener('keydown', e => {
+    // The password, confirmation and input dialogs open over this one and keep their own keys.
+    if (e.key === 'Escape' && !$('#security-overlay').hidden && $('#password-overlay').hidden
+        && $('#confirm-overlay').hidden && $('#input-overlay').hidden) closeSecurity();
+});
+$('#tf-enable').addEventListener('click', () => startSecurityChange('phone'));
+$('#tf-change').addEventListener('click', () => startSecurityChange('phone'));
+$('#tf-codes').addEventListener('click', () => startSecurityChange('recovery'));
+$('#tf-disable').addEventListener('click', () => startSecurityChange('disable'));
+$('#tf-start').addEventListener('submit', e => {
+    e.preventDefault();
+    submitSecurityStart('sms');
+});
+$('#tf-start-recovery').addEventListener('click', () => submitSecurityStart('recovery'));
+$('#tf-start-cancel').addEventListener('click', () => backToSecurity());
+$('#tf-verify').addEventListener('submit', e => {
+    e.preventDefault();
+    submitSecurityCode();
+});
+$('#tf-verify-cancel').addEventListener('click', () => backToSecurity());
+$('#tf-resend').addEventListener('click', resendSecurityCode);
+$('#tf-switch').addEventListener('click', () => {
+    security.recovery = !security.recovery;
+    securityMessage(null);
+    renderSecurityCode();
+});
+$('#tf-codes-copy').addEventListener('click', async () => {
+    try {
+        await navigator.clipboard.writeText((security.codes || []).join('\n'));
+        toast('Recovery codes copied');
+    } catch {
+        // No clipboard access (plain http, an older browser): select them for a manual copy.
+        getSelection().selectAllChildren($('#tf-code-list'));
+        toast('Codes selected: copy them now');
+    }
+});
+$('#tf-codes-download').addEventListener('click', () => {
+    const text = `Recovery codes for ${S.user?.username || 'your account'} (${location.host})\n`
+        + 'Each signs you in once in place of a texted code. Keep them somewhere safe.\n\n'
+        + (security.codes || []).join('\n') + '\n';
+    saveBlob(new Blob([text], { type: 'text/plain' }), 'recovery-codes.txt');
+});
+$('#tf-codes-done').addEventListener('click', () => {
+    security.codes = null;
+    $('#tf-code-list').innerHTML = '';
+    securityStep(null);
 });
 
 $('#add-server').addEventListener('click', () => $('#server-form').hidden = false);
@@ -2608,12 +3156,20 @@ async function openRoute() {
     } catch {
         d = null;
     }
+    // Reloaded on the code step: the password was right and the code still
+    // works, so carry on there rather than asking for the password again.
+    if (!d?.authenticated && d?.twoFactor) {
+        S.csrf = d.csrfToken || '';
+        showTwoFactorStep(d.twoFactor);
+        return;
+    }
     if (!d?.authenticated) {
         $('#login').style.display = 'flex';
         return;
     }
     S.csrf = d.csrfToken || '';
     S.role = d.user?.role || 'viewer';
+    S.user = d.user || null;
     // Convenience only: /api/users is administrator-gated server-side.
     $('#nav-users').hidden = S.role !== 'admin';
     $('#nav-storage').hidden = S.role !== 'admin';
