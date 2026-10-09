@@ -37,6 +37,25 @@ $uploadSizeHelp = $maxUploadMb >= 1024
             <p id="login-error" class="error"></p>
             <button>Sign In</button>
         </form>
+        <?php /* The second step for an account with SMS two-step verification, shown once its password was right. */ ?>
+        <form id="two-factor-form" class="dialog" hidden novalidate>
+            <h2>Two-step verification</h2>
+            <p id="two-factor-intro">Enter the code we sent to your phone.</p>
+            <label id="two-factor-code-label">Verification code
+                <input id="two-factor-code" class="code-input" inputmode="numeric" autocomplete="one-time-code" maxlength="6" spellcheck="false">
+            </label>
+            <label id="two-factor-recovery-label" hidden>Recovery code
+                <input id="two-factor-recovery" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="xxxx-xxxx-xxxx-xxxx">
+            </label>
+            <p id="two-factor-status" class="muted" role="status" aria-live="polite"></p>
+            <p id="two-factor-error" class="error" role="alert"></p>
+            <button id="two-factor-submit">Verify</button>
+            <div class="two-factor-links">
+                <button id="two-factor-resend" type="button" class="link-button">Send a new code</button>
+                <button id="two-factor-switch" type="button" class="link-button">Use a recovery code instead</button>
+                <button id="two-factor-back" type="button" class="link-button">Back to sign in</button>
+            </div>
+        </form>
     </div>
     <header>
         <strong>◉ File Server</strong>
@@ -54,7 +73,8 @@ $uploadSizeHelp = $maxUploadMb >= 1024
             <?php /* Beside the account controls rather than in the nav: on a phone the nav scrolls sideways and the Tasks link is often off-screen. */ ?>
             <a id="tasks-indicator" class="tasks-indicator" href="<?= htmlspecialchars($frontController, ENT_QUOTES) ?>?route=%2Ftasks" hidden><span class="tasks-spinner" aria-hidden="true"></span><span id="tasks-badge"></span></a>
             <button id="theme" aria-label="Toggle dark mode">◐</button>
-            <button id="change-password" type="button">Password</button>
+            <?php /* "Security" is as wide as the "Password" it replaced: the header was laid out at 320-412px with these buttons. */ ?>
+            <button id="account-security" type="button">Security</button>
             <button id="logout">Log out</button>
         </div>
     </header>
@@ -201,6 +221,87 @@ $uploadSizeHelp = $maxUploadMb >= 1024
             </div>
         </div>
 
+        <?php /* Before the password dialog: at equal z-index the later one stacks on top, so "Change password" opens over this. */ ?>
+        <div id="security-overlay" class="modal-overlay" hidden>
+            <div id="security-dialog" class="confirm-dialog security-dialog" role="dialog" aria-modal="true" aria-labelledby="security-title">
+                <div class="modal-heading">
+                    <div>
+                        <h2 id="security-title">Security</h2>
+                        <p>Your password and two-step verification.</p>
+                    </div>
+                    <button id="security-close" class="icon-button" type="button" aria-label="Close">&times;</button>
+                </div>
+
+                <section class="security-section">
+                    <div class="security-row">
+                        <div>
+                            <h3>Password</h3>
+                            <p class="muted">Change the password you sign in with.</p>
+                        </div>
+                        <button id="change-password" type="button">Change password</button>
+                    </div>
+                </section>
+
+                <section class="security-section" aria-labelledby="tf-heading">
+                    <h3 id="tf-heading">Two-step verification <span id="tf-badge" class="tf-badge">Off</span></h3>
+                    <p id="tf-summary" class="muted">Loading…</p>
+                    <div id="tf-actions" class="tf-actions">
+                        <button id="tf-enable" type="button" class="primary-button" hidden>Turn on</button>
+                        <button id="tf-change" type="button" hidden>Change number</button>
+                        <button id="tf-codes" type="button" hidden>New recovery codes</button>
+                        <button id="tf-disable" type="button" class="danger-text" hidden>Turn off</button>
+                    </div>
+
+                    <form id="tf-start" class="tf-step" hidden novalidate>
+                        <p id="tf-start-intro"></p>
+                        <label id="tf-phone-label" class="share-field">Mobile number, with country code
+                            <input id="tf-phone" type="tel" inputmode="tel" autocomplete="tel" placeholder="+31 6 12345678" spellcheck="false">
+                        </label>
+                        <label class="share-field">Current password
+                            <input id="tf-password" type="password" autocomplete="current-password">
+                        </label>
+                        <div class="tf-links">
+                            <button id="tf-start-recovery" type="button" class="link-button" hidden>No access to your phone? Use a recovery code</button>
+                        </div>
+                        <div class="modal-actions tf-buttons">
+                            <button id="tf-start-cancel" type="button">Cancel</button>
+                            <button id="tf-start-submit" class="primary-button" type="submit">Send code</button>
+                        </div>
+                    </form>
+
+                    <form id="tf-verify" class="tf-step" hidden novalidate>
+                        <p id="tf-verify-intro"></p>
+                        <label id="tf-code-label" class="share-field">Code from the text message
+                            <input id="tf-code" class="code-input" inputmode="numeric" autocomplete="one-time-code" maxlength="6" spellcheck="false">
+                        </label>
+                        <label id="tf-recovery-label" class="share-field" hidden>Recovery code
+                            <input id="tf-recovery" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="xxxx-xxxx-xxxx-xxxx">
+                        </label>
+                        <div class="tf-links">
+                            <button id="tf-resend" type="button" class="link-button">Send a new code</button>
+                            <button id="tf-switch" type="button" class="link-button" hidden>Use a recovery code instead</button>
+                        </div>
+                        <div class="modal-actions tf-buttons">
+                            <button id="tf-verify-cancel" type="button">Cancel</button>
+                            <button id="tf-verify-submit" class="primary-button" type="submit">Verify</button>
+                        </div>
+                    </form>
+
+                    <div id="tf-codes-step" class="tf-step" hidden>
+                        <p><strong>Save your recovery codes.</strong> If you lose your phone, each one signs you in once in place of a texted code. They are not shown again.</p>
+                        <ol id="tf-code-list" class="recovery-codes"></ol>
+                        <div class="modal-actions tf-buttons">
+                            <button id="tf-codes-copy" type="button">Copy</button>
+                            <button id="tf-codes-download" type="button">Download</button>
+                            <button id="tf-codes-done" class="primary-button" type="button">I have saved them</button>
+                        </div>
+                    </div>
+
+                    <div id="tf-message" class="status-message" role="status" aria-live="polite" hidden></div>
+                    <p class="muted tf-note">Codes come by text message. That protects your account from a stolen password, but not from someone who takes over your phone number, so keep your recovery codes somewhere safe.</p>
+                </section>
+            </div>
+        </div>
         <div id="password-overlay" class="modal-overlay" hidden>
             <form id="password-dialog" class="confirm-dialog">
                 <div class="modal-heading">

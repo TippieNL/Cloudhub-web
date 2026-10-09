@@ -274,3 +274,35 @@ header>nav a{padding:8px 12px;white-space:nowrap;flex:0 0 auto}
 .task-failures{margin:0;padding-left:18px;font-size:13px;color:var(--muted);max-height:9em;overflow:auto}
 .task-checksums{margin:0;padding:8px 10px;border-radius:7px;background:var(--bg);font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;overflow:auto;white-space:pre}
 .task .actions{margin-top:2px}
+
+/* Security: password and SMS two-step verification. Built from the share and
+   task patterns -- the share dialog's fields, the task status pill -- so it
+   reads as part of the same app in both themes. */
+.security-dialog{width:min(520px,100%);max-height:min(780px,92vh);overflow:auto}
+.security-section{border-top:1px solid var(--border);margin-top:16px;padding-top:14px}
+.security-section h3{margin:0 0 4px;font-size:15px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.security-section p{margin:4px 0}
+.security-row{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
+.tf-badge{font-size:12px;font-weight:600;border:1px solid var(--border);border-radius:99px;padding:1px 9px;color:var(--muted)}
+.tf-badge.on{border-color:#2a9d4b;color:#2a9d4b}
+.tf-actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}
+.tf-step{margin-top:12px}
+.tf-step>p{margin:0 0 4px}
+.tf-buttons{flex-wrap:wrap}
+.tf-note{margin-top:14px}
+.tf-links,.two-factor-links{display:flex;flex-wrap:wrap;gap:2px 16px;margin-top:10px}
+.link-button{border:0;background:transparent;padding:6px 0;color:var(--primary);text-decoration:underline;text-underline-offset:2px;text-align:left}
+.link-button:disabled{color:var(--muted);text-decoration:none;cursor:default}
+/* A one-time code is read off another screen digit by digit, so it gets
+   room and fixed-width digits. inputmode/autocomplete bring up the number
+   pad and the phone's own code suggestion. */
+.code-input{font:600 22px/1.2 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;letter-spacing:.3em;text-align:center}
+.recovery-codes{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px 22px;margin:12px 0;padding:12px 12px 12px 34px;border:1px solid var(--border);border-radius:9px;background:var(--bg)}
+.recovery-codes code{font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:nowrap}
+#two-factor-form #two-factor-submit{width:100%;margin-top:4px}
+#two-factor-status:empty,#two-factor-error:empty{display:none}
+@media(max-width:650px){
+  .security-dialog{width:100%;max-height:92vh;border-radius:16px 16px 0 0}
+  .recovery-codes{grid-template-columns:1fr}
+  .tf-actions button,.security-row>button{min-height:44px}
+}
