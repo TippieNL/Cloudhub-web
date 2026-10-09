@@ -132,6 +132,17 @@ needed. A script fails the run if it exits non-zero or emits any
 warning/notice. The database-schema checks read `database/migrate.php` rather
 than connecting, so no MySQL server is required.
 
+Two-step verification also has a suite that runs over real HTTP against a real
+database (see **Two-step verification (SMS)**):
+
+```bash
+php tests/http/two_factor_run.php
+```
+
+It needs the MySQL/MariaDB database `.env` points at, migrated. It starts its
+own CloudHub servers and a stand-in SMS gateway, creates its own accounts, and
+removes them when it is done.
+
 ## Required PHP extensions
 
 `pdo`, `pdo_mysql`, `fileinfo`, `json`, `mbstring`; `zip` for multi-file ZIP downloads; `gd` for image thumbnails; `apcu` or `redis` only for those cache drivers. OPcache is strongly recommended. OpenSSL is recommended. Remote storage protocols may additionally require `ftp`, `ssh2`, cURL, or an OS SMB client when those adapters are enabled.
@@ -323,8 +334,9 @@ restoring and purging need write access, like any other change to the store.
 
 Administrators manage accounts from the **Users** screen: create and delete
 them, set the role, enable and disable them, and reset a password. Every
-signed-in user can change their own password from the **Password** button,
-which requires their current one.
+signed-in user can change their own password from **Security** → **Change
+password**, which requires their current one. (The header button was called
+**Password** before two-step verification gave it a second section.)
 
 | Role | Can |
 |---|---|
@@ -368,6 +380,135 @@ gallery's worth of thumbnail requests does not each incur one.
 Passwords are stored using PHP-compatible password hashes and are re-hashed to
 the preferred algorithm on the next successful login. The browser no longer
 receives a `WWW-Authenticate` header, so native Basic Auth popups are not used.
+
+## Two-step verification (SMS)
+
+Any account can add a second step to signing in: after the password, a
+six-digit code texted to the owner's phone. It is off for every account until
+its owner turns it on, and nothing about signing in changes for accounts that
+leave it off. SECURITY.md has the threat model and what SMS does not protect
+against.
+
+**For a person.** **Security** → **Two-step verification** → **Turn on**: enter
+a mobile number in international format (`+31 6 12345678`; `0031…` and the
+`(0)` printed on business cards are understood, a local `06…` is not, because
+guessing a country sends a code to a stranger) and the current password; type
+the code that arrives. Ten recovery codes are then shown once — copy or
+download them. From then on signing in asks for the code; **Use a recovery
+code instead** is the way in without the phone. The same panel changes the
+number, turns it off and makes new recovery codes.
+
+| Change | Asks for |
+|---|---|
+| Turn on | password + code texted to the new number |
+| Change number | password + code texted to the new number, and first a code from the current phone (or a recovery code) unless this session proved it in the last 10 minutes — signing in counts |
+| Turn off | password + code from the current phone, or a recovery code |
+| New recovery codes | password + code from the current phone, or a recovery code |
+
+The old number is texted when the number changes or two-step verification is
+turned off, so a change nobody asked for does not go unnoticed.
+
+**Lost phone.** Sign in with a recovery code, then **Change number**: having
+just signed in, only the new number's code is asked for. Without recovery codes
+either, an administrator resets it from the **Users** screen (**Reset
+two-step**, which asks for the administrator's own password, is audited, and
+texts the owner's phone); the account then signs in with its password until its
+owner turns it on again. An administrator cannot reset their own this way — it
+would bypass the phone — so for the only administrator, the server's operator
+runs:
+
+```bash
+php tools/reset-two-factor.php <username>
+```
+
+**Codes and limits.** Codes are six digits from `random_int()`, stored only as
+an HMAC under `TWO_FACTOR_SECRET`, single-use, and valid for
+`TWO_FACTOR_CODE_TTL_SECONDS`. Each survives `TWO_FACTOR_MAX_ATTEMPTS` wrong
+guesses; asking for another replaces it and waits `TWO_FACTOR_RESEND_SECONDS`.
+Per hour, at most `TWO_FACTOR_SMS_PER_HOUR` texts go to one account and to one
+number, `TWO_FACTOR_SMS_IP_PER_HOUR` from one address, and after
+`TWO_FACTOR_FAILURES_PER_HOUR` wrong codes (or recovery codes) for one account
+— `TWO_FACTOR_IP_FAILURES_PER_HOUR` from one address — verification is refused
+until the hour has passed. Recovery codes are 16 characters (79 random bits),
+stored as SHA-256, and each works once.
+
+**Sessions.** A correct password for such an account gives the session a new
+ID and CSRF token and remembers which account is waiting — but no signed-in
+user, so every route, WebDAV included, answers it `401` exactly as it answers
+someone signed out. Only the code signs it in, with another new ID. The wait
+lasts 15 minutes. When an account turns two-step verification on, its other
+sessions that only ever proved the password — another browser, or the Android
+app — are signed out within a minute; the session that turned it on carries on.
+
+**What the server needs.**
+
+1. `php database/migrate.php` — adds two nullable columns to `users`, the
+   tables `two_factor_challenges` and `two_factor_recovery_codes`, and new
+   values to `login_attempts.scope`. Nothing is dropped or rewritten, and every
+   account starts with it off. Until it has run, sign-in works exactly as
+   before and the settings panel says the database needs updating.
+2. An SMS gateway in `.env` (examples in `.env.example`):
+
+   | Setting | |
+   |---|---|
+   | `SMS_DRIVER` | `twilio`, `webhook`, or `log` (development only); empty: nobody can turn two-step verification on |
+   | `SMS_FROM` | sender number (E.164) or alphanumeric sender ID |
+   | `SMS_APP_NAME` | the name in each message (default `CloudHub`) |
+   | `SMS_TIMEOUT_SECONDS` | how long to wait for the gateway (default 10) |
+   | `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN` | for `twilio`; `TWILIO_MESSAGING_SERVICE_SID` may replace `SMS_FROM` |
+   | `SMS_WEBHOOK_URL`, `SMS_WEBHOOK_TOKEN` | for `webhook` |
+   | `TWO_FACTOR_SECRET` | 32+ random bytes, hex: `php -r 'echo bin2hex(random_bytes(32)), PHP_EOL;'` |
+
+   **Twilio**: create an account, get a sending number (or a messaging
+   service), allow the destination countries in Twilio's SMS geographic
+   permissions, then set `SMS_DRIVER=twilio`, the account SID, the auth token
+   and `SMS_FROM`. Messages go out with one HTTPS POST; no SDK is needed.
+
+   **Webhook**: anything that takes `POST {"to", "from", "message"}` as JSON
+   with an optional `Authorization: Bearer <SMS_WEBHOOK_TOKEN>`, and answers
+   2xx when it accepted the message (400/422: the number was refused; anything
+   else: unavailable). That fronts a provider there is no driver for, or an SMS
+   gateway app on the phone CloudHub runs on. Plain `http://` is accepted only
+   for this machine or a private network address.
+
+   **Development**: `SMS_DRIVER=log` with `APP_ENV=development` writes each
+   message, code included, to `logs/sms-outbox.log` instead of sending it. With
+   any other `APP_ENV` it is refused and texts are off.
+
+   A driver that is named but cannot work — missing credentials, the outbox in
+   production, a plain-HTTP webhook to the internet — is logged once to
+   `logs/php-error.log` and treated as no gateway. That never opens a way round
+   the code: accounts that have it on can then only finish signing in with a
+   recovery code. The same holds when the gateway is down or slow; the person
+   is told the text could not be sent and can try again or use a recovery code.
+
+**API.** The web app uses these; another client can too.
+
+| Route | |
+|---|---|
+| `POST /api/auth/login` | unchanged for accounts without it. For one with it: `401` `TWO_FACTOR_REQUIRED`, with `twoFactor` (`phoneEnding`, `codeLength`, `smsAvailable`, `codeSent`, `resendIn`, `expiresIn`) and a fresh `csrfToken`. No text is sent yet |
+| `POST /api/auth/two-factor/send` | text a code; `429` with `Retry-After` while waiting, `503` when no text can be sent |
+| `POST /api/auth/two-factor/verify` | `{"code"}` or `{"recoveryCode"}`; the usual sign-in answer on success |
+| `POST /api/auth/two-factor/cancel` | give up the sign-in |
+| `GET /api/auth/status` | also carries `twoFactor` while a sign-in waits for its code |
+| `GET /api/users/me/two-factor` | the caller's settings: `enabled`, `phoneEnding`, `recoveryCodesLeft`, `available`, … |
+| `POST /api/users/me/two-factor/start` | `{"action": "phone" \| "disable" \| "recovery", "currentPassword", "phone"?, "method"?: "recovery"}` |
+| `POST /api/users/me/two-factor/confirm` | `{"code"}`, or `{"recoveryCode"}` for the current phone; a change of number may answer `"done": false` and ask for the new number's code next |
+| `POST /api/users/me/two-factor/resend`, `…/cancel` | |
+| `DELETE /api/users/{id}/two-factor` | administrator reset, `{"currentPassword"}` |
+
+The `/api/auth/two-factor/*` routes check CSRF themselves; the others sit behind
+the same guard as every other route. Refusals carry stable codes —
+`TWO_FACTOR_CODE_INVALID` (with `attemptsLeft`), `TWO_FACTOR_CODE_EXPIRED`,
+`TWO_FACTOR_LOCKED`, `TWO_FACTOR_RESEND_COOLDOWN`, `SMS_UNAVAILABLE`, … — and
+answers name at most a number's last two digits. The Users list
+(`GET /api/users`) gains `twoFactorEnabled`, never a number.
+
+**The Android app** (Cloudhub-2) shows the server's message for a sign-in
+answer it does not understand, so with two-step verification on it reports
+*"This account uses two-step verification…"* instead of signing in, and costs
+no text message. Until it learns the code step, accounts that turn this on sign
+in from the web app.
 
 ## Storage and quotas
 
