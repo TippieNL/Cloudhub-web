@@ -488,8 +488,9 @@ round the code.
    Amazon SES…) works with the SMTP credentials it issues. CloudHub signs in
    with a username and password (AUTH PLAIN or LOGIN), so a provider that only
    allows OAuth for SMTP cannot be used. A domain of your own needs SPF and
-   DKIM set up for the sender, or codes land in spam. Values are read as
-   written: don't wrap a password in quotes unless the quotes are part of it.
+   DKIM set up for the sender, or codes land in spam. In `.env`, quotes
+   around a value are removed (so a password that starts or ends with a
+   quote cannot be used), and a `#` after a value is part of the value.
 
    Certificates are always verified against `SMTP_HOST`. On Android/KSWEB,
    whose PHP often has no CA bundle, download one (for example curl's
