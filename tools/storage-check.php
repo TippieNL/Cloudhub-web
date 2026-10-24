@@ -43,6 +43,7 @@ foreach ($report['paths'] as $row) {
         true => 'yes',
         false => 'NO — PHP cannot create/remove files here',
     }.PHP_EOL;
+    if (isset($row['keepsTimes'])) echo '  file times: '.($row['keepsTimes'] ? 'kept' : 'NOT kept — no thumbnail can be kept here').PHP_EOL;
     if ($row['entries'] !== null) echo '  entries   : '.$row['entries'].PHP_EOL;
     echo PHP_EOL;
 }

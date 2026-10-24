@@ -467,9 +467,10 @@ $checks['every change to the store retires the generation, after the guard'] = $
     && str_contains($index, "if (!in_array(\$method, ['GET', 'HEAD', 'OPTIONS', 'PROPFIND'], true) && !in_array(\$path, \$cacheNeutralWrites, true)) {\n    register_shutdown_function(static function (): void {\n        cache_ready();\n        Cache::bumpGeneration();");
 preg_match('/\$cacheNeutralWrites = \[(.*?)\];/s', $index, $m);
 $neutral = array_map(static fn(string $s): string => trim($s, " \n'"), explode(',', $m[1] ?? ''));
+// The thumbnail scan writes thumbnails, which live outside the store.
 $checks['and only routes that cannot change a file are exempt'] = $neutral === ['/api/auth/login', '/api/auth/logout',
     '/api/uploads/init', '/api/uploads/chunk', '/api/uploads/cancel', '/api/uploads/cleanup', '/api/thumbnail/video',
-    '/api/files/download-zip', '/api/users/me/password', '/api/duplicates/scan'];
+    '/api/files/download-zip', '/api/users/me/password', '/api/duplicates/scan', '/api/thumbnails/scan'];
 $checks['finishing an upload is not among them'] = !in_array('/api/uploads/complete', $neutral, true);
 
 // --- the bundled dependency ----------------------------------------------------------

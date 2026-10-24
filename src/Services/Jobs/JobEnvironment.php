@@ -9,6 +9,7 @@ use CloudHub\Repositories\StorageLedger;
 use CloudHub\Repositories\UserRepository;
 use CloudHub\Services\FileService;
 use CloudHub\Services\StorageQuota;
+use CloudHub\Services\ThumbnailService;
 use PDO;
 use RuntimeException;
 
@@ -27,6 +28,7 @@ final class JobEnvironment
 {
     private ?StorageLedger $ledger = null;
     private ?StorageQuota $quota = null;
+    private ?ThumbnailService $thumbnails = null;
 
     public function __construct(
         public readonly array $config,
@@ -41,6 +43,8 @@ final class JobEnvironment
     public function favorites(): FavoriteRepository { return new FavoriteRepository($this->db); }
     public function ledger(): StorageLedger { return $this->ledger ??= new StorageLedger($this->db); }
     public function quota(): StorageQuota { return $this->quota ??= new StorageQuota($this->files, $this->config, $this->ledger(), $this->projectDir); }
+    /** The thumbnails kept beside the store: the ones GET /api/thumbnail serves. */
+    public function thumbnails(): ThumbnailService { return $this->thumbnails ??= new ThumbnailService($this->files, $this->projectDir.'/storage/.thumbnails'); }
 
     /**
      * ROOT_DIR/.jobs, where every job keeps its staging and its output.

@@ -18,7 +18,8 @@ use CloudHub\Services\Authorization;
 use CloudHub\Services\DuplicateFinder;
 use CloudHub\Services\StorageDiagnostics;
 use CloudHub\Services\StorageQuota;
-use CloudHub\Services\ImageThumbnailer;
+use CloudHub\Services\ThumbnailService;
+use CloudHub\Services\ThumbnailScan;
 use CloudHub\Services\MediaProbe;
 use CloudHub\Services\AuditLog;
 use CloudHub\Services\TwoFactor;
@@ -280,15 +281,13 @@ function purge_expired_trash_occasionally(FileService $fs, int $retentionDays): 
 }
 
 /**
- * Where a file's cached thumbnail lives.
- *
- * Keyed by absolute path and modification time, so editing or replacing a
- * file yields a new key and the stale thumbnail is simply never read again.
+ * The request's thumbnails, kept in storage/.thumbnails/files -- a mirror of
+ * the store, one `<name>.webp` beside where each file is. See ThumbnailService;
+ * the background jobs reach the same one through JobEnvironment::thumbnails().
  */
-function thumbnail_cache_path(string $file, ?int $mtime = null): ?string {
-    // ImageThumbnailer holds the key, so the background thumbnail job writes
-    // exactly the entries this route serves.
-    return ImageThumbnailer::cachePath(dirname(__DIR__), $file, $mtime);
+function thumbs(): ThumbnailService {
+    static $thumbs; global $fs;
+    return $thumbs ??= new ThumbnailService($fs, dirname(__DIR__).'/storage/.thumbnails');
 }
 
 /**
@@ -296,26 +295,23 @@ function thumbnail_cache_path(string $file, ?int $mtime = null): ?string {
  *
  * Without this the browser had to ask for every video thumbnail and treat the
  * failure as "not cached yet", which logged a failed request and a console
- * error for each one, and wasted a round trip. One is_file() per video here
+ * error for each one, and wasted a round trip. A stat or two per video here
  * replaces all of that. Shared by every route that hands out listing rows, so
  * a video opened from Favorites is not decoded again when the folder already
  * had its frame.
  */
 function flag_video_thumbnail(array $entry, string $root): array {
     if (!empty($entry['isDirectory'])) return $entry;
-    $ext = strtolower((string)pathinfo((string)$entry['name'], PATHINFO_EXTENSION));
-    if (!in_array($ext, THUMBNAIL_VIDEO_EXTENSIONS, true)) return $entry;
+    if (!ThumbnailService::isVideo((string)$entry['name'])) return $entry;
     // The row already says when the file changed. Asking the disk again cost a
     // stat per video, which on FUSE storage is what a cached listing saves.
     // (A file stamped exactly 0 reads as "now" in a row, so its frame goes
     // unflagged and is fetched once more -- a round trip, not a wrong answer.)
     $modified = strtotime((string)($entry['modified'] ?? ''));
-    $cache = thumbnail_cache_path($root.$entry['path'], $modified === false ? null : $modified);
-    $entry['hasThumbnail'] = $cache !== null && is_file($cache);
+    $entry['hasThumbnail'] = thumbs()->hasFrame($root.$entry['path'], $modified === false ? null : $modified);
     return $entry;
 }
 
-const THUMBNAIL_VIDEO_EXTENSIONS = ['mp4', 'webm', 'ogv', 'ogg', 'mov', 'm4v', 'avi', 'mkv', 'mpeg', 'mpg', '3gp', '3g2', 'ts', 'm2ts', 'mts'];
 /** Already-compressed formats, which a ZIP stores rather than deflates again. */
 const ZIP_STORED_EXTENSIONS = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'avif', 'heic', 'heif',
     'mp4', 'm4v', 'mov', 'mkv', 'webm', 'avi', '3gp', '3g2', 'mpeg', 'mpg', 'ogv',
@@ -325,29 +321,40 @@ const ZIP_STORED_EXTENSIONS = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'avif', 'hei
 /**
  * Send a cached thumbnail, answering conditional requests with 304.
  *
- * The URL carries the file's modification time, so a cached entry is
- * immutable for its URL and can be held for a year. The ETag still matters
- * for a reload, where the browser revalidates regardless.
+ * The URL carries the file's modification time and size and the thumbnail
+ * format, so a cached entry is immutable for its URL and can be held for a
+ * year. The ETag still matters for a reload, where the browser revalidates
+ * regardless.
  */
 function send_thumbnail(string $cache): never {
-    $etag = '"'.substr(basename($cache, '.webp'), 0, 32).'"';
-    header('Content-Type: image/webp');
-    header('Cache-Control: private,max-age=31536000,immutable');
-    header('X-Content-Type-Options: nosniff');
-    header('ETag: '.$etag);
-
-    $seen = trim((string)($_SERVER['HTTP_IF_NONE_MATCH'] ?? ''));
-    if ($seen !== '' && (str_contains($seen, $etag) || $seen === '*')) {
-        http_response_code(304);
-        exit;
-    }
-
+    clearstatcache(true, $cache);
+    send_thumbnail_headers('"'.md5($cache.':'.(int)@filemtime($cache).':'.(int)@filesize($cache).':'.ThumbnailService::FORMAT).'"');
     // filesize() returns false on failure, which interpolates to an empty
     // Content-Length header rather than a number.
     $cachedSize = @filesize($cache);
     if ($cachedSize !== false)header('Content-Length: '.$cachedSize);
     readfile($cache);
     exit;
+}
+
+/** The same for a thumbnail made fresh and not kept -- see ThumbnailService::canKeep(). */
+function send_thumbnail_bytes(string $bytes): never {
+    send_thumbnail_headers('"'.md5($bytes).'"');
+    header('Content-Length: '.strlen($bytes));
+    echo $bytes;
+    exit;
+}
+
+function send_thumbnail_headers(string $etag): void {
+    header('Content-Type: image/webp');
+    header('Cache-Control: private,max-age=31536000,immutable');
+    header('X-Content-Type-Options: nosniff');
+    header('ETag: '.$etag);
+    $seen = trim((string)($_SERVER['HTTP_IF_NONE_MATCH'] ?? ''));
+    if ($seen !== '' && (str_contains($seen, $etag) || $seen === '*')) {
+        http_response_code(304);
+        exit;
+    }
 }
 
 function api_try(callable $fn): never {
@@ -931,6 +938,8 @@ if ($isProtectedApi && $method !== 'OPTIONS') {
      * /api/storage/me refused to hand every account when it declined to honour
      * ?refresh. Reading the last result is a GET and needs only read, so a
      * viewer can see what a scan found without being able to start one.
+     * POST /api/thumbnails/scan stays off it for the same reason: a slice
+     * walks the store and decodes photos.
      */
     $writeExemptPost = ['/api/files/download-zip', '/api/thumbnail/video', '/api/users/me/password', '/api/favorites', '/api/users/me/two-factor/start', '/api/users/me/two-factor/resend', '/api/users/me/two-factor/confirm', '/api/users/me/two-factor/cancel'];
     /*
@@ -968,13 +977,14 @@ if ($isProtectedApi && $method !== 'OPTIONS') {
  * Registered after the guard, so a request turned away for want of a session,
  * a CSRF token or the write capability retires nothing. The exempt routes
  * cannot change a listed file: signing in and out, upload staging (the file
- * appears only at /complete, which is not exempt), video frames, which are
- * kept outside the store, bulk download, a password, and the duplicate scan's
- * own progress. Being wrong in the other direction only costs a cache miss.
+ * appears only at /complete, which is not exempt), video frames and the
+ * thumbnail scan, which write only outside the store, bulk download, a
+ * password, and the duplicate scan's own progress. Being wrong in the other
+ * direction only costs a cache miss.
  */
 $cacheNeutralWrites = ['/api/auth/login', '/api/auth/logout', '/api/uploads/init', '/api/uploads/chunk',
     '/api/uploads/cancel', '/api/uploads/cleanup', '/api/thumbnail/video', '/api/files/download-zip',
-    '/api/users/me/password', '/api/duplicates/scan'];
+    '/api/users/me/password', '/api/duplicates/scan', '/api/thumbnails/scan'];
 // Queueing, cancelling or removing a task changes nothing a listing shows.
 // A task that writes to the store retires the generation itself when it
 // finishes (Worker::execute()), which is the moment its changes are there.
@@ -997,7 +1007,14 @@ if ($path === '/api/files/config') Http::json([
     // has the feature at all.
     'duplicateMinBytes' => $config['duplicate_min_bytes'],
     'duplicateScanSeconds' => $config['duplicate_scan_seconds'],
-    'duplicateMaxFiles' => $config['duplicate_max_files']
+    'duplicateMaxFiles' => $config['duplicate_max_files'],
+    // The thumbnail format, which goes in every thumbnail URL so a cache that
+    // holds one for a year asks again when it changes -- and, by being here,
+    // that this server keeps thumbnails and can make them ahead of time. The
+    // Android app (Cloudhub-2, 5.0 and later) reads both: without them it
+    // neither runs the scan nor offers to.
+    'thumbnailFormat' => ThumbnailService::FORMAT,
+    'thumbnailScanSeconds' => ThumbnailScan::SLICE_SECONDS,
 ]);
 if ($path === '/api/files/list' && $method === 'GET') api_try(function()use($fs) {
     release_session_lock();
@@ -1081,6 +1098,7 @@ if ($path === '/api/files/delete' && $method === 'DELETE') api_try(function()use
             ledger()->forget($rel);
             shares_forget($rel);
             favorites()->forget($rel);
+            thumbs()->removed($rel);
             AuditLog::write(db(), 'file.delete', 'success', ['path' => $rel, 'job' => $job['id']]);
             Http::json(['success' => true, 'trashed' => false, 'queued' => true, 'job' => $job, 'message' => 'Deleting in the background'], 202);
         }
@@ -1088,6 +1106,7 @@ if ($path === '/api/files/delete' && $method === 'DELETE') api_try(function()use
         ledger()->forget($rel);
         shares_forget($rel);
         favorites()->forget($rel);
+        thumbs()->removed($rel);
         AuditLog::write(db(), 'file.delete', 'success', ['path' => $rel]);
         return ['success' => true, 'trashed' => false, 'message' => 'Deleted permanently'];
     }
@@ -1100,6 +1119,9 @@ if ($path === '/api/files/delete' && $method === 'DELETE') api_try(function()use
     ledger()->forget($meta['originalPath']);
     shares_forget($meta['originalPath']);
     favorites()->forget($meta['originalPath']);
+    // Made again if it is ever restored: a thumbnail is not worth keeping
+    // for something in the trash, and the trash holds no mirror of its own.
+    thumbs()->removed($meta['originalPath']);
     purge_expired_trash_occasionally($fs, (int)$config['trash_retention_days']);
     AuditLog::write(db(), 'file.trash', 'success', ['path' => $meta['originalPath'], 'id' => $meta['id']]);
     return ['success' => true, 'trashed' => true, 'id' => $meta['id'], 'message' => 'Moved to trash'];
@@ -1157,11 +1179,14 @@ $relocate = function(callable $apply, string $verb)use($fs, $config): array {
                 ledger()->relocate($fs->relative($source), $fs->relative($target));
                 shares_relocate($fs->relative($source), $fs->relative($target));
                 favorites()->relocate($fs->relative($source), $fs->relative($target));
+                thumbs()->moved($fs->relative($source), $fs->relative($target));
             } else {
                 foreach ($fs->copiedFiles($target) as $copied) {
                     ledger()->record($fs->relative($copied), basename($copied),
                         (int)(filesize($copied)?:0), null, Auth::user()['id'] ?? null);
                 }
+                // The same picture, so the same thumbnail rather than a decode.
+                thumbs()->copied($fs->relative($source), $fs->relative($target));
             }
             $done++;
         }catch(RuntimeException $e) {
@@ -1375,6 +1400,41 @@ if ($path === '/api/duplicates/scan' && $method === 'DELETE') api_try(function()
     duplicates()->reset();
     return ['success' => true];
 });
+/**
+* Thumbnails for what is already in the store, made ahead of anyone looking.
+*
+* The same shape as the duplicate scan: POST to start or carry on -- again
+* while `done` is false -- and GET to read how far it has got, doing no work.
+* Starting or continuing needs write access, as the guard above enforces for
+* POST: it walks the store and decodes photos. A finished scan stands for a
+* day, so a client may ask on every start and usually cost nothing;
+* `restart` begins one regardless. The Android app (Cloudhub-2, 5.0 and
+* later) keeps it going in the background for accounts that may write. See
+* ThumbnailScan, and tools/thumbnails.php for the command line.
+*
+* It needs no task of its own: a slice is bounded, its place is kept on disk,
+* and its lock -- shared with the command line -- turns a second caller away
+* as `busy` rather than letting two slices overlap. The Tasks page's "Make
+* thumbnails" (ThumbnailsJob) can run beside it; a thumbnail is made under
+* its own lock, so a photo is decoded once whoever gets there first.
+*/
+if ($path === '/api/thumbnails/scan') {
+    $thumbnailScan = fn(): ThumbnailScan => new ThumbnailScan($fs, thumbs(), dirname(__DIR__).'/storage/.cache');
+
+    if ($method === 'GET') api_try(function()use($thumbnailScan) {
+        release_session_lock();
+        return $thumbnailScan()->progress();
+    });
+
+    if ($method === 'POST') api_try(function()use($thumbnailScan) {
+        // A slice reads and writes for seconds; nothing in it touches the
+        // session, so the account's other requests are not held behind it.
+        release_session_lock();
+        $body = Http::body();
+        @set_time_limit(ThumbnailScan::SLICE_SECONDS + 60);
+        return $thumbnailScan()->run(ThumbnailScan::SLICE_SECONDS, !empty($body['restart']));
+    });
+}
 /**
 * Background tasks: long file operations a worker runs while nobody waits.
 *
@@ -1616,6 +1676,9 @@ if ($path === '/api/trash/restore' && $method === 'POST') api_try(function()use(
     ledger()->reattribute($restored['attribution'], $restored['originalPath'], $restored['path']);
     ledger()->sweep($fs);
     favorites()->reinstate($restored['favorites'], $restored['originalPath'], $restored['path']);
+    // A restored photo gets its thumbnail back straight away; a restored
+    // folder's are made as they are looked at, or by the next scan.
+    if (is_file($fs->root().$restored['path']))thumbs()->afterReply([$fs->root().$restored['path']]);
     AuditLog::write(db(), 'file.restore', 'success', ['path' => $restored['path']]);
     return ['success' => true, 'path' => $restored['path'],
         'message' => $restored['renamed']
@@ -1671,9 +1734,11 @@ if ($path === '/api/files/rename' && $method === 'POST') api_try(function()use($
     if (!rename($a, $z))throw new RuntimeException('Rename failed', 500);
     $to = $fs->relative($z);
     ledger()->relocate($from, $to);
-    // A shared file keeps its link when it is renamed, and a starred one its star.
+    // A shared file keeps its link when it is renamed, a starred one its star,
+    // and a photo its thumbnail.
     shares_relocate($from, $to);
     favorites()->relocate($from, $to);
+    thumbs()->moved($from, $to);
     return ['success' => true, 'path' => $to, 'name' => basename($z),
         'message' => basename($z) === basename((string)($b['newPath']??''))
             ? 'Renamed successfully'
@@ -1729,6 +1794,9 @@ if ($path === '/api/uploads/complete' && $method === 'POST') api_try(function()u
     ledger()->record((string)$done['path'], (string)$done['name'],
         is_file($full)?(int)(filesize($full)?:0):0, is_file($full)?mime_type($full):null,
         Auth::user()['id'] ?? null);
+    // Its thumbnail, made once the reply has gone. Whatever happens to that,
+    // the upload has already succeeded: see ThumbnailService::afterReply().
+    thumbs()->afterReply([$full]);
     return $done;
 });
 if ($path === '/api/uploads/cancel' && $method === 'DELETE') api_try(function() {
@@ -1827,6 +1895,9 @@ if ($path === '/api/files/upload' && $method === 'POST') api_try(function()use($
             }
             if (!move_uploaded_file((string)$tmp[$i], $dest)) throw new RuntimeException('Unable to save '.$safe, 500);
             ledger()->record($fs->relative($dest), basename($dest), $size, null, Auth::user()['id'] ?? null);
+            // Its thumbnail once the reply has gone -- asked for file by file,
+            // so the ones saved before a later file is refused still get theirs.
+            thumbs()->afterReply([$dest]);
             $saved[] = basename($dest);
         }
         return ['success' => true,
@@ -2098,31 +2169,46 @@ if ($path === '/api/files/upload' && $method === 'POST') api_try(function()use($
 
         $f = $fs->existing((string)($_GET['path'] ?? ''));
         if (!is_file($f))throw new RuntimeException('File not found', 404);
+        $thumbs = thumbs();
 
-        $ext = strtolower(pathinfo($f, PATHINFO_EXTENSION));
-        $cache = thumbnail_cache_path($f);
-        if ($cache === null)throw new RuntimeException('Unable to prepare the thumbnail cache', 500);
+        // A current thumbnail is served the same way whatever produced it, so
+        // a video whose frame a client has already contributed costs no more
+        // than a photo -- two stats and a look at its header, which turns a
+        // thumbnail a crash left empty or short into one made again.
+        $cache = $thumbs->current($f, true);
+        if ($cache !== null)send_thumbnail($cache);
 
-        // A cached entry is served the same way whatever produced it, so a
-        // video whose frame the browser has already contributed costs no more
-        // than a photo.
-        if (is_file($cache))send_thumbnail($cache);
-
-        if (in_array($ext, THUMBNAIL_VIDEO_EXTENSIONS, true)) {
+        if (ThumbnailService::isVideo($f)) {
+            // A frame contributed before thumbnails were kept in a mirror of
+            // the store is brought across the first time it is asked for.
+            if ($thumbs->adoptFrame($f) && ($cache = $thumbs->current($f, true)) !== null)send_thumbnail($cache);
             // Nothing has contributed a frame for this video yet. That is an
             // ordinary state, not a broken request: the file listing carries a
-            // hasThumbnail flag so the browser knows to decode one instead of
+            // hasThumbnail flag so the client knows to decode one instead of
             // asking for it, and only reaches here if the cache entry vanished
             // in between.
             throw new RuntimeException('No thumbnail has been generated for this video yet', 404);
         }
 
-        // Decoded, scaled, turned upright and stored by ImageThumbnailer, which
-        // the background thumbnail job shares -- with the same guards, codes
-        // and messages this route always answered with.
-        ImageThumbnailer::generate($f, $cache);
-
-        send_thumbnail($cache);
+        // Made, kept and sent -- or, for the one name the mirror cannot hold,
+        // made and sent. ensure() measures the header before it decodes, and
+        // answers a file it already knows is unreadable without reading it.
+        // The background thumbnail job and the scan make theirs the same way,
+        // so this finds them already made.
+        if (ThumbnailService::isImage($f) && !$thumbs->canKeep($f))send_thumbnail_bytes($thumbs->renderUncached($f));
+        try {
+            $kept = $thumbs->ensure($f, true)['path'];
+        } catch (RuntimeException $e) {
+            // Made but not kept: a full disk, or storage that will not take a
+            // file's time -- which is how a kept thumbnail is matched to its
+            // photo, and which Android shared storage has been known to refuse.
+            // The gallery is answered all the same, with one made afresh, where
+            // the old flat cache answered 500; /api/system/storage says which.
+            if ($e->getCode() !== 500)throw $e;
+            error_log('['.Http::requestId().'] [thumbnails] '.$fs->relative($f).' was not kept: '.$e->getMessage());
+            send_thumbnail_bytes($thumbs->renderUncached($f));
+        }
+        send_thumbnail($kept);
     });
 
     /**
@@ -2143,13 +2229,10 @@ if ($path === '/api/files/upload' && $method === 'POST') api_try(function()use($
 
         $f = $fs->existing($rel);
         if (!is_file($f))throw new RuntimeException('File not found', 404);
-        if (!in_array(strtolower(pathinfo($f, PATHINFO_EXTENSION)), THUMBNAIL_VIDEO_EXTENSIONS, true)) {
+        if (!ThumbnailService::isVideo($f)) {
             throw new RuntimeException('Only video files take a browser-generated thumbnail', 400);
         }
-
-        $cache = thumbnail_cache_path($f);
-        if ($cache === null)throw new RuntimeException('Unable to prepare the thumbnail cache', 500);
-        if (is_file($cache))return ['success' => true, 'stored' => false];
+        if (thumbs()->current($f, true) !== null)return ['success' => true, 'stored' => false];
 
         $image = Http::string($b, 'image', 32, 400000);
         if (preg_match('#^data:image/(webp|jpeg|png);base64,#i', $image, $m)) {
@@ -2184,9 +2267,9 @@ if ($path === '/api/files/upload' && $method === 'POST') api_try(function()use($
             if (!$encoded || $raw === '')throw new RuntimeException('Unable to convert the thumbnail', 500);
         }
 
-        $tmp = $cache.'.'.bin2hex(random_bytes(4)).'.tmp';
-        if (@file_put_contents($tmp, $raw) !== strlen($raw) || !@rename($tmp, $cache)) {
-            @unlink($tmp);
+        // Written through a temporary file and renamed into place, stamped
+        // with the video's own time: see ThumbnailService::put().
+        if (!thumbs()->storeFrame($f, $raw)) {
             throw new RuntimeException('Unable to store the video thumbnail', 500);
         }
 
@@ -2394,20 +2477,25 @@ if ($path === '/api/files/upload' && $method === 'POST') api_try(function()use($
             'attribution' => fn(string $rel): array => ledger()->rowsUnder($rel),
             'favorites' => fn(string $rel): array => favorites()->rowsUnder($rel),
             'fits' => function(int $bytes) use ($fs, $config): void { assert_upload_fits($fs, $config, $bytes); },
-            'stored' => function(string $rel, int $bytes): void {
+            'stored' => function(string $rel, int $bytes) use ($fs): void {
                 ledger()->record($rel, basename($rel), $bytes, null, Auth::user()['id'] ?? null);
+                // A WebDAV client often writes a file empty and fills it a
+                // moment later; afterReply() drops what the first write left.
+                thumbs()->afterReply([$fs->root().$rel]);
                 AuditLog::write(db(), 'file.webdav.put', 'success', ['path' => $rel, 'bytes' => $bytes]);
             },
             'removed' => function(string $rel): void {
                 ledger()->forget($rel);
                 shares_forget($rel);
                 favorites()->forget($rel);
+                thumbs()->removed($rel);
                 AuditLog::write(db(), 'file.webdav.delete', 'success', ['path' => $rel]);
             },
             'moved' => function(string $from, string $to): void {
                 ledger()->relocate($from, $to);
                 shares_relocate($from, $to);
                 favorites()->relocate($from, $to);
+                thumbs()->moved($from, $to);
                 AuditLog::write(db(), 'file.webdav.move', 'success', ['from' => $from, 'to' => $to]);
             },
         ]);

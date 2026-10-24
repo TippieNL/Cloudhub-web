@@ -19,6 +19,8 @@ declare(strict_types=1);
 $root = dirname(__DIR__);
 $index = (string)file_get_contents($root.'/public/index.php');
 $app = (string)file_get_contents($root.'/public/assets/js/app.js');
+// The thumbnails themselves moved into a service of their own; see phase 56.
+$service = (string)file_get_contents($root.'/src/Services/ThumbnailService.php');
 
 $checks = [];
 
@@ -47,14 +49,21 @@ $checks['mutating routes keep their session lock'] =
     !preg_match('/api\/files\/(?:delete|rename|mkdir)[^;]{0,200}release_session_lock/s', $index);
 
 // --- 2. cached video thumbnails ------------------------------------------
-$checks['thumbnails share one cache-path helper'] = str_contains($index, 'function thumbnail_cache_path(string $file, ?int $mtime = null): ?string');
+// One place decides where every thumbnail lives -- photos', and the frames
+// clients contribute for videos -- so the two can never disagree.
+$checks['thumbnails share one cache-path helper'] =
+    str_contains($index, 'function thumbs(): ThumbnailService {')
+    && str_contains($service, 'public function pathFor(string $relative): ?string')
+    && !str_contains($index, 'function thumbnail_cache_path(');
 // A listing row already carries the file's time, so flagging a video costs no
 // second stat -- on FUSE storage that is what a cached listing saves.
 $checks['listing rows flag their frame from the time they carry'] =
     str_contains($index, "\$modified = strtotime((string)(\$entry['modified'] ?? ''));")
-    && str_contains($index, "thumbnail_cache_path(\$root.\$entry['path'], \$modified === false ? null : \$modified)");
+    && str_contains($index, "thumbs()->hasFrame(\$root.\$entry['path'], \$modified === false ? null : \$modified)")
+    && str_contains($service, 'public function hasFrame(string $file, ?int $mtime = null): bool')
+    && str_contains($service, '$mtime ??= @filemtime($file);');
 $checks['a cached entry is served whatever produced it'] =
-    (bool)preg_match('/if \(is_file\(\$cache\)\)send_thumbnail\(\$cache\);/', $index);
+    str_contains($index, "\$cache = \$thumbs->current(\$f, true);\n        if (\$cache !== null)send_thumbnail(\$cache);");
 $checks['browsers can contribute a video frame'] = str_contains($index, "\$path === '/api/thumbnail/video' && \$method === 'POST'");
 $checks['contributed frames are validated as images'] =
     str_contains($index, 'getimagesizefromstring($raw)') && str_contains($index, 'IMAGETYPE_WEBP');
@@ -71,20 +80,23 @@ $checks['the client tries the server cache first'] = str_contains($app, 'functio
 // to answer 415, so every uncached video logged a failed request and a console
 // error on first load. The listing now says which videos have one.
 $checks['the listing reports which videos have a cached frame'] =
-    str_contains($index, "\$entry['hasThumbnail'] = \$cache !== null && is_file(\$cache);");
+    str_contains($index, "\$entry['hasThumbnail'] = thumbs()->hasFrame(");
 $checks['the client only asks when a frame exists'] =
     str_contains($app, "button.dataset.hasThumb === '1'") && str_contains($app, 'data-has-thumb=');
 $checks['an uncached video reports 404, not 415'] =
     str_contains($index, "'No thumbnail has been generated for this video yet', 404")
     && !str_contains($index, 'use the media stream endpoint');
 // const is not hoisted: a route that runs and exits earlier in the file would
-// never reach a definition placed further down.
+// never reach a definition placed further down. The extension lists are class
+// constants now, autoloaded wherever they are first used, so only the
+// helpers' position is left to hold.
 $checks['thumbnail helpers are defined before any route uses them'] = (function () use ($index): bool {
-    $const = strpos($index, 'const THUMBNAIL_VIDEO_EXTENSIONS');
-    $helper = strpos($index, 'function thumbnail_cache_path');
+    $helper = strpos($index, 'function thumbs(): ThumbnailService');
+    $send = strpos($index, 'function send_thumbnail(string $cache): never');
     $firstRoute = strpos($index, "if (\$path === '/api/auth/login'");
-    return $const !== false && $helper !== false && $firstRoute !== false
-        && $const < $firstRoute && $helper < $firstRoute;
+    return $helper !== false && $send !== false && $firstRoute !== false
+        && $helper < $firstRoute && $send < $firstRoute
+        && !str_contains($index, 'const THUMBNAIL_VIDEO_EXTENSIONS');
 })();
 
 // --- 3. caching and re-render --------------------------------------------
@@ -93,7 +105,9 @@ $checks['thumbnails are cached for a year, immutable'] =
 $checks['thumbnails answer conditional requests'] =
     str_contains($index, 'HTTP_IF_NONE_MATCH') && str_contains($index, 'http_response_code(304)');
 $checks['thumbnails are written atomically'] =
-    str_contains($index, "\$tmp = \$cache.'.'.bin2hex(random_bytes(4)).'.tmp'");
+    str_contains($service, "\$tmp = self::temporary(\$thumb);")
+    && str_contains($service, "return \$path.'.'.bin2hex(random_bytes(4)).'.tmp';")
+    && str_contains($service, "!@rename(\$tmp, \$thumb)");
 $checks['decoded frames survive a re-render'] =
     str_contains($app, 'const videoThumbCache = new Map()') && !str_contains($app, 'cleanupVideoThumbnailUrls');
 $checks['only frames for vanished files are released'] = str_contains($app, 'releaseStaleVideoThumbs(new Set(');
