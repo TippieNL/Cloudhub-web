@@ -36,6 +36,8 @@ final class NoLockFs56
 {
     public $context;
     public static string $realBase = '';
+    /** False plays storage that will not set a file's time, which some Android storage refuses. */
+    public static bool $keepsTimes = true;
     private $fh = null;
     private $dh = null;
 
@@ -64,7 +66,9 @@ final class NoLockFs56
     public function dir_closedir() { closedir($this->dh); return true; }
     public function stream_metadata($path, $option, $value)
     {
-        return $option === STREAM_META_TOUCH && @touch(self::real($path), ...array_filter((array)$value, 'is_int'));
+        $times = array_filter((array)$value, 'is_int');
+        if ($times && !self::$keepsTimes) return false;
+        return $option === STREAM_META_TOUCH && @touch(self::real($path), ...$times);
     }
 }
 stream_wrapper_register('nolock56', 'NoLockFs56');
@@ -483,6 +487,38 @@ $checks['thumbnails are made and kept where locks fail'] = $keptThere['status'] 
     && $lockThumbs->current($store.'/Photos/icon.png', true) === 'nolock56://thumbs/files/Photos/icon.png.webp'
     && $lockThumbs->ensure($store.'/Photos/icon.png', true)['status'] === ThumbnailService::VALID;
 
+/* --- storage that cannot keep a thumbnail ------------------------------------------------- */
+
+// A kept thumbnail is matched to its photo by the time set on it. Where that
+// cannot be set -- or there is no room, or nowhere to write -- none can be
+// kept: that is the server's storage, not the photo, and saying so is the fix.
+NoLockFs56::$keepsTimes = false;
+$timeless = new ThumbnailService($fs, 'nolock56://timeless');
+$refusal = null;
+try { $timeless->ensure($store.'/Photos/beach.jpg'); } catch (RuntimeException $e) { $refusal = $e; }
+$checks['a thumbnail that cannot be kept says so, and why'] = $refusal?->getCode() === ThumbnailService::CANNOT_KEEP
+    && str_contains($refusal->getMessage(), 'modification time') && $timeless->current($store.'/Photos/beach.jpg') === null;
+$leftovers = glob($base.'/nolock/timeless/files/Photos/*') ?: [];
+$checks['and leaves nothing half-written behind'] = $leftovers === [];
+$checks['nor marks the photo as unreadable'] = $timeless->knownFailure($store.'/Photos/beach.jpg') === null;
+
+$stuckScan = new ThumbnailScan($fs, $timeless, $base.'/cache-timeless');
+$stops = [];
+for ($i = 0; $i < 2; $i++) {
+    try { $stuckScan->run(30.0, $i === 0); $stops[] = null; } catch (RuntimeException $e) { $stops[] = $e; }
+}
+// It used to count every photo as "could not be read", which the app shows
+// as the photos' fault. Now the slice stops with the reason, which the API
+// passes through and the app shows as "Stopped: ...".
+$checks['the scan stops at it with the reason, not "unreadable" for every photo'] =
+    ($stops[0] ?? null)?->getCode() === ThumbnailService::CANNOT_KEEP && str_contains($stops[0]->getMessage(), 'modification time');
+$checks['and gives the scan back, so asking again is told the same rather than busy'] =
+    ($stops[1] ?? null)?->getCode() === ThumbnailService::CANNOT_KEEP;
+NoLockFs56::$keepsTimes = true;
+$recovered = $stuckScan->run(30.0);
+$checks['once storage keeps times again, the scan carries on to done'] = $recovered['done'] && $recovered['busy'] === false
+    && $timeless->current($store.'/Photos/beach.jpg', true) !== null;
+
 /* --- and the originals ------------------------------------------------------------------- */
 
 $untouched = true;
@@ -514,7 +550,7 @@ $checks['the gallery route serves, makes, or makes without keeping'] =
 // -- is still a thumbnail for the gallery, and the storage report says why.
 $checks['a thumbnail that cannot be kept is still served'] =
     str_contains($index, "\$kept = \$thumbs->ensure(\$f, true)['path'];")
-    && str_contains($index, "if (\$e->getCode() !== 500)throw \$e;")
+    && str_contains($index, "if (\$e->getCode() !== ThumbnailService::CANNOT_KEEP)throw \$e;")
     && substr_count($index, 'send_thumbnail_bytes($thumbs->renderUncached($f));') === 2
     && str_contains($read('src/Services/StorageDiagnostics.php'), "\$row['keepsTimes'] = \$touched && @filemtime(\$probe) === 1_000_000_000;");
 $checks['and brings a frame across from the first layout'] =
@@ -548,6 +584,8 @@ $checks['the background job makes the thumbnails the route serves'] =
     && str_contains($jobs('ThumbnailsJob'), "\$thumbs->ensure(\$full, true)['status'] === ThumbnailService::GENERATED")
     && str_contains($jobs('JobEnvironment'), "new ThumbnailService(\$this->files, \$this->projectDir.'/storage/.thumbnails')")
     && str_contains($index, "new ThumbnailService(\$fs, dirname(__DIR__).'/storage/.thumbnails')");
+$checks['a task that cannot keep thumbnails fails, saying why'] =
+    str_contains($jobs('ThumbnailsJob'), 'if (in_array((int)$e->getCode(), [503, ThumbnailService::CANNOT_KEEP], true)) throw $e;');
 $checks['and a background copy carries them'] =
     substr_count($jobs('CopyJob'), 'self::carryThumbnails(') === 2
     && str_contains($jobs('CopyJob'), '$ctx->env()->thumbnails()->copied($from, $to, static fn() => $ctx->checkpoint());');

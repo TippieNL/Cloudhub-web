@@ -196,7 +196,11 @@ as chunked uploads found; see **v10.2 Android shared-storage compatibility**),
 it holds it with a claim file instead, which lapses
 two minutes after its slice should have ended if that slice dies. Taking the
 missing lock for someone else's used to make every slice answer busy there, so
-the scan never ran and the app's **Check now** came to nothing. A
+the scan never ran and the app's **Check now** came to nothing. A photo whose
+thumbnail cannot be kept at all — no room, nowhere to write, or storage that
+will not set a file's time — stops the slice with the reason (`507`), which the
+app shows as "Stopped: … · tries again later"; it used to count every photo as
+unreadable, which blamed the photos for the server's storage. A
 finished scan stands for a day, and asking again within it costs nothing.
 Begun again, a scan makes nothing that is already current, so it is safe to
 run as often as you like.

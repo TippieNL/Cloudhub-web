@@ -86,6 +86,12 @@ final class ThumbnailService
     public const GENERATED = 'generated';
     public const ADOPTED = 'adopted';
 
+    /**
+     * The status of a thumbnail made but not kept: the server's storage, not
+     * the photo -- see put(). 507, whose message the API passes through.
+     */
+    public const CANNOT_KEEP = 507;
+
     /** The suffix of the marker that says a thumbnail could not be made. */
     private const FAILED = '.failed';
 
@@ -309,6 +315,7 @@ final class ThumbnailService
      * the failures that are the file's own (not an image, too large to decode)
      * so the next caller is answered without decoding it again. Failures that
      * are the server's (no GD, a full disk) are not recorded: they can pass.
+     * One made but not kept is CANNOT_KEEP, saying why (see put()).
      *
      * @return array{status:string,path:string}
      */
@@ -346,9 +353,8 @@ final class ThumbnailService
                 $this->remember($thumb, $mtime, $status, $message);
                 throw new RuntimeException($message, $status);
             });
-            if (!$this->put($thumb, $bytes, $mtime)) {
-                throw new RuntimeException('Failed to store image thumbnail', 500);
-            }
+            $why = $this->put($thumb, $bytes, $mtime);
+            if ($why !== null) throw new RuntimeException($why, self::CANNOT_KEEP);
             @unlink($thumb.self::FAILED);
             return ['status' => self::GENERATED, 'path' => $thumb];
         });
@@ -476,7 +482,7 @@ final class ThumbnailService
         $length = self::riffLength($webp);
         if ($thumb === null || $mtime === false || $length === null || $length > strlen($webp)) return false;
         $webp = substr($webp, 0, $length);
-        return $this->locked($thumb, fn(): bool => $this->put($thumb, $webp, $mtime));
+        return $this->locked($thumb, fn(): bool => $this->put($thumb, $webp, $mtime) === null);
     }
 
     /**
@@ -555,7 +561,7 @@ final class ThumbnailService
             if ($thumb === null || $mtime === false || $dest === null) continue;
             $this->locked($dest, function () use ($thumb, $dest, $mtime): bool {
                 $bytes = @file_get_contents($thumb);
-                return is_string($bytes) && $this->put($dest, $bytes, $mtime);
+                return is_string($bytes) && $this->put($dest, $bytes, $mtime) === null;
             });
         }
     }
@@ -658,18 +664,28 @@ final class ThumbnailService
      * Write through a temporary file stamped with the original's time, then
      * rename: a reader sees the old thumbnail or the new one, never half of
      * one, and never a new one with the old time.
+     *
+     * Returns null once it is in place, or why it could not be kept -- in
+     * words for whoever reads the scan's report, since each is the server's
+     * storage rather than the photo: nowhere to write, no room, or storage
+     * that will not set a file's time, which is how a thumbnail is matched to
+     * its photo (see current()).
      */
-    private function put(string $thumb, string $bytes, int $mtime): bool
+    private function put(string $thumb, string $bytes, int $mtime): ?string
     {
-        if (!$this->prepareDir(dirname($thumb))) return false;
-        if (is_dir($thumb)) return false;
+        $unwritable = 'Thumbnails cannot be written where this server keeps them';
+        if (!$this->prepareDir(dirname($thumb))) return $unwritable;
+        if (is_dir($thumb)) return 'A folder stands where this photo\'s thumbnail belongs';
         $tmp = self::temporary($thumb);
-        if (@file_put_contents($tmp, $bytes) !== strlen($bytes) || !@touch($tmp, $mtime) || !@rename($tmp, $thumb)) {
-            @unlink($tmp);
-            return false;
-        }
+        $written = @file_put_contents($tmp, $bytes);
+        if ($written === false) $why = $unwritable;
+        elseif ($written !== strlen($bytes)) $why = 'There is no room left to keep thumbnails';
+        elseif (!@touch($tmp, $mtime)) $why = 'This server\'s storage cannot set a file\'s modification time, which a kept thumbnail needs';
+        elseif (!@rename($tmp, $thumb)) $why = $unwritable;
+        else $why = null;
+        if ($why !== null) @unlink($tmp);
         clearstatcache(true, $thumb);
-        return true;
+        return $why;
     }
 
     /** A name beside $path to write it under first. See TEMP_SUFFIX_LENGTH. */

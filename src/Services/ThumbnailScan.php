@@ -277,6 +277,12 @@ final class ThumbnailScan
      * the service has recorded them, so they are not decoded again until they
      * change. What this server cannot do (no GD, no AVIF) is skipped rather
      * than blamed on the file, and a fault of the server's is logged.
+     *
+     * A thumbnail that cannot be kept at all stops the slice, saying why: no
+     * room, nowhere to write, or storage that will not set a file's time. That
+     * is the server's storage, and the next photo would fail the same way --
+     * counting each as unreadable told the app's Settings that every photo was
+     * damaged. The thumbnails made before it stay made.
      */
     private function one(string $file): string
     {
@@ -291,6 +297,7 @@ final class ThumbnailScan
         try {
             return $this->thumbs->ensure($file, true)['status'] === ThumbnailService::GENERATED ? 'generated' : 'valid';
         } catch (RuntimeException $e) {
+            if ($e->getCode() === ThumbnailService::CANNOT_KEEP) throw $e;
             if (in_array($e->getCode(), [415, 422], true)) return 'failed';
             error_log('[thumbnails] '.$this->fs->relative($file).': '.$e->getMessage());
             return 'failed';

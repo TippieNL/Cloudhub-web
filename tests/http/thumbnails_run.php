@@ -324,6 +324,11 @@ scenario('a thumbnail that cannot be kept is still served', function () use ($cl
         check('that was not kept', !is_file($thumbOf($scratch.'/stuck/second.jpg')));
         check('cacheable like any other, as it is right for its URL',
             str_contains((string)$served->header('Cache-Control'), 'immutable'), (string)$served->header('Cache-Control'));
+        // The scan stops there and says why -- the app shows "Stopped: ..." --
+        // rather than counting the photo, and every one after it, unreadable.
+        $scan = $client->post('/api/thumbnails/scan', ['restart' => true]);
+        check('the scan stops at it, saying why', $scan->status === 507
+            && str_contains((string)($scan->json['error']['message'] ?? ''), 'cannot be written'), $scan->describe());
     } finally {
         exec('chattr -i '.escapeshellarg($dir));
     }
