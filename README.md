@@ -189,7 +189,14 @@ It runs in slices of about eight seconds, its place kept in
 `storage/.cache/thumbnail-scan.json`, so it needs no long-running process and
 no request runs long. Memory does not grow with the collection: the work list
 is read from disk, not held. One slice runs at a time; another caller is told
-the scan is busy, and a slice never holds up the account's other requests. A
+the scan is busy, and a slice never holds up the account's other requests. The
+slice holds the scan with an advisory lock where the filesystem has one; on
+Android's shared storage, which has none (`flock()` fails at once, every time,
+as chunked uploads found; see **v10.2 Android shared-storage compatibility**),
+it holds it with a claim file instead, which lapses
+two minutes after its slice should have ended if that slice dies. Taking the
+missing lock for someone else's used to make every slice answer busy there, so
+the scan never ran and the app's **Check now** came to nothing. A
 finished scan stands for a day, and asking again within it costs nothing.
 Begun again, a scan makes nothing that is already current, so it is safe to
 run as often as you like.

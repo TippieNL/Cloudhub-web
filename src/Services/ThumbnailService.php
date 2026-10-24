@@ -724,6 +724,13 @@ final class ThumbnailService
      * Run $work holding the lock for one thumbnail. Locks are a fixed set of
      * files picked by hash, rather than one per thumbnail, so there is nothing
      * to clean up and no lock file can be deleted while someone waits on it.
+     *
+     * Best effort, as UploadService's: where the filesystem has no advisory
+     * locks -- Android's shared storage -- flock() fails at once and the work
+     * runs unlocked. Each thumbnail is still written whole and renamed into
+     * place; what is lost there is a second decode when two ask at once, and
+     * the one race afterReply() closes with it -- a photo replaced within the
+     * second its old thumbnail was being made can keep that one.
      */
     private function locked(string $thumb, callable $work): mixed
     {
@@ -732,10 +739,10 @@ final class ThumbnailService
         $h = @fopen($dir.'/'.(crc32($thumb) % self::LOCK_SLOTS).'.lock', 'c');
         if ($h === false) return $work();
         try {
-            flock($h, LOCK_EX);
+            @flock($h, LOCK_EX);
             return $work();
         } finally {
-            flock($h, LOCK_UN);
+            @flock($h, LOCK_UN);
             fclose($h);
         }
     }

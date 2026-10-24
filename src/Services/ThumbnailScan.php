@@ -27,8 +27,8 @@ use RuntimeException;
  * Paths are written down URL-encoded, one to a line: a file name may hold any
  * byte but "/" and NUL, which JSON cannot carry and a newline would split.
  *
- * One scan at a time, whoever asks: a slice holds a lock, and a second caller
- * is told the scan is busy and shown how far it has got.
+ * One scan at a time, whoever asks: a slice holds the scan (see hold()), and a
+ * second caller is told the scan is busy and shown how far it has got.
  */
 final class ThumbnailScan
 {
@@ -41,11 +41,19 @@ final class ThumbnailScan
     /** A half-written thumbnail older than this belongs to a request that died. */
     private const STALE_TEMP_SECONDS = 3600;
 
+    /**
+     * How long a claim on the scan outlives the slice it was taken for. A
+     * slice can run past its own deadline by one photo's decode or one large
+     * folder's walk; a claim older than this belongs to a slice that died.
+     */
+    private const CLAIM_GRACE_SECONDS = 120;
+
     private const COUNTS = ['generated' => 0, 'valid' => 0, 'adopted' => 0, 'failed' => 0, 'skipped' => 0, 'removed' => 0];
 
     private string $stateFile;
     private string $listFile;
     private string $lockFile;
+    private string $claimFile;
 
     /** @param string $stateDir where the scan keeps its place, `storage/.cache` */
     public function __construct(private FileService $fs, private ThumbnailService $thumbs, string $stateDir)
@@ -55,6 +63,7 @@ final class ThumbnailScan
         $this->stateFile = $dir.'/thumbnail-scan.json';
         $this->listFile = $dir.'/thumbnail-scan.list';
         $this->lockFile = $dir.'/thumbnail-scan.lock';
+        $this->claimFile = $dir.'/thumbnail-scan.claim';
     }
 
     /** How far the last scan got, doing no work. */
@@ -73,12 +82,8 @@ final class ThumbnailScan
      */
     public function run(float $seconds, bool $restart = false): array
     {
-        $lock = @fopen($this->lockFile, 'c');
-        if ($lock === false) throw new RuntimeException('Unable to open the thumbnail scan', 500);
-        if (!flock($lock, LOCK_EX | LOCK_NB)) {
-            fclose($lock);
-            return $this->report($this->load(), true);
-        }
+        $held = $this->hold($seconds);
+        if ($held === null) return $this->report($this->load(), true);
         try {
             $state = $this->load();
             $stale = $state !== null && $state['phase'] === 'done'
@@ -97,9 +102,92 @@ final class ThumbnailScan
             $this->save($state);
             return $this->report($state, false);
         } finally {
-            flock($lock, LOCK_UN);
-            fclose($lock);
+            $this->release($held);
         }
+    }
+
+    /* ---- one slice at a time ------------------------------------------------ */
+
+    /**
+     * Take the scan for one slice of $seconds, or null when another holds it.
+     *
+     * An advisory lock where the filesystem has one, which goes with the
+     * process however the slice ends. Android's shared storage -- where a
+     * phone keeps storage/.cache -- has none: flock() fails at once, every
+     * time, which read as "another slice holds the scan", so every slice
+     * answered busy and the scan never ran. So a failed lock is only taken
+     * for another slice's when a file nobody else can know of locks; without
+     * advisory locks the scan is claimed instead (see claim()).
+     *
+     * @return array{0:string,1:mixed}|null
+     */
+    private function hold(float $seconds): ?array
+    {
+        $lock = @fopen($this->lockFile, 'c');
+        if ($lock === false) throw new RuntimeException('Unable to open the thumbnail scan', 500);
+        if (@flock($lock, LOCK_EX | LOCK_NB)) return ['lock', $lock];
+        fclose($lock);
+        return $this->locksWork() ? null : $this->claim($seconds);
+    }
+
+    /**
+     * Whether advisory locks work where the scan keeps its place: a new file
+     * of a name nobody else can know is locked, or the filesystem has none.
+     * Asked of the filesystem rather than read from flock()'s error, which
+     * differs from one to another.
+     */
+    private function locksWork(): bool
+    {
+        $probe = $this->lockFile.'.'.bin2hex(random_bytes(6)).'.probe';
+        $h = @fopen($probe, 'x');
+        // Not knowing is the old answer: a slice that may be running elsewhere.
+        if ($h === false) return true;
+        $locked = @flock($h, LOCK_EX | LOCK_NB);
+        if ($locked) @flock($h, LOCK_UN);
+        fclose($h);
+        @unlink($probe);
+        return $locked;
+    }
+
+    /**
+     * Claim the scan by creating its claim file, which only one caller can do
+     * -- exclusive creation is atomic on every filesystem, FUSE included. The
+     * claim says until when it holds, so one left by a slice that died is
+     * taken over once that has passed, and whose it is, so a slice that ran
+     * past it removes only its own.
+     *
+     * @return array{0:string,1:string}|null
+     */
+    private function claim(float $seconds): ?array
+    {
+        $token = bin2hex(random_bytes(8));
+        for ($try = 0; $try < 2; $try++) {
+            $h = @fopen($this->claimFile, 'x');
+            if ($h !== false) {
+                fwrite($h, (time() + (int)ceil($seconds) + self::CLAIM_GRACE_SECONDS).' '.$token);
+                fclose($h);
+                return ['claim', $token];
+            }
+            clearstatcache(true, $this->claimFile);
+            $until = explode(' ', (string)@file_get_contents($this->claimFile), 2)[0];
+            // Empty only while its taker is writing it: as fresh as the file.
+            $expires = ctype_digit($until) ? (int)$until : (int)@filemtime($this->claimFile) + self::CLAIM_GRACE_SECONDS;
+            if ($expires >= time()) return null;
+            @unlink($this->claimFile);
+        }
+        return null;
+    }
+
+    /** @param array{0:string,1:mixed} $held what hold() returned */
+    private function release(array $held): void
+    {
+        [$how, $what] = $held;
+        if ($how === 'lock') {
+            @flock($what, LOCK_UN);
+            fclose($what);
+            return;
+        }
+        if (str_ends_with((string)@file_get_contents($this->claimFile), ' '.$what)) @unlink($this->claimFile);
     }
 
     private function begin(): array
