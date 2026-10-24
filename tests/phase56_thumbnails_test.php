@@ -26,6 +26,61 @@ use CloudHub\Services\FileService;
 use CloudHub\Services\ThumbnailScan;
 use CloudHub\Services\ThumbnailService;
 
+/**
+ * A filesystem with no advisory locking, as tests/phase28 models it: every
+ * operation proxies to a real directory, stream_lock() is not implemented, so
+ * flock() fails at once -- what Android shared storage does, and ext4 here
+ * never will. touch() passes its times through, which the mirror relies on.
+ */
+final class NoLockFs56
+{
+    public $context;
+    public static string $realBase = '';
+    /** False plays storage that will not set a file's time, which some Android storage refuses. */
+    public static bool $keepsTimes = true;
+    /** Run once, just before the scan's claim is next removed or moved: another request, that instant. */
+    public static ?Closure $meanwhile = null;
+    private $fh = null;
+    private $dh = null;
+
+    public static function real(string $path): string
+    {
+        return self::$realBase.'/'.ltrim(substr($path, strlen('nolock56://')), '/');
+    }
+    public function stream_open($path, $mode, $options, &$opened) { $this->fh = @fopen(self::real($path), $mode); return $this->fh !== false; }
+    public function stream_read($n) { return fread($this->fh, $n); }
+    public function stream_write($d) { return fwrite($this->fh, $d); }
+    public function stream_eof() { return feof($this->fh); }
+    public function stream_seek($o, $w = SEEK_SET) { return fseek($this->fh, $o, $w) === 0; }
+    public function stream_tell() { return ftell($this->fh); }
+    public function stream_stat() { return fstat($this->fh); }
+    public function stream_flush() { return fflush($this->fh); }
+    public function stream_close() { return fclose($this->fh); }
+    // stream_lock() is intentionally absent.
+    public function url_stat($path, $flags) { return @stat(self::real($path)) ?: false; }
+    public function unlink($path) { self::meanwhile($path); return @unlink(self::real($path)); }
+    public function rename($from, $to) { self::meanwhile($from); return @rename(self::real($from), self::real($to)); }
+    private static function meanwhile(string $path): void
+    {
+        if (self::$meanwhile === null || !str_ends_with($path, '/thumbnail-scan.claim')) return;
+        [$then, self::$meanwhile] = [self::$meanwhile, null];
+        $then();
+    }
+    public function mkdir($path, $mode, $options) { return @mkdir(self::real($path), $mode, (bool)($options & STREAM_MKDIR_RECURSIVE)); }
+    public function rmdir($path, $options) { return @rmdir(self::real($path)); }
+    public function dir_opendir($path, $options) { $this->dh = @opendir(self::real($path)); return $this->dh !== false; }
+    public function dir_readdir() { return readdir($this->dh); }
+    public function dir_rewinddir() { rewinddir($this->dh); return true; }
+    public function dir_closedir() { closedir($this->dh); return true; }
+    public function stream_metadata($path, $option, $value)
+    {
+        $times = array_filter((array)$value, 'is_int');
+        if ($times && !self::$keepsTimes) return false;
+        return $option === STREAM_META_TOUCH && @touch(self::real($path), ...$times);
+    }
+}
+stream_wrapper_register('nolock56', 'NoLockFs56');
+
 $checks = [];
 $base = sys_get_temp_dir().'/cloudhub-thumbs-'.bin2hex(random_bytes(4));
 $store = $base.'/store';
@@ -392,6 +447,100 @@ $checks['a copy\'s thumbnails come with it, reporting in per file'] =
 $thumbs->removed('/Albums/Summer copy');
 $fs->deleteTree($store.'/Albums/Summer copy');
 
+/* --- on storage without advisory locks --------------------------------------------------- */
+
+// Where storage/.cache is on Android shared storage, flock() fails at once,
+// every time. That used to read as "another slice holds the scan": every slice
+// answered busy, nothing was ever made, and the app waited on it for good.
+NoLockFs56::$realBase = $base.'/nolock';
+mkdir($base.'/nolock/cache', 0775, true);
+$claim = $base.'/nolock/cache/thumbnail-scan.claim';
+$lockless = new ThumbnailScan($fs, $thumbs, 'nolock56://cache');
+$ran = $lockless->run(30.0, true);
+$checks['without advisory locks, a slice runs rather than reporting busy'] = $ran['busy'] === false && $ran['done']
+    && $ran['processed'] === $ran['found'] && $ran['found'] >= $restarted['found'] && $ran['generated'] === 0;
+$checks['and gives the scan back when it ends'] = !file_exists($claim);
+$checks['which the next slice can take'] = ($next = $lockless->run(30.0, true))['busy'] === false && $next['done'];
+
+// One at a time all the same: a slice under way there holds a claim instead.
+$stateThere = $base.'/nolock/cache/thumbnail-scan.json';
+$stateBefore = file_get_contents($stateThere);
+file_put_contents($claim, ($until = time() + 60).' someoneelse');
+$held = $lockless->run(30.0, true);
+$checks['a claim held by a running slice turns a second one away'] = $held['busy'] === true
+    && file_get_contents($stateThere) === $stateBefore && file_get_contents($claim) === $until.' someoneelse';
+file_put_contents($claim, '');
+$checks['as does one being written that instant'] = $lockless->run(30.0, true)['busy'] === true;
+// A slice killed part way leaves its claim; it lapses, and is taken over.
+file_put_contents($claim, (time() - 1).' died');
+$after = $lockless->run(30.0, true);
+$checks['a claim left by a slice that died is taken over once it lapses'] = $after['busy'] === false && $after['done']
+    && $after['processed'] === $after['found'] && !file_exists($claim) && glob($claim.'.*') === [];
+file_put_contents($claim, '');
+touch($claim, time() - 600);
+$checks['even one that was never written'] = $lockless->run(30.0, true)['busy'] === false && !file_exists($claim);
+// Two requests can both find a claim lapsed. The quicker takes it over and
+// makes its own; the slower must not then remove that one by name, or both
+// slices run on the one work list.
+file_put_contents($claim, (time() - 1).' died');
+$stateBefore = file_get_contents($stateThere);
+NoLockFs56::$meanwhile = function () use ($claim, &$until): void {
+    file_put_contents($claim, ($until = time() + 60).' quicker');
+};
+$raced = $lockless->run(30.0, true);
+NoLockFs56::$meanwhile = null;
+$checks['of two that find a claim lapsed, the slower leaves the quicker\'s alone'] = $raced['busy'] === true
+    && file_get_contents($stateThere) === $stateBefore && file_get_contents($claim) === $until.' quicker'
+    && glob($claim.'.*') === [];
+@unlink($claim);
+
+// Where locks do work, a failed one is still another slice's.
+$lock = fopen($base.'/cache/thumbnail-scan.lock', 'c');
+flock($lock, LOCK_EX);
+$checks['where locks work, a held lock is still a busy scan'] = $scan->run(1.0, true)['busy'] === true
+    && !file_exists($base.'/cache/thumbnail-scan.claim');
+flock($lock, LOCK_UN);
+fclose($lock);
+
+// And the thumbnails themselves, kept there: their locks are best effort.
+$lockThumbs = new ThumbnailService($fs, 'nolock56://thumbs');
+$keptThere = $lockThumbs->ensure($store.'/Photos/icon.png');
+$checks['thumbnails are made and kept where locks fail'] = $keptThere['status'] === ThumbnailService::GENERATED
+    && $lockThumbs->current($store.'/Photos/icon.png', true) === 'nolock56://thumbs/files/Photos/icon.png.webp'
+    && $lockThumbs->ensure($store.'/Photos/icon.png', true)['status'] === ThumbnailService::VALID;
+
+/* --- storage that cannot keep a thumbnail ------------------------------------------------- */
+
+// A kept thumbnail is matched to its photo by the time set on it. Where that
+// cannot be set -- or there is no room, or nowhere to write -- none can be
+// kept: that is the server's storage, not the photo, and saying so is the fix.
+NoLockFs56::$keepsTimes = false;
+$timeless = new ThumbnailService($fs, 'nolock56://timeless');
+$refusal = null;
+try { $timeless->ensure($store.'/Photos/beach.jpg'); } catch (RuntimeException $e) { $refusal = $e; }
+$checks['a thumbnail that cannot be kept says so, and why'] = $refusal?->getCode() === ThumbnailService::CANNOT_KEEP
+    && str_contains($refusal->getMessage(), 'modification time') && $timeless->current($store.'/Photos/beach.jpg') === null;
+$leftovers = glob($base.'/nolock/timeless/files/Photos/*') ?: [];
+$checks['and leaves nothing half-written behind'] = $leftovers === [];
+$checks['nor marks the photo as unreadable'] = $timeless->knownFailure($store.'/Photos/beach.jpg') === null;
+
+$stuckScan = new ThumbnailScan($fs, $timeless, $base.'/cache-timeless');
+$stops = [];
+for ($i = 0; $i < 2; $i++) {
+    try { $stuckScan->run(30.0, $i === 0); $stops[] = null; } catch (RuntimeException $e) { $stops[] = $e; }
+}
+// It used to count every photo as "could not be read", which the app shows
+// as the photos' fault. Now the slice stops with the reason, which the API
+// passes through and the app shows as "Stopped: ...".
+$checks['the scan stops at it with the reason, not "unreadable" for every photo'] =
+    ($stops[0] ?? null)?->getCode() === ThumbnailService::CANNOT_KEEP && str_contains($stops[0]->getMessage(), 'modification time');
+$checks['and gives the scan back, so asking again is told the same rather than busy'] =
+    ($stops[1] ?? null)?->getCode() === ThumbnailService::CANNOT_KEEP;
+NoLockFs56::$keepsTimes = true;
+$recovered = $stuckScan->run(30.0);
+$checks['once storage keeps times again, the scan carries on to done'] = $recovered['done'] && $recovered['busy'] === false
+    && $timeless->current($store.'/Photos/beach.jpg', true) !== null;
+
 /* --- and the originals ------------------------------------------------------------------- */
 
 $untouched = true;
@@ -423,7 +572,7 @@ $checks['the gallery route serves, makes, or makes without keeping'] =
 // -- is still a thumbnail for the gallery, and the storage report says why.
 $checks['a thumbnail that cannot be kept is still served'] =
     str_contains($index, "\$kept = \$thumbs->ensure(\$f, true)['path'];")
-    && str_contains($index, "if (\$e->getCode() !== 500)throw \$e;")
+    && str_contains($index, "if (\$e->getCode() !== ThumbnailService::CANNOT_KEEP)throw \$e;")
     && substr_count($index, 'send_thumbnail_bytes($thumbs->renderUncached($f));') === 2
     && str_contains($read('src/Services/StorageDiagnostics.php'), "\$row['keepsTimes'] = \$touched && @filemtime(\$probe) === 1_000_000_000;");
 $checks['and brings a frame across from the first layout'] =
@@ -457,6 +606,8 @@ $checks['the background job makes the thumbnails the route serves'] =
     && str_contains($jobs('ThumbnailsJob'), "\$thumbs->ensure(\$full, true)['status'] === ThumbnailService::GENERATED")
     && str_contains($jobs('JobEnvironment'), "new ThumbnailService(\$this->files, \$this->projectDir.'/storage/.thumbnails')")
     && str_contains($index, "new ThumbnailService(\$fs, dirname(__DIR__).'/storage/.thumbnails')");
+$checks['a task that cannot keep thumbnails fails, saying why'] =
+    str_contains($jobs('ThumbnailsJob'), 'if (in_array((int)$e->getCode(), [503, ThumbnailService::CANNOT_KEEP], true)) throw $e;');
 $checks['and a background copy carries them'] =
     substr_count($jobs('CopyJob'), 'self::carryThumbnails(') === 2
     && str_contains($jobs('CopyJob'), '$ctx->env()->thumbnails()->copied($from, $to, static fn() => $ctx->checkpoint());');

@@ -11,6 +11,29 @@ declare(strict_types=1);
 
 $uri = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?: '/';
 
+/**
+ * Tell the application which script it is really running.
+ *
+ * PHP's built-in server (8.2 and 8.3.6 alike, measured) hands a request whose
+ * path ends in an extension -- /share/TOKEN.jpg, /webdav/Photos/beach.jpg --
+ * to this router with SCRIPT_NAME set to that path and SCRIPT_FILENAME naming
+ * this file, as if the URL named a script. Http::basePath() reads the install
+ * folder from SCRIPT_NAME, so it took "/share" or "/webdav/Photos" for one and
+ * stripped it: every share link carrying its file's extension, and every
+ * WebDAV file, answered "Not found" here while working under Apache and nginx,
+ * which report the front controller. Under this router the application sits at
+ * the root of the server, so that is what it is told -- in the form the server
+ * itself uses for any other path, and only when it has named the router.
+ * (Cloudhub-2's router does the same.)
+ */
+function dev_front_controller(string $uri): void
+{
+    if (realpath((string)($_SERVER['SCRIPT_FILENAME'] ?? '')) !== __FILE__) return;
+    $_SERVER['SCRIPT_FILENAME'] = rtrim((string)($_SERVER['DOCUMENT_ROOT'] ?? __DIR__), '/').'/index.php';
+    $_SERVER['SCRIPT_NAME'] = '/index.php';
+    $_SERVER['PHP_SELF'] = '/index.php'.$uri;
+}
+
 /*
  * Public share links, before the deny rules.
  *
@@ -21,6 +44,7 @@ $uri = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?: '/';
  * rules to protect.
  */
 if (preg_match('#^/share/[A-Za-z0-9_-]{20,128}(?:[./]|$)#', $uri)) {
+    dev_front_controller($uri);
     require __DIR__ . '/public/index.php';
     return true;
 }
@@ -69,4 +93,5 @@ if ($uri !== '/') {
 }
 
 // Otherwise, boot the application.
+dev_front_controller($uri);
 require __DIR__ . '/public/index.php';

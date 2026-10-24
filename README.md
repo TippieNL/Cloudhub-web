@@ -189,7 +189,18 @@ It runs in slices of about eight seconds, its place kept in
 `storage/.cache/thumbnail-scan.json`, so it needs no long-running process and
 no request runs long. Memory does not grow with the collection: the work list
 is read from disk, not held. One slice runs at a time; another caller is told
-the scan is busy, and a slice never holds up the account's other requests. A
+the scan is busy, and a slice never holds up the account's other requests. The
+slice holds the scan with an advisory lock where the filesystem has one; on
+Android's shared storage, which has none (`flock()` fails at once, every time,
+as chunked uploads found; see **v10.2 Android shared-storage compatibility**),
+it holds it with a claim file instead, which lapses
+two minutes after its slice should have ended if that slice dies. Taking the
+missing lock for someone else's used to make every slice answer busy there, so
+the scan never ran and the app's **Check now** came to nothing. A photo whose
+thumbnail cannot be kept at all — no room, nowhere to write, or storage that
+will not set a file's time — stops the slice with the reason (`507`), which the
+app shows as "Stopped: … · tries again later"; it used to count every photo as
+unreadable, which blamed the photos for the server's storage. A
 finished scan stands for a day, and asking again within it costs nothing.
 Begun again, a scan makes nothing that is already current, so it is safe to
 run as often as you like.
@@ -385,6 +396,14 @@ or, to serve the project from a parent directory as a subdirectory install:
 ```bash
 php -S 0.0.0.0:8000 router.php     # open http://localhost:8000/
 ```
+
+Without `router.php` the built-in server takes any path that ends in an
+extension for a file of its own and answers 404 without running CloudHub: a
+share link (`/share/<token>.jpg`) and every WebDAV file. Use `router.php` to try
+either. It also tells the application its front controller for such a path,
+which the built-in server (8.2 and 8.3 alike) reports as the path itself;
+`Http::basePath()` took that path's folder for the install's, so the same
+requests answered "Not found" even through the router until it did.
 
 ## Login
 

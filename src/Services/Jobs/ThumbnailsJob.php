@@ -71,8 +71,10 @@ final class ThumbnailsJob extends BaseJobType
             } catch (RuntimeException $e) {
                 // Unreadable or too large: the same photos the gallery shows an
                 // icon for, remembered so they are not decoded again. One is
-                // not the job.
-                if ((int)$e->getCode() === 503) throw $e;
+                // not the job. No GD, or nowhere to keep what is made, is the
+                // server's, and every photo after this one would fail the same
+                // way: the task fails, saying why.
+                if (in_array((int)$e->getCode(), [503, ThumbnailService::CANNOT_KEEP], true)) throw $e;
                 $skipped++;
             }
             $ctx->checkpoint();

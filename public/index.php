@@ -2204,7 +2204,7 @@ if ($path === '/api/files/upload' && $method === 'POST') api_try(function()use($
             // photo, and which Android shared storage has been known to refuse.
             // The gallery is answered all the same, with one made afresh, where
             // the old flat cache answered 500; /api/system/storage says which.
-            if ($e->getCode() !== 500)throw $e;
+            if ($e->getCode() !== ThumbnailService::CANNOT_KEEP)throw $e;
             error_log('['.Http::requestId().'] [thumbnails] '.$fs->relative($f).' was not kept: '.$e->getMessage());
             send_thumbnail_bytes($thumbs->renderUncached($f));
         }

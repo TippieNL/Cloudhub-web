@@ -324,9 +324,31 @@ scenario('a thumbnail that cannot be kept is still served', function () use ($cl
         check('that was not kept', !is_file($thumbOf($scratch.'/stuck/second.jpg')));
         check('cacheable like any other, as it is right for its URL',
             str_contains((string)$served->header('Cache-Control'), 'immutable'), (string)$served->header('Cache-Control'));
+        // The scan stops there and says why -- the app shows "Stopped: ..." --
+        // rather than counting the photo, and every one after it, unreadable.
+        $scan = $client->post('/api/thumbnails/scan', ['restart' => true]);
+        check('the scan stops at it, saying why', $scan->status === 507
+            && str_contains((string)($scan->json['error']['message'] ?? ''), 'cannot be written'), $scan->describe());
     } finally {
         exec('chattr -i '.escapeshellarg($dir));
     }
+});
+
+scenario('a share link that ends in the photo\'s extension works on the development server', function () use ($client, $base, $scratch, $photo, $photoPut) {
+    $bytes = $photo(640, 360);
+    $photoPut($scratch.'/pics/shared.jpg', $bytes);
+    $share = $client->post('/api/shares/create', ['filePath' => $scratch.'/pics/shared.jpg']);
+    $url = (string)($share->json['url'] ?? '');
+    check('the link carries the extension', str_ends_with($url, '.jpg'), $url);
+    // A photo's link is its viewer page; the bytes are at /raw.jpg beside it.
+    $anyone = new Client($base);
+    $page = $anyone->fetchUrl(preg_replace('#^https?://[^/]+#', $base, $url) ?? $url);
+    $raw = preg_replace('#\.jpg$#', '/raw.jpg', preg_replace('#^https?://[^/]+#', $base, $url) ?? $url) ?? '';
+    check('which, here as in production, opens its page for someone with no account',
+        $page->status === 200 && str_contains($page->body, '/raw.jpg'), $page->describe());
+    $fetched = $anyone->fetchUrl($raw);
+    check('and the photo itself', $fetched->status === 200 && $fetched->body === $bytes, $raw.' '.$fetched->describe());
+    $client->delete('/api/shares/revoke', ['token' => (string)($share->json['token'] ?? '')]);
 });
 
 /* ---- video frames ---------------------------------------------------------------- */
@@ -360,10 +382,10 @@ scenario('a video\'s frame, contributed by a client, is kept in the mirror', fun
 /* ---- WebDAV ----------------------------------------------------------------------- */
 
 scenario('WebDAV keeps thumbnails in step', function () use ($client, $scratch, $thumbOf, $photo, $soon, $size) {
-    // Addressed as ?route=/webdav/..., the form the API is spoken in here: PHP's
-    // built-in server takes a clean /webdav/... path that ends in an extension
-    // for a file of its own, and hands the front controller the wrong base path.
-    $dav = fn(string $path): string => '/?route='.rawurlencode('/webdav'.$path);
+    // As a WebDAV client addresses it: a clean path ending in the file's name,
+    // which PHP's built-in server mistook for a script until router.php told
+    // the application otherwise (see dev_front_controller()).
+    $dav = fn(string $path): string => '/webdav'.$path;
     $put = $client->dav('PUT', $dav($scratch.'/pics/dav.jpg'), ['Content-Type: image/jpeg'], $photo(1200, 600));
     check('a PUT stores the photo', $put->status === 201, $put->describe());
     check('and makes its thumbnail', $soon(fn() => is_file($thumbOf($scratch.'/pics/dav.jpg'))));
