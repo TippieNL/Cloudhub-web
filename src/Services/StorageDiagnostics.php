@@ -101,6 +101,19 @@ final class StorageDiagnostics
             // UploadService probes instead of trusting the permission bits.
             $probe = rtrim($path, '/').'/.storage-check-'.bin2hex(random_bytes(6));
             $written = @file_put_contents($probe, 'probe');
+            if ($label === 'thumbnail cache' && $written !== false) {
+                // A kept thumbnail carries its photo's modification time, set
+                // on it; storage that refuses to set a file's time can keep
+                // none (see ThumbnailService), so every thumbnail is made again
+                // each time it is shown.
+                $touched = @touch($probe, 1_000_000_000);
+                clearstatcache(true, $probe);
+                $row['keepsTimes'] = $touched && @filemtime($probe) === 1_000_000_000;
+                if (!$row['keepsTimes']) {
+                    $problems[] = 'The thumbnail cache cannot set a file\'s modification time, so no thumbnail is kept: '
+                        .'each is made again whenever it is shown. Move the installation to storage that can.';
+                }
+            }
             $row['writable'] = $written !== false && @unlink($probe);
             if (!$row['writable']) {
                 @unlink($probe);

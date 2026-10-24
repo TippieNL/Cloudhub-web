@@ -461,8 +461,19 @@ if (function_exists('imagewebp')) {
     imagepng($im, $root.'/src/photo.png');
     imagedestroy($im);
     $thumbs = $run($queue('thumbnails', ['path' => '/src']));
+    $kept = $base.'/project/storage/.thumbnails/files/src/photo.png.webp';
     $checks['thumbnails are made where the thumbnail route looks'] = $thumbs['status'] === 'completed' && $thumbs['result']['made'] === 1
-        && is_file((string)\CloudHub\Services\ImageThumbnailer::cachePath($base.'/project', $root.'/src/photo.png'));
+        && $env->thumbnails()->current($root.'/src/photo.png', true) === $kept;
+    $checks['and a second run makes none'] = ($again = $run($queue('thumbnails', ['path' => '/src'])))['status'] === 'completed'
+        && $again['result']['made'] === 0 && $again['result']['existing'] === 1;
+    // A background copy is the same pictures: their thumbnails come along,
+    // stamped with the copies' own times, rather than a decode each.
+    mkdir($root.'/album', 0775);
+    $carried = $run($queue('copy', ['paths' => ['/src/photo.png'], 'destination' => '/album']));
+    $copyThumb = $env->thumbnails()->current($root.'/album/photo.png', true);
+    $checks['a background copy carries the thumbnail along'] = $carried['status'] === 'completed'
+        && $copyThumb === $base.'/project/storage/.thumbnails/files/album/photo.png.webp'
+        && file_get_contents($copyThumb) === file_get_contents($kept);
 }
 
 // Duplicates, one at a time.

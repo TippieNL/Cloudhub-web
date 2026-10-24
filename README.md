@@ -83,43 +83,213 @@ seek without downloading the whole file.
 
 ## Thumbnails
 
-Image thumbnails are generated on demand with GD, capped at 300px, encoded as
-WebP and cached under `storage/.thumbnails/images`. The cache key includes the
-source file's modification time, so replacing a file produces a new key and the
-stale entry is simply never read again.
+Every photo in the store has a thumbnail of its own: a WebP no larger than
+512 px on its longer side, made once by the server with GD and kept. Galleries
+— the web grid, the duplicate finder, the Android app's grid and its photo
+viewer's placeholder — only ever load thumbnails; the original is fetched only
+when a photo is opened.
+
+This is the thumbnail API of Cloudhub-2's server, which the Android app speaks
+from 5.0: `ThumbnailService` and `ThumbnailScan` are that repository's, and
+`GET /api/files/config` publishing `thumbnailFormat` and
+`thumbnailScanSeconds` is what tells the app this server keeps thumbnails and
+can make them ahead of time. Against a server without them the app runs no
+scan and says thumbnails are made as photos are first shown.
+
+### Where they live
+
+`storage/.thumbnails/files` mirrors the store: the same folders and the same
+name, with `.webp` on the end.
+
+| Photo in the store        | Its thumbnail                                          |
+|---------------------------|--------------------------------------------------------|
+| `/Photos/2026/beach.jpg`  | `storage/.thumbnails/files/Photos/2026/beach.jpg.webp` |
+| `/Photos/2026/beach.png`  | `storage/.thumbnails/files/Photos/2026/beach.png.webp` |
+
+Appending the extension rather than replacing it keeps the mapping one to one,
+so two photos that differ only in extension never share a thumbnail. The
+mirror sits outside the store root, so it never shows up in a listing, a
+search, a quota or a WebDAV client. Paths are mapped with the same rules as
+every file route — a name with `..`, a NUL or a control character has no
+thumbnail path — and nothing outside the mirror is ever written or deleted.
+Originals are only read, never written.
+
+### When one is current
+
+A thumbnail carries its photo's modification time as its own (set before it
+is renamed into place), so checking one costs two stats and a 12-byte read. An
+edited or replaced photo has a new time, so its thumbnail is stale at once and
+is made again the next time it is shown. Two details keep that true:
+
+- File times are whole seconds, and a file written twice within one — a WebDAV
+  client creating it empty and then filling it, a photo replaced straight after
+  it arrived — keeps one time across both writes. So whenever the server writes
+  a file itself (an upload, a WebDAV `PUT`, a restore from the trash) it also
+  drops that file's thumbnail there and then, waiting for one being made from
+  the old bytes at that moment rather than racing it. Thumbnail URLs carry the
+  size beside the time for the same reason. Only a file changed twice within
+  one second by something other than CloudHub can keep the first one's
+  thumbnail (see **Starting over**).
+- Before a thumbnail is served its WebP header is checked, and the length the
+  header declares against the file's, so one that a crash emptied or cut short
+  is made again rather than sent.
+
+Setting that time is the one thing the mirror needs of its storage beyond
+writing files, and Android's shared storage has been known to refuse it on
+some versions. Where a thumbnail cannot be kept — that, or a full disk — the
+gallery is still answered with one made afresh rather than with an error, and
+`/api/system/storage` (or `php tools/storage-check.php`) says whether the
+thumbnail cache keeps file times; see **Checking what the storage can do**.
+
+A file that cannot be decoded — not really an image, damaged, or declaring
+more than 50 megapixels — gets a `.failed` marker beside where its thumbnail
+would be, stamped with the same time, and is answered `415` or `422` without
+being decoded again until the file changes. It still lists with its icon, and
+still opens and downloads. (The 50-megapixel cap is measured from the header:
+GD holds a decoded image at up to four bytes a pixel whatever the file's size,
+so a 285 KB PNG declaring 10000x10000 pixels took one request to 704 MB, and
+`memory_limit` does not see the system libgd's allocations.)
+
+### When they are made
+
+- **On upload.** Every way a file arrives — chunked upload, multipart, WebDAV
+  `PUT`, trash restore — makes its thumbnail after the reply has gone. The
+  upload has already succeeded by then: a thumbnail that cannot be made is
+  logged (`[thumbnails] …` in the PHP error log) and nothing else. Under
+  php-fpm or LiteSpeed the reply is finished first; under mod_php or `php -S`
+  the client is still connected, so only a handful are made there in a couple
+  of seconds and the rest when they are first shown.
+- **When first shown.** `GET /api/thumbnail` makes a missing, stale or damaged
+  one, keeps it and serves it. One lock per thumbnail means a gallery, a phone
+  and the scan asking at once decode the photo once.
+- **By the scan**, for photos that were there before — see below — or by
+  **Make thumbnails** on a folder (a task; see **Background tasks**), which
+  does the same for one folder.
+
+Renaming, moving and copying carry thumbnails along — a copy is the same
+picture, so it gets its original's thumbnail without a decode, a copy made as a
+background task included. Deleting or trashing a photo removes its thumbnail,
+at once even when the deleting itself is left to a task; restoring it makes a
+new one. A folder renamed only in case on case-insensitive storage — a phone's
+shared storage — keeps its thumbnails.
+
+### Photos already in the store: the scan
+
+Photos uploaded before this version, or copied straight onto the disk, are
+found by a background scan that works in three phases:
+
+1. **walk** — lists every file in the store into a work list on disk;
+2. **make** — goes through the list, making each thumbnail that is missing,
+   stale or damaged and counting the ones already current;
+3. **sweep** — removes thumbnails and markers whose photo has gone, and the
+   300 px thumbnails of the old flat cache in `storage/.thumbnails/images`
+   (the video frames clients contributed to it are moved into the mirror).
+
+It runs in slices of about eight seconds, its place kept in
+`storage/.cache/thumbnail-scan.json`, so it needs no long-running process and
+no request runs long. Memory does not grow with the collection: the work list
+is read from disk, not held. One slice runs at a time; another caller is told
+the scan is busy, and a slice never holds up the account's other requests. A
+finished scan stands for a day, and asking again within it costs nothing.
+Begun again, a scan makes nothing that is already current, so it is safe to
+run as often as you like.
+
+Three ways to run it:
+
+- **The Android app** (5.0 and later) keeps it going by itself, in the
+  background, for accounts that may write; **Settings → Photo thumbnails**
+  shows how far it has got, and **Check now** checks every photo again.
+- **The command line**, for a large library or a cron job — as the web
+  server's user, like `tools/worker.php`:
+
+  ```bash
+  php tools/thumbnails.php            # carry on, or start, until it is done
+  php tools/thumbnails.php --restart  # check every photo again from the start
+  php tools/thumbnails.php --status   # print the last report
+  ```
+
+- **The API**, for other clients: `POST /api/thumbnails/scan` runs one slice
+  and returns the report (`{"restart": true}` begins again);
+  `GET /api/thumbnails/scan` reads it. Running a slice is a write (admins and
+  editors, CSRF-guarded); reading the report is open to any signed-in account.
+  Neither touches the store, so neither retires cached listings.
+
+The report has `started`, `done`, `busy`, `phase`, `found`, `processed`,
+`generated`, `valid` (already current), `adopted` (video frames brought
+across), `failed`, `skipped` (videos with no frame yet, images this server's
+GD cannot read), `removed`, `startedAt`, `finishedAt` and `format`.
+
+### Formats
+
+JPEG, PNG, GIF, WebP and BMP, and AVIF where the server's GD reads it
+(`gd_info()`). JPEG thumbnails are turned by the photo's EXIF orientation, so a
+portrait phone photo stands upright in the grid as it does when opened, and
+transparent PNG and GIF thumbnails stay transparent. SVG and HEIC have no
+thumbnail — GD reads neither — and show their icon.
 
 The server has no video decoder. A video's frame is decoded by the first
-browser that sees it and posted back to `POST /api/thumbnail/video`, after
-which it is served from the same cache as any image — so a video is decoded
-once for everyone, rather than re-fetched and re-decoded by every visitor on
-every load. Contributed frames are validated as real WebP/JPEG/PNG images,
-bounded to 256 KB and 1280px, and re-encoded to WebP before being stored.
-
-`GET /api/files/list` reports `hasThumbnail` for each video, so the browser
-knows whether to fetch a cached frame or decode one, without having to ask and
+browser or phone that sees it and posted back to `POST /api/thumbnail/video`,
+then kept in the same mirror — so a video is decoded once for everyone, rather
+than re-fetched and re-decoded by every visitor on every load. Contributed
+frames are validated as real WebP/JPEG/PNG images, bounded to 256 KB and
+1280px, and re-encoded to WebP before being stored. `GET /api/files/list`
+reports `hasThumbnail` for each video — from the time the listing row already
+carries, so flagging one costs no second stat of the video — and the client
+knows whether to fetch a kept frame or decode one, without having to ask and
 treat the failure as an answer. Requesting a video thumbnail that has not been
 generated yet returns `404`.
 
-Thumbnail URLs carry the file's modification time and are therefore immutable,
-so they are served `Cache-Control: private,max-age=31536000,immutable` with an
-`ETag` for the reload case. Images use native `loading="lazy"` and declare
-intrinsic dimensions, and video frames are decoded through an
-`IntersectionObserver` two at a time.
+### Caching
+
+Thumbnail URLs carry the photo's time and size (`&v=<time>-<size>`) and the
+thumbnail format (`&t=2`), so they are immutable: served
+`Cache-Control: private,max-age=31536000,immutable` with an `ETag` for the
+reload case. A new format — the size went from 300 to 512 px with this one — is
+a new URL, so a cache holding the old one for a year asks again. The web client
+and the duplicate finder's previews ask that way, as the Android app does.
+Images use native `loading="lazy"` and declare intrinsic dimensions, and video
+frames are decoded through an `IntersectionObserver` two at a time.
 
 Read-only endpoints release the PHP session lock as soon as authorization has
 been decided. Without that, PHP's exclusive per-session file lock serialises
 every request in a gallery no matter how many workers are free — the single
 largest cost in loading a folder of images.
 
-Images whose header declares more than 50 megapixels get no thumbnail (`422`).
-GD holds a decoded image at up to four bytes a pixel whatever the file's size,
-so a 285 KB PNG declaring 10000x10000 pixels took one request to 704 MB — and
-`memory_limit` does not see the system libgd's allocations, so it is no guard.
-JPEG thumbnails are turned by the photo's EXIF orientation, so a portrait phone
-photo stands upright in the grid as it does when opened.
+### Upgrading
 
-To clear the cache, delete `storage/.thumbnails/images`; it is rebuilt on
-demand.
+Nothing to run. Thumbnails of the old flat cache are not used again: each photo
+gets a 512 px one when it is next shown or when the scan reaches it, a video
+keeps the frame a browser contributed (brought across the first time it is
+asked for), and a finished scan removes `storage/.thumbnails/images`. The
+mirror takes about two and a half times the space the 300 px thumbnails did.
+Android app 4.x keeps working: it asks without `t`, and is served the new
+thumbnails.
+
+### Starting over
+
+Delete `storage/.thumbnails/files` and `storage/.cache/thumbnail-scan.json`:
+every thumbnail is made again when it is next shown, or by the next scan. Video
+frames are contributed again by the next browser or phone that plays them.
+
+### Testing it
+
+```bash
+php tests/phase56_thumbnails_test.php  # the service and the scan, on a throwaway store
+php tests/http/thumbnails_run.php      # and over HTTP, against the database
+```
+
+The first needs no database. It makes thumbnails from every format, checks the
+mirror and the names, the edge cases (an unreadable file, a 400-megapixel
+header, a name the mirror cannot hold, a path out of the store, a photo
+replaced within one second, a WebDAV client's empty file filled a moment later,
+a thumbnail cut short, a folder renamed only in case), keeps them in step
+through rename, move, copy and delete, runs a scan of 250 photos in many short
+slices, runs it again to make nothing, and ends by checking that no original
+was changed by any of it. The second does the same through the real routes —
+chunked and multipart uploads, WebDAV, a video frame from a viewer, a
+background copy and **Make thumbnails** run by the worker, the scan run to done
+twice, a slice running while the same account lists a folder — and checks the
+report has every field, of the type, the Android app reads.
 
 ## Tests
 
@@ -143,6 +313,18 @@ It needs the MySQL/MariaDB database `.env` points at, migrated, and PHP's
 openssl extension. It starts its own CloudHub servers and two stand-in SMTP
 servers (one speaking STARTTLS with a certificate from a CA it makes for the
 run), creates its own accounts, and removes them when it is done.
+
+Thumbnails have one too (see **Thumbnails**), against the same database:
+
+```bash
+php tests/http/thumbnails_run.php
+```
+
+It needs PHP's GD with JPEG and WebP. It starts its own CloudHub from this
+checkout, creates its own accounts and a folder of its own in the store, runs
+background tasks with `tools/worker.php --once`, and removes what it made when
+it is done. It runs the thumbnail scan over the whole store, which makes
+thumbnails and never changes a photo.
 
 ## Required PHP extensions
 
@@ -734,8 +916,9 @@ GET /api/system/storage?measure=1&mb=16
 
 It reports, for ROOT_DIR, the upload staging directory, the thumbnail cache and
 `logs/`: whether PHP can genuinely create and remove files there (a real probe,
-not `is_writable()`, which Android shared storage answers unreliably), how many
-entries each holds, the PHP version and SAPI, the request-size limits with a
+not `is_writable()`, which Android shared storage answers unreliably), for the
+thumbnail cache whether a file's modification time can be set (a kept thumbnail
+is matched to its photo by it: see **Thumbnails**), how many entries each holds, the PHP version and SAPI, the request-size limits with a
 warning when one sits at or below the chunk size, the deployed commit, and
 whether finishing an upload is an instant rename or a whole-file copy.
 

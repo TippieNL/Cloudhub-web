@@ -724,6 +724,25 @@ function initVideoThumbnails() {
     }
 }
 
+/*
+ * The thumbnail format, ThumbnailService::FORMAT on the server, in every
+ * thumbnail URL: the server sends them cacheable for a year, so a URL that
+ * stayed the same would keep the browser showing the old size for that year
+ * after the server began making them larger.
+ */
+const THUMBNAIL_FORMAT = 2;
+
+/**
+ * A thumbnail's URL, versioned by the file's time and size. The size is there
+ * because times are whole seconds: a photo replaced within the second it
+ * arrived keeps its time but rarely its size. The Android app writes `v` the
+ * same way.
+ */
+function thumbnailUrlFor(path, modified, size) {
+    return appUrl('/api/thumbnail?path=' + encodeURIComponent(path)
+        + '&v=' + encodeURIComponent((modified ?? '') + '-' + (size ?? '')) + '&t=' + THUMBNAIL_FORMAT);
+}
+
 /** Render files in either responsive grid or compact list mode. */
 function renderFiles() {
     const list = $('#file-list');
@@ -738,7 +757,7 @@ function renderFiles() {
         // actually does with this file.
         const playable = videoExt.has(ext) || audioExt.has(ext);
         const preview = f.isDirectory ? '' : `<button data-preview="${encoded}">${playable ? 'Play' : 'Preview'}</button>`;
-        const thumbnailUrl = appUrl('/api/thumbnail?path=' + encodeURIComponent(f.path) + '&v=' + encodeURIComponent(f.modified || ''));
+        const thumbnailUrl = thumbnailUrlFor(f.path, f.modified, f.size);
         let thumb = '<span class="file-icon">📄</span>';
 
         if (f.isDirectory) {
@@ -2611,7 +2630,7 @@ function renderDuplicates() {
             return `<li class="dupe-file">
                 <label>
                     <input type="checkbox" data-dupe="${esc(encodeURIComponent(f.path))}"${checked}>
-                    <img class="dupe-thumb" loading="lazy" alt="" src="${esc(appUrl('/api/thumbnail?path=' + encodeURIComponent(f.path)))}">
+                    <img class="dupe-thumb" loading="lazy" alt="" src="${esc(thumbnailUrlFor(f.path, f.mtime, f.bytes))}">
                     <span class="dupe-meta">
                         <span class="dupe-path">${esc(f.path)}</span>
                         <span class="muted">${fmt(f.bytes)}${f.mtime ? ' · ' + new Date(f.mtime * 1000).toLocaleDateString() : ''} ${isKeep}</span>

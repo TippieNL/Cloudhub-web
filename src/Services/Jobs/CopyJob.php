@@ -53,11 +53,15 @@ final class CopyJob extends BaseJobType
         $placing = $state['placing'] ?? null;
         if (is_array($placing) && isset($placing['index'], $placing['to'])) {
             try { $landed = $fs->sanitize((string)$placing['to']); } catch (RuntimeException) { $landed = null; }
-            if ($landed !== null && file_exists($landed)) {
+            $recovered = $landed !== null && file_exists($landed);
+            if ($recovered) {
                 $placed[(int)$placing['index']] = (string)$placing['to'];
                 self::recordOwnership($ctx, $landed);
             }
             $this->save($ctx, $placed, null);
+            if ($recovered && isset($paths[(int)$placing['index']])) {
+                self::carryThumbnails($ctx, $paths[(int)$placing['index']], (string)$placing['to']);
+            }
         }
 
         $destination = $fs->existing((string)($payload['destination'] ?? ''));
@@ -105,6 +109,7 @@ final class CopyJob extends BaseJobType
                 $placed[$i] = $fs->relative($target);
                 self::recordOwnership($ctx, $target);
                 $this->save($ctx, $placed, null);
+                self::carryThumbnails($ctx, $rel, $placed[$i]);
             } catch (JobCancelled $e) {
                 throw new JobCancelled('Cancelled', $this->result($fs->relative($destination), $placed, $failed, count($paths)));
             } catch (RuntimeException $e) {
@@ -132,6 +137,17 @@ final class CopyJob extends BaseJobType
     private static function stops(RuntimeException $e): bool
     {
         return $e instanceof JobCancelled || $e instanceof JobInterrupted || $e instanceof JobLost || $e instanceof \PDOException;
+    }
+
+    /**
+     * A copy is the same pictures, so it gets its originals' thumbnails rather
+     * than a decode each, as the copy route does. After the item is recorded
+     * as placed: an attempt stopped part way leaves the rest to be made when
+     * they are first shown, or by the thumbnail scan.
+     */
+    private static function carryThumbnails(JobContext $ctx, string $from, string $to): void
+    {
+        $ctx->env()->thumbnails()->copied($from, $to, static fn() => $ctx->checkpoint());
     }
 
     private function save(JobContext $ctx, array $placed, ?array $placing): void

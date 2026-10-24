@@ -10,30 +10,33 @@ declare(strict_types=1);
  * - Phone photos record their rotation in EXIF, which GD ignores and the WebP
  *   thumbnail drops, so portrait photos lay on their side in the grid.
  *
- * The helpers live in ImageThumbnailer, shared by GET /api/thumbnail and the
- * background thumbnail job, and are run here against real GD images,
- * including a JPEG carrying a real EXIF Orientation tag.
+ * The helpers are ThumbnailService's own -- shared by GET /api/thumbnail, the
+ * thumbnail scan and the background thumbnail job -- and are run here against
+ * real GD images, including a JPEG carrying a real EXIF Orientation tag. The
+ * mirror, the scan and keeping thumbnails in step are phase 56's.
  */
 $root = dirname(__DIR__);
 $index = (string)file_get_contents($root.'/public/index.php');
-$thumbSrc = (string)file_get_contents($root.'/src/Services/ImageThumbnailer.php');
+$thumbSrc = (string)file_get_contents($root.'/src/Services/ThumbnailService.php');
 $checks = [];
 
 if (!extension_loaded('gd')) { echo "[SKIP] GD is not loaded\n"; exit(0); }
-require $root.'/src/Services/ImageThumbnailer.php';
-use CloudHub\Services\ImageThumbnailer;
-function thumbnail_source_fits(int $w, int $h): bool { return ImageThumbnailer::sourceFits($w, $h); }
-function thumbnail_orient(\GdImage $im, int $orientation): \GdImage { return ImageThumbnailer::orient($im, $orientation); }
-$checks['the route generates through ImageThumbnailer'] =
-    str_contains($index, 'ImageThumbnailer::generate($f, $cache);')
-    && str_contains($index, 'return ImageThumbnailer::cachePath(dirname(__DIR__), $file, $mtime);');
+require_once $root.'/src/Services/FileService.php';
+require_once $root.'/src/Services/ThumbnailService.php';
+use CloudHub\Services\FileService;
+use CloudHub\Services\ThumbnailService;
+function thumbnail_source_fits(int $w, int $h): bool { return ThumbnailService::sourceFits($w, $h); }
+function thumbnail_orient(\GdImage $im, int $orientation): \GdImage { return ThumbnailService::orient($im, $orientation); }
+$checks['the route makes thumbnails through ThumbnailService'] =
+    str_contains($index, "\$kept = \$thumbs->ensure(\$f, true)['path'];")
+    && str_contains($index, "return \$thumbs ??= new ThumbnailService(\$fs, dirname(__DIR__).'/storage/.thumbnails');");
 
 // --- the decode guard ------------------------------------------------------
 $checks['a 10000x10000 declaration is refused'] = !thumbnail_source_fits(10000, 10000);
 $checks['a 48 MP phone photo is allowed'] = thumbnail_source_fits(8000, 6000);
 $checks['a nonsense size is refused'] = !thumbnail_source_fits(0, 100) && !thumbnail_source_fits(100, -1);
-$checks['the route measures before it decodes'] =
-    (bool)preg_match('/\$dimensions = @getimagesize\(\$file\);.*self::sourceFits\(.*\$create = match \(\$ext\)/s', $thumbSrc);
+$checks['the service measures before it decodes'] =
+    (bool)preg_match('/\$dimensions = @getimagesize\(\$file\);.*self::sourceFits\(.*\$source = match \(\$ext\)/s', $thumbSrc);
 
 // --- orientation: where the top-left pixel of a 4x2 image must end up -------
 // The EXIF meaning of each value, as the correction that makes it upright.
@@ -74,18 +77,28 @@ $checks['the thumbnail canvas keeps transparency'] =
     str_contains($thumbSrc, "imagesavealpha(\$im, true);") && str_contains($thumbSrc, "imagefill(\$im, 0, 0, imagecolorallocatealpha(\$im, 0, 0, 0, 127));");
 
 // --- a real thumbnail, end to end -------------------------------------------------
-$src = sys_get_temp_dir().'/cloudhub-p41-'.bin2hex(random_bytes(4)).'.png';
+$tmp = sys_get_temp_dir().'/cloudhub-p41-'.bin2hex(random_bytes(4));
+mkdir($tmp.'/store', 0775, true);
+$thumbs = new ThumbnailService(new FileService(['root_dir' => $tmp.'/store', 'read_only' => false]), $tmp.'/thumbnails');
 $img = imagecreatetruecolor(900, 300);
 imagefill($img, 0, 0, imagecolorallocate($img, 10, 200, 30));
-imagepng($img, $src);
-$out = $src.'.webp';
-ImageThumbnailer::generate($src, $out);
-$made = @getimagesize($out);
-$checks['generate() writes a 300px WebP'] = $made !== false && $made[0] === 300 && $made[1] === 100 && $made[2] === IMAGETYPE_WEBP;
+imagepng($img, $tmp.'/store/wide.png');
+$made = $thumbs->ensure($tmp.'/store/wide.png');
+$size = @getimagesize($made['path']);
+$checks['ensure() keeps a 512 px WebP in the mirror'] = $made['path'] === $tmp.'/thumbnails/files/wide.png.webp'
+    && $size !== false && $size[0] === 512 && $size[1] === 171 && $size[2] === IMAGETYPE_WEBP;
+file_put_contents($tmp.'/store/notes.txt', 'not a photo');
 $refused = null;
-try { ImageThumbnailer::generate($src.'.txt', $out); } catch (RuntimeException $e) { $refused = $e->getCode(); }
+try { $thumbs->ensure($tmp.'/store/notes.txt'); } catch (RuntimeException $e) { $refused = $e->getCode(); }
 $checks['a type that takes no thumbnail is a 400'] = $refused === 400;
-@unlink($src); @unlink($out);
+$wipe = function (string $dir) use (&$wipe): void {
+    foreach (scandir($dir) ?: [] as $name) {
+        if ($name === '.' || $name === '..') continue;
+        is_dir($dir.'/'.$name) ? $wipe($dir.'/'.$name) : @unlink($dir.'/'.$name);
+    }
+    @rmdir($dir);
+};
+$wipe($tmp);
 
 $bad = false;
 foreach ($checks as $name => $ok) { echo ($ok ? '[PASS] ' : '[FAIL] ').$name.PHP_EOL; $bad = $bad || !$ok; }

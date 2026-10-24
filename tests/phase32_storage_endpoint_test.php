@@ -77,6 +77,14 @@ $checks['the storage root is described'] = $rootRow !== null;
 $checks['it counts entries instead'] = ($rootRow['entries'] ?? null) === 2;   // the photo and .uploads
 $checks['it probed writability for real'] = ($rootRow['writable'] ?? null) === true;
 
+// A kept thumbnail is matched to its photo by the time set on it, which some
+// storage refuses; the report says whether this one takes it.
+$thumbRow = null;
+foreach ($measured['paths'] as $row) if ($row['label'] === 'thumbnail cache') $thumbRow = $row;
+$checks['the thumbnail cache is asked whether it keeps file times'] = ($thumbRow['keepsTimes'] ?? null) === true
+    && !array_filter($measured['problems'], static fn(string $p): bool => str_contains($p, 'modification time'))
+    && listing32($base.'/storage/.thumbnails') === [];
+
 // --- the rename-versus-copy verdict, both directions ---------------------
 
 $checks['same filesystem is reported as a rename'] =
