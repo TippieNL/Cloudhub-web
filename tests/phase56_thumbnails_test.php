@@ -38,6 +38,8 @@ final class NoLockFs56
     public static string $realBase = '';
     /** False plays storage that will not set a file's time, which some Android storage refuses. */
     public static bool $keepsTimes = true;
+    /** Run once, just before the scan's claim is next removed or moved: another request, that instant. */
+    public static ?Closure $meanwhile = null;
     private $fh = null;
     private $dh = null;
 
@@ -56,8 +58,14 @@ final class NoLockFs56
     public function stream_close() { return fclose($this->fh); }
     // stream_lock() is intentionally absent.
     public function url_stat($path, $flags) { return @stat(self::real($path)) ?: false; }
-    public function unlink($path) { return @unlink(self::real($path)); }
-    public function rename($from, $to) { return @rename(self::real($from), self::real($to)); }
+    public function unlink($path) { self::meanwhile($path); return @unlink(self::real($path)); }
+    public function rename($from, $to) { self::meanwhile($from); return @rename(self::real($from), self::real($to)); }
+    private static function meanwhile(string $path): void
+    {
+        if (self::$meanwhile === null || !str_ends_with($path, '/thumbnail-scan.claim')) return;
+        [$then, self::$meanwhile] = [self::$meanwhile, null];
+        $then();
+    }
     public function mkdir($path, $mode, $options) { return @mkdir(self::real($path), $mode, (bool)($options & STREAM_MKDIR_RECURSIVE)); }
     public function rmdir($path, $options) { return @rmdir(self::real($path)); }
     public function dir_opendir($path, $options) { $this->dh = @opendir(self::real($path)); return $this->dh !== false; }
@@ -466,11 +474,25 @@ $checks['as does one being written that instant'] = $lockless->run(30.0, true)['
 // A slice killed part way leaves its claim; it lapses, and is taken over.
 file_put_contents($claim, (time() - 1).' died');
 $after = $lockless->run(30.0, true);
-$checks['a claim left by a slice that died is taken over once it lapses'] =
-    $after['busy'] === false && $after['done'] && $after['processed'] === $after['found'] && !file_exists($claim);
+$checks['a claim left by a slice that died is taken over once it lapses'] = $after['busy'] === false && $after['done']
+    && $after['processed'] === $after['found'] && !file_exists($claim) && glob($claim.'.*') === [];
 file_put_contents($claim, '');
 touch($claim, time() - 600);
 $checks['even one that was never written'] = $lockless->run(30.0, true)['busy'] === false && !file_exists($claim);
+// Two requests can both find a claim lapsed. The quicker takes it over and
+// makes its own; the slower must not then remove that one by name, or both
+// slices run on the one work list.
+file_put_contents($claim, (time() - 1).' died');
+$stateBefore = file_get_contents($stateThere);
+NoLockFs56::$meanwhile = function () use ($claim, &$until): void {
+    file_put_contents($claim, ($until = time() + 60).' quicker');
+};
+$raced = $lockless->run(30.0, true);
+NoLockFs56::$meanwhile = null;
+$checks['of two that find a claim lapsed, the slower leaves the quicker\'s alone'] = $raced['busy'] === true
+    && file_get_contents($stateThere) === $stateBefore && file_get_contents($claim) === $until.' quicker'
+    && glob($claim.'.*') === [];
+@unlink($claim);
 
 // Where locks do work, a failed one is still another slice's.
 $lock = fopen($base.'/cache/thumbnail-scan.lock', 'c');

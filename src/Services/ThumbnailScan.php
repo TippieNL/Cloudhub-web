@@ -156,6 +156,12 @@ final class ThumbnailScan
      * taken over once that has passed, and whose it is, so a slice that ran
      * past it removes only its own.
      *
+     * A lapsed claim is moved aside, not deleted. Two callers can both find it
+     * lapsed: the quicker takes it over and makes its own, and the slower,
+     * deleting by name, deleted that one instead -- and both slices ran.
+     * rename() moves one file, atomically, so the slower moves the quicker's
+     * claim, finds that it holds, and puts it back.
+     *
      * @return array{0:string,1:string}|null
      */
     private function claim(float $seconds): ?array
@@ -168,14 +174,27 @@ final class ThumbnailScan
                 fclose($h);
                 return ['claim', $token];
             }
-            clearstatcache(true, $this->claimFile);
-            $until = explode(' ', (string)@file_get_contents($this->claimFile), 2)[0];
-            // Empty only while its taker is writing it: as fresh as the file.
-            $expires = ctype_digit($until) ? (int)$until : (int)@filemtime($this->claimFile) + self::CLAIM_GRACE_SECONDS;
-            if ($expires >= time()) return null;
-            @unlink($this->claimFile);
+            if ($this->claimHolds($this->claimFile)) return null;
+            $aside = $this->claimFile.'.'.$token;
+            // Gone already: its slice ended, or another caller moved it.
+            if (!@rename($this->claimFile, $aside)) continue;
+            if (!$this->claimHolds($aside)) {
+                @unlink($aside);
+                continue;
+            }
+            @rename($aside, $this->claimFile);
+            return null;
         }
         return null;
+    }
+
+    private function claimHolds(string $file): bool
+    {
+        clearstatcache(true, $file);
+        $until = explode(' ', (string)@file_get_contents($file), 2)[0];
+        // Empty only while its taker is writing it: as fresh as the file.
+        $expires = ctype_digit($until) ? (int)$until : (int)@filemtime($file) + self::CLAIM_GRACE_SECONDS;
+        return $expires >= time();
     }
 
     /** @param array{0:string,1:mixed} $held what hold() returned */
