@@ -13,7 +13,10 @@ declare(strict_types=1);
  * Pins: every dot-segment is refused except /.well-known/ (ACME HTTP-01
  * renewal answers from it); internals and loose artefacts are refused; and a
  * share link reaches the application whatever extension the shared file has,
- * because a share URL ends in the file's own name or extension.
+ * because a share URL ends in the file's own name or extension -- and is told
+ * the front controller is the script, as a WebDAV file is: the built-in server
+ * names the URL itself for a path ending in an extension, and Http::basePath()
+ * took its folder for the install's.
  */
 $root = dirname(__DIR__);
 $checks = [];
@@ -24,7 +27,7 @@ $put = static function (string $rel, string $body) use ($tmp): void {
 };
 mkdir($tmp, 0775, true);
 copy($root.'/router.php', $tmp.'/router.php');
-$put('public/index.php', '<?php echo "APP ", parse_url($_SERVER["REQUEST_URI"], PHP_URL_PATH);');
+$put('public/index.php', '<?php header("X-Script-Name: ".($_SERVER["SCRIPT_NAME"] ?? "")); echo "APP ", parse_url($_SERVER["REQUEST_URI"], PHP_URL_PATH);');
 $put('public/assets/js/app.js', 'console.log(1);');
 $put('.well-known/acme-challenge/tok', 'acme');
 $put('.git/config', '[core]');
@@ -53,11 +56,13 @@ $server = proc_open([PHP_BINARY, '-S', '127.0.0.1:'.$port, $tmp.'/router.php'],
 $base = 'http://127.0.0.1:'.$port;
 for ($i = 0; $i < 200; $i++) { if (@file_get_contents($base.'/public/assets/js/app.js') !== false) break; usleep(25000); }
 
-/** @return array{0:int,1:string} */
+/** @return array{0:int,1:string,2:string} the status, the body and the script the application was told it is */
 $get = static function (string $path) use ($base): array {
     $body = @file_get_contents($base.$path, false, stream_context_create(['http' => ['ignore_errors' => true, 'timeout' => 10]]));
-    preg_match('~HTTP/\S+\s+(\d+)~', implode("\n", $http_response_header ?? []), $m);
-    return [(int)($m[1] ?? 0), (string)$body];
+    $headers = implode("\n", $http_response_header ?? []);
+    preg_match('~HTTP/\S+\s+(\d+)~', $headers, $m);
+    preg_match('~^X-Script-Name: (.*)$~mi', $headers, $script);
+    return [(int)($m[1] ?? 0), (string)$body, trim((string)($script[1] ?? ''))];
 };
 
 foreach (['/.git/config', '/.env', '/.gitignore', '/docs/.hidden', '/src/Services/Auth.php', '/notes.log', '/database/schema.sql',
@@ -70,10 +75,13 @@ $checks['an ACME challenge is still served'] = $status === 200 && $body === 'acm
 [$status, $body] = $get('/public/assets/js/app.js');
 $checks['a public asset is still served'] = $status === 200 && $body === 'console.log(1);';
 foreach ($shareUrls as $url) {
-    [$status, $body] = $get($url);
+    [$status, $body, $script] = $get($url);
     $checks['share link '.(substr($url, strlen('/share/'.$token)) ?: '(bare token)').' reaches the application'] =
-        $status === 200 && $body === 'APP '.$url;
+        $status === 200 && $body === 'APP '.$url && $script === '/index.php';
 }
+[$status, $body, $script] = $get('/webdav/Photos/beach.jpg');
+$checks['a WebDAV file reaches the application, told its front controller'] =
+    $status === 200 && $body === 'APP /webdav/Photos/beach.jpg' && $script === '/index.php';
 
 if (is_resource($server)) { proc_terminate($server); proc_close($server); }
 $rmrf = static function (string $p) use (&$rmrf): void {

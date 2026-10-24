@@ -397,6 +397,14 @@ or, to serve the project from a parent directory as a subdirectory install:
 php -S 0.0.0.0:8000 router.php     # open http://localhost:8000/
 ```
 
+Without `router.php` the built-in server takes any path that ends in an
+extension for a file of its own and answers 404 without running CloudHub: a
+share link (`/share/<token>.jpg`) and every WebDAV file. Use `router.php` to try
+either. It also tells the application its front controller for such a path,
+which the built-in server (8.2 and 8.3 alike) reports as the path itself;
+`Http::basePath()` took that path's folder for the install's, so the same
+requests answered "Not found" even through the router until it did.
+
 ## Login
 
 Authentication is database-backed and uses PHP sessions. **No account is created
