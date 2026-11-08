@@ -37,6 +37,47 @@ const toast = m => {
     toastTimer = setTimeout(() => t.style.display = 'none', 2200);
 };
 
+/* ---- Loading screen -----------------------------------------------------
+ *
+ * Each page of the app is a full page load. The server paints a signed-in
+ * visitor's page with this screen in front (see views/pages/app.php); it goes
+ * once the page has something to show. A link to another page brings it up
+ * at the moment of the click, so the click is answered before the next page
+ * arrives -- and that page starts with the same screen.
+ */
+const loadingScreen = $('#app-loading');
+
+function showLoading() {
+    loadingScreen.classList.remove('app-loading-done');
+    loadingScreen.hidden = false;
+}
+
+function hideLoading() {
+    if (loadingScreen.hidden || loadingScreen.classList.contains('app-loading-done')) return;
+    loadingScreen.classList.add('app-loading-done');
+    setTimeout(() => { if (loadingScreen.classList.contains('app-loading-done')) loadingScreen.hidden = true; }, 250);
+}
+
+document.addEventListener('click', e => {
+    if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+    const a = e.target.closest('a[href]');
+    // A new tab, a download or a jump within this page leaves this page where it is.
+    if (!a || (a.target && a.target !== '_self') || a.hasAttribute('download')) return;
+    let url;
+    try { url = new URL(a.href, location.href); } catch { return; }
+    if (url.origin !== location.origin || url.pathname !== new URL(FRONT, location.href).pathname) return;
+    if (url.hash && url.search === location.search) return;
+    // An API answer is a file or data, never a page to wait for.
+    if ((url.searchParams.get('route') || '/').startsWith('/api/')) return;
+    showLoading();
+    // A navigation that never happens -- stopped, or answered with a download
+    // after all -- must not leave the screen up.
+    setTimeout(hideLoading, 8000);
+});
+// Back and Forward can bring this page back from the browser's cache exactly
+// as it was left: with the screen up from the click that left it.
+window.addEventListener('pageshow', e => { if (e.persisted) hideLoading(); });
+
 async function api(url, opt = {}) {
     url = appUrl(url);
     opt.headers = { ...(opt.headers || {}) };
@@ -49,6 +90,7 @@ async function api(url, opt = {}) {
     const r = await fetch(url, { ...opt, credentials: 'same-origin' });
     if (r.status === 401) {
         $('#login').style.display = 'flex';
+        hideLoading();
         throw Error('Authentication required');
     }
     if (!r.ok) {
@@ -2685,6 +2727,7 @@ async function openRoute() {
     }
     if (!d?.authenticated) {
         $('#login').style.display = 'flex';
+        hideLoading();
         return;
     }
     S.csrf = d.csrfToken || '';
@@ -2694,6 +2737,12 @@ async function openRoute() {
     $('#nav-storage').hidden = S.role !== 'admin';
     signedIn();
     $('#login').style.display = 'none';
+    // The loading screen stays until the page has its content, but no longer
+    // than a few seconds: a large folder or a storage report then shows its
+    // own progress rather than a spinner with no end.
+    const slow = setTimeout(hideLoading, 4000);
     await openRoute();
+    clearTimeout(slow);
+    hideLoading();
 })();
 

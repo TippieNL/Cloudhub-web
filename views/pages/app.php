@@ -17,6 +17,18 @@ $maxUploadMb = (int)$config['max_upload_mb'];
 $uploadSizeHelp = $maxUploadMb >= 1024
     ? number_format($maxUploadMb / 1024, 0).' GB'
     : $maxUploadMb.' MB';
+/*
+ * Every page of the app is a full page load, and the script used to learn who
+ * is signed in only after the page had painted -- with the sign-in form in
+ * front, because that was the default. Signed-in users saw it flash up on
+ * every click of the menu. The server knows already: a signed-in visitor gets
+ * the loading screen instead, and the sign-in form is only ever painted for a
+ * visitor who needs it. The script still confirms both (see the boot at the
+ * end of app.js), so a session that has just expired still ends on the form.
+ */
+$signedIn = \CloudHub\Services\Auth::user() !== null;
+// The menu entry for this page is marked while it loads, not only once the script has run.
+$navActive = static fn(string $route): string => ($path ?? '/') === $route ? ' class="active"' : '';
 ?>
 <!doctype html>
 <html lang="en">
@@ -24,11 +36,22 @@ $uploadSizeHelp = $maxUploadMb >= 1024
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width,initial-scale=1">
     <title>File Server</title>
+    <script nonce="<?= htmlspecialchars(\CloudHub\Services\Security::cspNonce(), ENT_QUOTES) ?>">
+        // Before the first paint: the theme used to be applied by app.js, at the
+        // end of the page, so a dark-mode page painted white first on every load.
+        try { if (localStorage.getItem('theme') === 'dark') document.documentElement.classList.add('dark'); } catch (e) {}
+    </script>
     <link rel="icon" href="<?= htmlspecialchars($assetBase, ENT_QUOTES) ?>/favicon.png">
     <link rel="stylesheet" href="<?= htmlspecialchars($assetBase, ENT_QUOTES) ?>/assets/css/app.css?v=<?= (int)@filemtime(dirname(__DIR__, 2).'/public/assets/css/app.css') ?>">
 </head>
 <body>
-    <div id="login" class="overlay">
+    <div id="app-loading" class="app-loading" role="status" aria-live="polite"<?= $signedIn ? '' : ' hidden' ?>>
+        <div class="app-loading-box">
+            <span class="app-loading-ring" aria-hidden="true"></span>
+            <span class="app-loading-text">Loading…</span>
+        </div>
+    </div>
+    <div id="login" class="overlay"<?= $signedIn ? ' style="display:none"' : '' ?>>
         <form id="login-form" class="dialog">
             <h2>File Server</h2>
             <p>Enter your credentials to access the file server.</p>
@@ -41,14 +64,14 @@ $uploadSizeHelp = $maxUploadMb >= 1024
     <header>
         <strong>◉ File Server</strong>
         <nav>
-            <a href="<?= htmlspecialchars($frontController, ENT_QUOTES) ?>" data-route="/">Files</a>
-            <a href="<?= htmlspecialchars($frontController, ENT_QUOTES) ?>?route=%2Fservers" data-route="/servers">Servers</a>
-            <a href="<?= htmlspecialchars($frontController, ENT_QUOTES) ?>?route=%2Ftrash" data-route="/trash">Trash</a>
-            <a href="<?= htmlspecialchars($frontController, ENT_QUOTES) ?>?route=%2Fbrowse" data-route="/browse">Browse</a>
-            <a href="<?= htmlspecialchars($frontController, ENT_QUOTES) ?>?route=%2Fduplicates" data-route="/duplicates">Duplicates</a>
-            <a id="nav-tasks" href="<?= htmlspecialchars($frontController, ENT_QUOTES) ?>?route=%2Ftasks" data-route="/tasks">Tasks</a>
-            <a id="nav-users" href="<?= htmlspecialchars($frontController, ENT_QUOTES) ?>?route=%2Fusers" data-route="/users" hidden>Users</a>
-            <a id="nav-storage" href="<?= htmlspecialchars($frontController, ENT_QUOTES) ?>?route=%2Fstorage" data-route="/storage" hidden>Storage</a>
+            <a href="<?= htmlspecialchars($frontController, ENT_QUOTES) ?>" data-route="/"<?= $navActive('/') ?>>Files</a>
+            <a href="<?= htmlspecialchars($frontController, ENT_QUOTES) ?>?route=%2Fservers" data-route="/servers"<?= $navActive('/servers') ?>>Servers</a>
+            <a href="<?= htmlspecialchars($frontController, ENT_QUOTES) ?>?route=%2Ftrash" data-route="/trash"<?= $navActive('/trash') ?>>Trash</a>
+            <a href="<?= htmlspecialchars($frontController, ENT_QUOTES) ?>?route=%2Fbrowse" data-route="/browse"<?= $navActive('/browse') ?>>Browse</a>
+            <a href="<?= htmlspecialchars($frontController, ENT_QUOTES) ?>?route=%2Fduplicates" data-route="/duplicates"<?= $navActive('/duplicates') ?>>Duplicates</a>
+            <a id="nav-tasks" href="<?= htmlspecialchars($frontController, ENT_QUOTES) ?>?route=%2Ftasks" data-route="/tasks"<?= $navActive('/tasks') ?>>Tasks</a>
+            <a id="nav-users" href="<?= htmlspecialchars($frontController, ENT_QUOTES) ?>?route=%2Fusers" data-route="/users"<?= $navActive('/users') ?> hidden>Users</a>
+            <a id="nav-storage" href="<?= htmlspecialchars($frontController, ENT_QUOTES) ?>?route=%2Fstorage" data-route="/storage"<?= $navActive('/storage') ?> hidden>Storage</a>
         </nav>
         <div class="header-actions">
             <?php /* Beside the account controls rather than in the nav: on a phone the nav scrolls sideways and the Tasks link is often off-screen. */ ?>
